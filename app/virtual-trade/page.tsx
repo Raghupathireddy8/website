@@ -1,6 +1,5 @@
 "use client"
 export const dynamic = "force-dynamic"
-export const runtime = "edge"
 import { useState, useEffect, useCallback } from "react"
 import { supabase } from "@/lib/supabase"
 import { AnnouncementBar } from "@/components/announcement-bar"
