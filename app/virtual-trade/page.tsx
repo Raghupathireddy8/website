@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect, useCallback } from "react"
-import { createClient } from "@supabase/supabase-js"
+import { supabase } from "@/lib/supabase"
 import { AnnouncementBar } from "@/components/announcement-bar"
 import { Navbar } from "@/components/navbar"
 import { Footer } from "@/components/footer"
@@ -10,12 +10,6 @@ import {
   TrendingUp, TrendingDown, RefreshCw, LogOut,
   X, History, BarChart2, ChevronDown, Wallet,
 } from "lucide-react"
-
-// ─── Supabase client ──────────────────────────────────────────────────────────
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const LOT_SIZES: Record<string, number> = {
