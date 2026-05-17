@@ -3,7 +3,7 @@ import { Navbar } from "@/components/navbar"
 import { Footer } from "@/components/footer"
 import { LiveIndicesBar } from "@/components/home/live-indices-bar"
 import { UpcomingIPOsCard } from "@/components/home/upcoming-ipos-card"
-import { AlertsFeedCard } from "@/components/home/alerts-feed-card"
+import { MarketPulseCard } from "@/components/home/market-pulse-card"
 import { IVRankCard } from "@/components/home/iv-rank-card"
 import { QuarterlyResultsCard } from "@/components/home/quarterly-results-card"
 import { GovtSchemesCard } from "@/components/home/govt-schemes-card"
@@ -25,8 +25,8 @@ export default function HomePage() {
             {/* Card A - Upcoming IPOs */}
             <UpcomingIPOsCard />
             
-            {/* Card B - Telegram Alerts Feed */}
-            <AlertsFeedCard />
+            {/* Card B - Market Pulse */}
+            <MarketPulseCard />
             
             {/* Card C - IV Rank Screener */}
             <IVRankCard />
