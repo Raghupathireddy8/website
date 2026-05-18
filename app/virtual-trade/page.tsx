@@ -112,8 +112,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     const { data, error: e } = await supabase.auth.signUp({
       email: email.toLowerCase(), password,
       options: {
-        data: { full_name: fullName, mobile: m },
-        emailRedirectTo: `${window.location.origin}/virtual-trade`,
+        data: { full_name: fullName, mobile: m },        
       },
     })
     if (e) { setError(e.message); setLoading(false); return }
