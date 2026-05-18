@@ -1,17 +1,18 @@
 "use client"
+
 export const dynamic = "force-dynamic"
+
 import { useState, useEffect, useCallback } from "react"
 import { supabase } from "@/lib/supabase"
 import { AnnouncementBar } from "@/components/announcement-bar"
 import { Navbar } from "@/components/navbar"
 import { Footer } from "@/components/footer"
 import {
-  Eye, EyeOff, Phone, Lock, User, ArrowRight,
+  Eye, EyeOff, Phone, Lock, User, ArrowRight, Mail,
   TrendingUp, TrendingDown, RefreshCw, LogOut,
   X, History, BarChart2, ChevronDown, Wallet,
 } from "lucide-react"
 
-// ─── Constants ────────────────────────────────────────────────────────────────
 const LOT_SIZES: Record<string, number> = {
   NIFTY: 25, BANKNIFTY: 15, FINNIFTY: 40,
   RELIANCE: 250, TCS: 150, INFY: 300, HDFCBANK: 550,
@@ -36,12 +37,10 @@ const FNO_SYMBOLS = [
 type InstrumentType = "EQUITY" | "OPTIONS" | "FUTURES"
 type TradeType      = "BUY" | "SELL"
 type OptionType     = "CE" | "PE"
-type AuthMode       = "login" | "signup" | "forgot"
+type AuthMode       = "login" | "signup" | "forgot" | "verify"
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-const fmt = (n: number) =>
+const fmt  = (n: number) =>
   new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(n)
-
 const fmtN = (n: number) =>
   new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n)
 
@@ -56,11 +55,11 @@ function calcCharges(price: number, qty: number, type: InstrumentType, side: Tra
 
 async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<number | null> {
   try {
-    let ySym = type === "EQUITY" ? `${symbol}.NS`
+    const ySym = type === "EQUITY" ? `${symbol}.NS`
       : symbol === "NIFTY" ? "^NSEI"
       : symbol === "BANKNIFTY" ? "^NSEBANK"
       : `${symbol}.NS`
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
     const res  = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`)
     const body = await res.json()
     const json = JSON.parse(body.contents)
@@ -69,75 +68,89 @@ async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<num
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// AUTH SECTION
+// AUTH
 // ═════════════════════════════════════════════════════════════════════════════
 
 function AuthSection({ onAuth }: { onAuth: () => void }) {
-  const [mode,      setMode]      = useState<AuthMode>("login")
-  const [mobile,    setMobile]    = useState("")
-  const [email,     setEmail]     = useState("")
-  const [password,  setPassword]  = useState("")
-  const [confirm,   setConfirm]   = useState("")
-  const [fullName,  setFullName]  = useState("")
-  const [showPass,  setShowPass]  = useState(false)
-  const [loading,   setLoading]   = useState(false)
-  const [error,     setError]     = useState("")
-  const [success,   setSuccess]   = useState("")
+  const [mode,     setMode]     = useState<AuthMode>("login")
+  const [mobile,   setMobile]   = useState("")
+  const [email,    setEmail]    = useState("")
+  const [password, setPassword] = useState("")
+  const [confirm,  setConfirm]  = useState("")
+  const [fullName, setFullName] = useState("")
+  const [showPass, setShowPass] = useState(false)
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState("")
+  const [success,  setSuccess]  = useState("")
 
-  const mobileToEmail = (m: string) => `${m}@marketgreeks.user`
-  const normMobile    = (m: string) => m.replace(/\D/g, "").slice(-10)
+  const normMobile = (m: string) => m.replace(/\D/g, "").slice(-10)
 
   function validate() {
+    if (mode === "forgot") return email ? "" : "Enter your registered email"
     const m = normMobile(mobile)
-    if (mode === "forgot") return email ? "" : "Enter your email"
-    if (m.length !== 10)   return "Enter a valid 10-digit mobile number"
-    if (!password)         return "Enter your password"
+    if (m.length !== 10)  return "Enter a valid 10-digit mobile number"
+    if (!password)        return "Enter your password"
     if (mode === "signup") {
-      if (!fullName.trim())   return "Enter your full name"
-      if (password.length < 8) return "Password must be at least 8 characters"
-      if (password !== confirm) return "Passwords do not match"
+      if (!fullName.trim())          return "Enter your full name"
+      if (!email.trim())             return "Enter your email address"
+      if (!/\S+@\S+\.\S+/.test(email)) return "Enter a valid email"
+      if (password.length < 8)      return "Password must be at least 8 characters"
+      if (password !== confirm)     return "Passwords do not match"
     }
     return ""
   }
 
   async function handleSignup() {
     const m = normMobile(mobile)
-    const { data: ex } = await supabase.from("profiles").select("id").eq("mobile", m).maybeSingle()
-    if (ex) { setError("Mobile number already registered. Please sign in."); setLoading(false); return }
+
+    const { data: exMobile } = await supabase.from("profiles").select("id").eq("mobile", m).maybeSingle()
+    if (exMobile) { setError("Mobile already registered. Please sign in."); setLoading(false); return }
+
+    const { data: exEmail } = await supabase.from("profiles").select("id").eq("email", email.toLowerCase()).maybeSingle()
+    if (exEmail) { setError("Email already registered. Please sign in."); setLoading(false); return }
 
     const { data, error: e } = await supabase.auth.signUp({
-      email: mobileToEmail(m), password,
-      options: { data: { full_name: fullName, mobile: m } },
+      email: email.toLowerCase(), password,
+      options: {
+        data: { full_name: fullName, mobile: m },
+        emailRedirectTo: `${window.location.origin}/virtual-trade`,
+      },
     })
     if (e) { setError(e.message); setLoading(false); return }
 
     const uid = data.user?.id
     if (!uid) { setError("Signup failed. Try again."); setLoading(false); return }
 
-    await supabase.from("profiles").insert({ id: uid, mobile: m, full_name: fullName })
+    await supabase.from("profiles").insert({ id: uid, mobile: m, full_name: fullName, email: email.toLowerCase() })
     await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
 
-    setSuccess("Account created! ₹10,00,000 added to your wallet. Please sign in.")
-    setMode("login")
+    setMode("verify")
     setLoading(false)
   }
 
   async function handleLogin() {
     const m = normMobile(mobile)
-    const { error: e } = await supabase.auth.signInWithPassword({
-      email: mobileToEmail(m), password,
-    })
-    if (e) { setError("Invalid mobile number or password."); setLoading(false); return }
+    const { data: profile } = await supabase.from("profiles").select("email").eq("mobile", m).maybeSingle()
+    if (!profile?.email) { setError("Mobile number not registered. Please sign up first."); setLoading(false); return }
+
+    const { error: e } = await supabase.auth.signInWithPassword({ email: profile.email, password })
+    if (e) {
+      setError(e.message.includes("Email not confirmed")
+        ? "Please verify your email first. Check your inbox for the verification link."
+        : "Invalid mobile number or password.")
+      setLoading(false)
+      return
+    }
     onAuth()
     setLoading(false)
   }
 
   async function handleForgot() {
-    const { error: e } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password`,
+    const { error: e } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), {
+      redirectTo: `${window.location.origin}/virtual-trade`,
     })
     if (e) { setError(e.message); setLoading(false); return }
-    setSuccess("Password reset link sent to your email.")
+    setSuccess("Password reset link sent! Check your email inbox and spam folder.")
     setLoading(false)
   }
 
@@ -151,13 +164,56 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     if (mode === "forgot") await handleForgot()
   }
 
-  const switchMode = (m: AuthMode) => { setMode(m); setError(""); setSuccess("") }
+  const switchMode = (m: AuthMode) => {
+    setMode(m); setError(""); setSuccess("")
+    setMobile(""); setEmail(""); setPassword(""); setConfirm(""); setFullName("")
+  }
+
+  // Email verification screen
+  if (mode === "verify") {
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
+        <div className="w-full max-w-md text-center">
+          <div className="inline-flex items-center justify-center w-16 h-16 bg-primary/10 rounded-2xl mb-4">
+            <Mail className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-2xl font-bold text-foreground mb-2">Verify your email</h2>
+          <p className="text-muted-foreground text-sm mb-6">
+            We sent a verification link to <strong>{email}</strong>
+          </p>
+          <div className="bg-card border border-border rounded-2xl p-5 text-left space-y-3 mb-6">
+            <p className="text-xs font-semibold text-foreground">Steps to activate your account:</p>
+            {[
+              `Open your inbox for ${email}`,
+              `Click "Confirm your email" link from MarketGreeks`,
+              "Come back here and sign in with your mobile number and password",
+              "Check spam/junk folder if you don't see it",
+            ].map((step, i) => (
+              <div key={i} className="flex items-start gap-3">
+                <span className={`w-5 h-5 rounded-full text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5 ${i < 3 ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"}`}>
+                  {i < 3 ? i + 1 : "!"}
+                </span>
+                <p className="text-xs text-muted-foreground">{step}</p>
+              </div>
+            ))}
+          </div>
+          <button onClick={() => switchMode("login")}
+            className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors">
+            Go to Sign In →
+          </button>
+          <p className="text-xs text-muted-foreground mt-3">
+            Wrong email?{" "}
+            <button onClick={() => switchMode("signup")} className="text-primary hover:underline font-semibold">Sign up again</button>
+          </p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
       <div className="w-full max-w-md">
 
-        {/* Header */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-14 h-14 bg-primary rounded-2xl mb-3">
             <TrendingUp className="w-7 h-7 text-primary-foreground" />
@@ -165,14 +221,13 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
           <h2 className="text-2xl font-bold text-foreground">Virtual Trading</h2>
           <p className="text-sm text-muted-foreground mt-1">
             {mode === "signup" ? "Create account & get ₹10L virtual money" :
-             mode === "forgot" ? "Reset your password" :
-             "Sign in to your trading account"}
+             mode === "forgot" ? "Reset your password via email" :
+             "Sign in with your mobile number"}
           </p>
         </div>
 
         <div className="bg-card border border-border rounded-2xl p-6">
 
-          {/* Welcome bonus banner */}
           {mode === "signup" && (
             <div className="bg-primary/10 rounded-xl p-3 mb-5 flex items-center gap-3">
               <span className="text-2xl">💰</span>
@@ -183,50 +238,52 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
             </div>
           )}
 
-          {/* Alerts */}
           {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
           {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
 
           <form onSubmit={submit} className="space-y-4">
 
-            {/* Full name */}
             {mode === "signup" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Full Name</label>
                 <div className="relative">
                   <User className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input type="text" value={fullName} onChange={e => setFullName(e.target.value)}
-                    placeholder="Ravi Kumar"
+                  <input type="text" value={fullName} onChange={e => setFullName(e.target.value)} placeholder="Ravi Kumar"
                     className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
                 </div>
               </div>
             )}
 
-            {/* Email for forgot */}
-            {mode === "forgot" ? (
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Email Address</label>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)}
-                  placeholder="you@email.com"
-                  className="w-full px-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-              </div>
-            ) : (
-              /* Mobile */
+            {mode !== "forgot" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Mobile Number</label>
                 <div className="flex">
                   <span className="inline-flex items-center px-3 text-sm text-muted-foreground bg-muted border border-r-0 border-border rounded-l-xl">
                     <Phone className="w-3.5 h-3.5 mr-1" />+91
                   </span>
-                  <input type="tel" value={mobile} onChange={e => setMobile(e.target.value)}
-                    placeholder="9876543210" maxLength={10}
+                  <input type="tel" value={mobile} onChange={e => setMobile(e.target.value)} placeholder="9876543210" maxLength={10}
                     className="flex-1 px-4 py-2.5 text-sm border border-border rounded-r-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
                 </div>
-                <p className="text-[10px] text-muted-foreground mt-1">Each mobile number can only register once</p>
+                {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">Used for login. Each number registers only once.</p>}
               </div>
             )}
 
-            {/* Password */}
+            {(mode === "signup" || mode === "forgot") && (
+              <div>
+                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
+                  {mode === "signup" ? "Email Address" : "Registered Email Address"}
+                </label>
+                <div className="relative">
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@gmail.com"
+                    className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                </div>
+                {mode === "signup" && (
+                  <p className="text-[10px] text-muted-foreground mt-1">Verification link sent here. Also used for password reset.</p>
+                )}
+              </div>
+            )}
+
             {mode !== "forgot" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Password</label>
@@ -243,38 +300,32 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
               </div>
             )}
 
-            {/* Confirm password */}
             {mode === "signup" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Confirm Password</label>
                 <div className="relative">
                   <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input type={showPass ? "text" : "password"} value={confirm} onChange={e => setConfirm(e.target.value)}
-                    placeholder="Re-enter password"
+                  <input type={showPass ? "text" : "password"} value={confirm} onChange={e => setConfirm(e.target.value)} placeholder="Re-enter password"
                     className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
                 </div>
               </div>
             )}
 
-            {/* Forgot link */}
             {mode === "login" && (
               <div className="text-right -mt-1">
-                <button type="button" onClick={() => switchMode("forgot")}
-                  className="text-xs text-primary hover:underline">Forgot password?</button>
+                <button type="button" onClick={() => switchMode("forgot")} className="text-xs text-primary hover:underline">Forgot password?</button>
               </div>
             )}
 
-            {/* Submit */}
             <button type="submit" disabled={loading}
               className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
               {loading
                 ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                : <><span>{mode === "login" ? "Sign In" : mode === "signup" ? "Create Account & Get ₹10L" : "Send Reset Link"}</span><ArrowRight className="w-4 h-4" /></>
+                : <><span>{mode === "login" ? "Sign In" : mode === "signup" ? "Create Account & Verify Email" : "Send Reset Link"}</span><ArrowRight className="w-4 h-4" /></>
               }
             </button>
           </form>
 
-          {/* Mode switch */}
           <div className="mt-5 text-center text-xs text-muted-foreground">
             {mode === "login"  && <>Don't have an account? <button onClick={() => switchMode("signup")} className="text-primary font-semibold hover:underline">Sign up free</button></>}
             {mode === "signup" && <>Already have an account? <button onClick={() => switchMode("login")} className="text-primary font-semibold hover:underline">Sign in</button></>}
@@ -308,8 +359,8 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   const [error,    setError]    = useState("")
   const [success,  setSuccess]  = useState("")
 
-  const symbols  = inst === "EQUITY" ? EQUITY_SYMBOLS : FNO_SYMBOLS
-  const lotSize  = LOT_SIZES[symbol] ?? 1
+  const symbols   = inst === "EQUITY" ? EQUITY_SYMBOLS : FNO_SYMBOLS
+  const lotSize   = LOT_SIZES[symbol] ?? 1
   const actualQty = inst === "EQUITY" ? qty : qty * lotSize
   const turnover  = price ? (price as number) * actualQty : 0
   const charges   = price ? calcCharges(price as number, actualQty, inst, side) : 0
@@ -319,7 +370,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   useEffect(() => { setPrice("") }, [symbol])
 
   async function getPrice() {
-    setFetching(true)
+    setFetching(true); setError("")
     const p = await fetchLivePrice(symbol, inst)
     if (p) setPrice(Math.round(p * 100) / 100)
     else   setError("Could not fetch price. Enter manually.")
@@ -330,16 +381,12 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     ev.preventDefault()
     setError(""); setSuccess("")
     if (!price || (price as number) <= 0) { setError("Enter a valid price"); return }
-    if (qty < 1)                          { setError("Enter valid quantity"); return }
-    if (inst !== "EQUITY" && !expiry)     { setError("Select expiry date"); return }
-    if (inst === "OPTIONS" && !strike)    { setError("Enter strike price"); return }
-    if (side === "BUY" && net > balance)  {
-      setError(`Insufficient balance. Need ${fmt(net)}, have ${fmt(balance)}`); return
-    }
-
+    if (qty < 1)                           { setError("Enter valid quantity"); return }
+    if (inst !== "EQUITY" && !expiry)      { setError("Select expiry date"); return }
+    if (inst === "OPTIONS" && !strike)     { setError("Enter strike price"); return }
+    if (side === "BUY" && net > balance)   { setError(`Insufficient balance. Need ${fmt(net)}, have ${fmt(balance)}`); return }
     setLoading(true)
 
-    // Insert position
     await supabase.from("positions").insert({
       user_id: userId, symbol, instrument_type: inst, trade_type: side,
       quantity: actualQty, avg_price: price, current_price: price,
@@ -348,16 +395,13 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       option_type:  inst === "OPTIONS" ? optType : null,
       lot_size: lotSize, status: "OPEN", pnl: 0,
     })
-
-    // Insert history
     await supabase.from("trade_history").insert({
       user_id: userId, symbol, instrument_type: inst, trade_type: side,
       quantity: actualQty, price, total_value: turnover, charges, net_value: net,
     })
-
-    // Update wallet
-    const newBal = side === "BUY" ? balance - net : balance + net
-    await supabase.from("wallets").update({ balance: newBal, updated_at: new Date().toISOString() }).eq("user_id", userId)
+    await supabase.from("wallets")
+      .update({ balance: side === "BUY" ? balance - net : balance + net, updated_at: new Date().toISOString() })
+      .eq("user_id", userId)
 
     setSuccess(`✅ ${side} ${actualQty} ${symbol} @ ₹${price} | Charges ₹${charges.toFixed(2)}`)
     setLoading(false)
@@ -367,11 +411,9 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   return (
     <form onSubmit={placeTrade} className="bg-card border border-border rounded-xl p-5">
       <h3 className="text-base font-semibold text-foreground mb-4">Place Order</h3>
-
       {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-3">{error}</div>}
       {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-3">{success}</div>}
 
-      {/* Instrument tabs */}
       <div className="flex gap-1 bg-muted p-1 rounded-xl mb-4">
         {(["EQUITY","OPTIONS","FUTURES"] as InstrumentType[]).map(t => (
           <button key={t} type="button" onClick={() => setInst(t)}
@@ -381,7 +423,6 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         ))}
       </div>
 
-      {/* BUY / SELL */}
       <div className="flex gap-2 mb-4">
         {(["BUY","SELL"] as TradeType[]).map(s => (
           <button key={s} type="button" onClick={() => setSide(s)}
@@ -396,7 +437,6 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       </div>
 
       <div className="space-y-3">
-        {/* Symbol */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Symbol</label>
           <div className="relative">
@@ -408,13 +448,11 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           </div>
         </div>
 
-        {/* Options extras */}
         {inst === "OPTIONS" && (
           <div className="grid grid-cols-2 gap-2">
             <div>
               <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Strike Price ₹</label>
-              <input type="number" value={strike} onChange={e => setStrike(Number(e.target.value))}
-                placeholder="e.g. 24800"
+              <input type="number" value={strike} onChange={e => setStrike(Number(e.target.value))} placeholder="e.g. 24800"
                 className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
             </div>
             <div>
@@ -431,7 +469,6 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           </div>
         )}
 
-        {/* Expiry */}
         {inst !== "EQUITY" && (
           <div>
             <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Expiry Date</label>
@@ -441,14 +478,12 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           </div>
         )}
 
-        {/* Price */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
             {inst === "OPTIONS" ? "Option Premium ₹" : "Price ₹"}
           </label>
           <div className="flex gap-2">
-            <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
-              placeholder="Enter or fetch live"
+            <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))} placeholder="Enter or fetch live"
               className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
             <button type="button" onClick={getPrice} disabled={fetching}
               className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50">
@@ -457,20 +492,15 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           </div>
         </div>
 
-        {/* Qty */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "EQUITY" ? "Quantity (shares)" : `Lots  (1 lot = ${lotSize} qty)`}
+            {inst === "EQUITY" ? "Quantity (shares)" : `Lots (1 lot = ${lotSize} qty)`}
           </label>
-          <input type="number" value={qty} min={1}
-            onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))}
+          <input type="number" value={qty} min={1} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))}
             className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-          {inst !== "EQUITY" && (
-            <p className="text-[10px] text-muted-foreground mt-1">Total qty: {fmtN(actualQty)}</p>
-          )}
+          {inst !== "EQUITY" && <p className="text-[10px] text-muted-foreground mt-1">Total qty: {fmtN(actualQty)}</p>}
         </div>
 
-        {/* Summary */}
         {price ? (
           <div className="bg-muted rounded-xl p-3 space-y-1.5 text-xs">
             <div className="flex justify-between"><span className="text-muted-foreground">Turnover</span><span className="font-mono font-semibold">{fmt(turnover)}</span></div>
@@ -481,7 +511,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">Balance after</span>
-              <span className="font-mono font-semibold text-foreground">{fmt(side === "BUY" ? balance - net : balance + net)}</span>
+              <span className="font-mono font-semibold">{fmt(side === "BUY" ? balance - net : balance + net)}</span>
             </div>
           </div>
         ) : null}
@@ -501,7 +531,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// DASHBOARD
+// TRADING DASHBOARD
 // ═════════════════════════════════════════════════════════════════════════════
 
 function TradingDashboard({ userId }: { userId: string }) {
@@ -531,7 +561,7 @@ function TradingDashboard({ userId }: { userId: string }) {
 
   async function closePos(pos: any) {
     setClosing(pos.id)
-    const lp = await fetchLivePrice(pos.symbol, pos.instrument_type) ?? pos.current_price
+    const lp  = await fetchLivePrice(pos.symbol, pos.instrument_type) ?? pos.current_price
     const pnl = (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
     await supabase.from("positions").update({ status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl }).eq("id", pos.id)
     const closeVal = lp * pos.quantity
@@ -547,7 +577,8 @@ function TradingDashboard({ userId }: { userId: string }) {
     load()
   }
 
-  const totalPnL = positions.reduce((s, p) => s + (p.current_price - p.avg_price) * p.quantity * (p.trade_type === "BUY" ? 1 : -1), 0)
+  const totalPnL = positions.reduce((s, p) =>
+    s + (p.current_price - p.avg_price) * p.quantity * (p.trade_type === "BUY" ? 1 : -1), 0)
 
   if (loading) return (
     <div className="flex items-center justify-center py-24">
@@ -557,7 +588,6 @@ function TradingDashboard({ userId }: { userId: string }) {
 
   return (
     <div>
-      {/* Top bar */}
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-2">
           <span className="text-xs bg-primary/10 text-primary px-2 py-1 rounded-full font-semibold">PAPER MONEY</span>
@@ -569,10 +599,12 @@ function TradingDashboard({ userId }: { userId: string }) {
         </button>
       </div>
 
-      {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <div className="bg-card border border-border rounded-xl p-4">
-          <div className="flex items-center gap-1.5 mb-1"><Wallet className="w-3.5 h-3.5 text-primary" /><span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Available Cash</span></div>
+          <div className="flex items-center gap-1.5 mb-1">
+            <Wallet className="w-3.5 h-3.5 text-primary" />
+            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Available Cash</span>
+          </div>
           <div className="font-mono text-lg font-bold text-foreground">{fmt(balance)}</div>
         </div>
         <div className="bg-card border border-border rounded-xl p-4">
@@ -592,13 +624,8 @@ function TradingDashboard({ userId }: { userId: string }) {
         </div>
       </div>
 
-      {/* Main grid */}
       <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
-
-        {/* Trade form */}
         <TradeForm userId={userId} balance={balance} onDone={load} />
-
-        {/* Positions / History */}
         <div>
           <div className="flex gap-1 bg-card border border-border p-1 rounded-xl mb-4 w-fit">
             {([["positions","Positions",BarChart2],["history","History",History]] as const).map(([key, label, Icon]) => (
@@ -607,7 +634,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                 <Icon className="w-3.5 h-3.5" />{label}
               </button>
             ))}
-            <button onClick={load} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors" title="Refresh">
+            <button onClick={load} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors">
               <RefreshCw className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -630,7 +657,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                     </tr></thead>
                     <tbody>
                       {positions.map((pos, i) => {
-                        const pnl = (pos.current_price - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+                        const pnl  = (pos.current_price - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
                         const pos_ = pnl >= 0
                         return (
                           <tr key={pos.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
@@ -641,7 +668,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                             </td>
                             <td className="px-4 py-3">
                               <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                                pos.instrument_type === "EQUITY" ? "bg-primary/10 text-primary" :
+                                pos.instrument_type === "EQUITY"  ? "bg-primary/10 text-primary" :
                                 pos.instrument_type === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
                                 "bg-warning/10 text-warning"}`}>
                                 {pos.instrument_type}
@@ -653,7 +680,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                             <td className="px-4 py-3 font-mono">₹{fmtN(pos.current_price)}</td>
                             <td className="px-4 py-3">
                               <div className={`font-mono font-bold ${pos_ ? "text-success" : "text-destructive"}`}>{pos_ ? "+" : ""}₹{fmtN(Math.abs(pnl))}</div>
-                              <div className={`text-[10px] ${pos_ ? "text-success" : "text-destructive"}`}>{pos_ ? "▲" : "▼"}{Math.abs((pnl / (pos.avg_price * pos.quantity) * 100)).toFixed(2)}%</div>
+                              <div className={`text-[10px] ${pos_ ? "text-success" : "text-destructive"}`}>{pos_ ? "▲" : "▼"}{Math.abs(pnl / (pos.avg_price * pos.quantity) * 100).toFixed(2)}%</div>
                             </td>
                             <td className="px-4 py-3">
                               <button onClick={() => closePos(pos)} disabled={closing === pos.id}
@@ -697,7 +724,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                           <td className="px-4 py-2.5 font-mono">{fmtN(t.quantity)}</td>
                           <td className="px-4 py-2.5 font-mono">₹{fmtN(t.price)}</td>
                           <td className="px-4 py-2.5 font-mono text-warning">₹{fmtN(t.charges)}</td>
-                          <td className="px-4 py-2.5 font-mono font-semibold text-foreground">₹{fmtN(t.net_value)}</td>
+                          <td className="px-4 py-2.5 font-mono font-semibold">₹{fmtN(t.net_value)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -717,7 +744,7 @@ function TradingDashboard({ userId }: { userId: string }) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// PAGE EXPORT — keeps your existing Navbar / Footer
+// PAGE EXPORT
 // ═════════════════════════════════════════════════════════════════════════════
 
 export default function VirtualTradePage() {
@@ -741,14 +768,12 @@ export default function VirtualTradePage() {
       <Navbar />
       <main className="flex-1">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6">
-
           <div className="mb-6">
             <h1 className="text-2xl font-bold text-foreground">Virtual Trading</h1>
             <p className="text-sm text-muted-foreground mt-1">
               Practice Equity, Options & Futures with ₹10,00,000 virtual money — zero real risk
             </p>
           </div>
-
           {!checked ? (
             <div className="flex items-center justify-center py-24">
               <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
@@ -760,7 +785,6 @@ export default function VirtualTradePage() {
               supabase.auth.getUser().then(({ data }) => setUserId(data.user?.id ?? null))
             }} />
           )}
-
         </div>
       </main>
       <Footer />
