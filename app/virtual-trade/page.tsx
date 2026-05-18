@@ -145,13 +145,13 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
   }
 
   async function handleForgot() {
-    const { error: e } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), {
-      redirectTo: `${window.location.origin}/virtual-trade`,
-    })
-    if (e) { setError(e.message); setLoading(false); return }
-    setSuccess("Password reset link sent! Check your email inbox and spam folder.")
-    setLoading(false)
-  }
+  const { error: e } = await supabase.auth.resetPasswordForEmail(
+    email.toLowerCase()
+  )
+  if (e) { setError(e.message); setLoading(false); return }
+  setSuccess("Password reset link sent! Check your email inbox and spam folder.")
+  setLoading(false)
+}
 
   async function submit(ev: React.FormEvent) {
     ev.preventDefault()
