@@ -13,12 +13,19 @@ import {
   X, History, BarChart2, ChevronDown, Wallet,
 } from "lucide-react"
 
+// NSE F&O Lot Sizes — effective January 2026
+// Update when NSE revises (check nseindia.com/circulars)
 const LOT_SIZES: Record<string, number> = {
-  NIFTY: 25, BANKNIFTY: 15, FINNIFTY: 40,
+  // Indices
+  NIFTY: 65, BANKNIFTY: 30, FINNIFTY: 60, MIDCPNIFTY: 120,
+  // Large cap stocks
   RELIANCE: 250, TCS: 150, INFY: 300, HDFCBANK: 550,
   ICICIBANK: 700, SBIN: 1500, BHARTIARTL: 950, ITC: 3200,
   AXISBANK: 1200, BAJFINANCE: 125, MARUTI: 100, SUNPHARMA: 350,
   TATAMOTORS: 1425, WIPRO: 1500, HCLTECH: 700, ONGC: 1925,
+  HINDUNILVR: 300, KOTAKBANK: 400, LT: 150, ASIANPAINT: 200,
+  TITAN: 175, DRREDDY: 125, CIPLA: 650, JSWSTEEL: 600,
+  TATASTEEL: 5500, HINDALCO: 1075, ADANIENT: 625, BAJAJFINSV: 500,
 }
 
 const EQUITY_SYMBOLS = [
@@ -55,16 +62,54 @@ function calcCharges(price: number, qty: number, type: InstrumentType, side: Tra
 
 async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<number | null> {
   try {
-    const ySym = type === "EQUITY" ? `${symbol}.NS`
-      : symbol === "NIFTY" ? "^NSEI"
-      : symbol === "BANKNIFTY" ? "^NSEBANK"
-      : `${symbol}.NS`
-    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
-    const res  = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`)
+    // Map symbol to Yahoo Finance format
+    let ySym: string
+    if (type === "EQUITY") {
+      ySym = `${symbol}.NS`
+    } else if (symbol === "NIFTY") {
+      ySym = "^NSEI"
+    } else if (symbol === "BANKNIFTY") {
+      ySym = "^NSEBANK"
+    } else if (symbol === "FINNIFTY") {
+      ySym = "^NSEMDCP50"
+    } else {
+      ySym = `${symbol}.NS`
+    }
+
+    // Try allorigins proxy first
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
+
+    const res  = await fetch(proxyUrl, { cache: "no-store" })
+    if (!res.ok) throw new Error("Proxy failed")
+
     const body = await res.json()
+    if (!body.contents) throw new Error("Empty response")
+
     const json = JSON.parse(body.contents)
-    return json.chart?.result?.[0]?.meta?.regularMarketPrice ?? null
-  } catch { return null }
+    const price = json.chart?.result?.[0]?.meta?.regularMarketPrice
+
+    if (price && price > 0) return Math.round(price * 100) / 100
+
+    throw new Error("No price in response")
+  } catch (err) {
+    // Try backup proxy
+    try {
+      const ySym2 = type === "EQUITY" ? `${symbol}.NS`
+        : symbol === "NIFTY" ? "^NSEI"
+        : symbol === "BANKNIFTY" ? "^NSEBANK"
+        : `${symbol}.NS`
+
+      const backupUrl = `https://corsproxy.io/?${encodeURIComponent(
+        `https://query2.finance.yahoo.com/v8/finance/chart/${ySym2}?interval=1d&range=1d`
+      )}`
+      const res2  = await fetch(backupUrl, { cache: "no-store" })
+      const json2 = await res2.json()
+      const price2 = json2.chart?.result?.[0]?.meta?.regularMarketPrice
+      if (price2 && price2 > 0) return Math.round(price2 * 100) / 100
+    } catch { }
+    return null
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
