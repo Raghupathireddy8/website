@@ -1,4 +1,32 @@
 "use client"
+
+import { useState } from "react"
+import { supabase } from "@/lib/supabase"
+
+export default function ResetPasswordPage() {
+  const [password, setPassword] = useState("")
+  const [confirm, setConfirm] = useState("")
+  const [message, setMessage] = useState("")
+  const [loading, setLoading] = useState(false)
+
+  async function updatePassword() {
+    if (password !== confirm) {
+      setMessage("Passwords do not match")
+      return
+    }
+
+    setLoading(true)
+
+    const { error } =
+      await supabase.auth.updateUser({
+        password,
+      })
+
+    if (error) {
+      setMessage(error.message)
+    } else {
+      setMessage(
+        "Password updated successfully"
       )
     }
 
@@ -7,7 +35,6 @@
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-[#f5f7ff] px-4">
-
       <div className="w-full max-w-md bg-white border border-gray-100 rounded-3xl p-8 shadow-sm">
 
         <h1 className="text-3xl font-bold mb-6">
@@ -39,7 +66,7 @@
           <button
             onClick={updatePassword}
             disabled={loading}
-            className="w-full h-12 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-semibold"
+            className="w-full h-12 bg-blue-600 text-white rounded-2xl font-semibold"
           >
             {loading
               ? "Updating..."
@@ -51,6 +78,7 @@
               {message}
             </div>
           )}
+
         </div>
       </div>
     </div>
