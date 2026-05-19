@@ -147,8 +147,9 @@ export function AuthPage({ onAuth }: { onAuth: () => void }) {
     if (!email.trim()) { setError("Enter the email linked to your account"); return }
     setLoading(true); setError(""); setSuccess("")
 
-    const { error: resetErr } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password`,
+    const { error: resetErr } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), {
+     redirectTo:
+      "https://marketgreeks.com/reset-password",
     })
 
     if (resetErr) { setError(resetErr.message); setLoading(false); return }
