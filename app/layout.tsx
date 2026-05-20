@@ -16,7 +16,7 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: 'MarketGreeks - Indian Stock Market Tools & Fintech Information',
   description: 'Your complete Indian market toolkit. Free tools for traders & investors including IPO tracker, options screener, virtual trading, tax calculator, and more.',
-  keywords: ['Indian stock market', 'NSE', 'BSE', 'IPO', 'options trading', 'NIFTY', 'SENSEX', 'mutual funds', 'tax calculator'],
+  keywords: ['Indian stock market', 'NSE', 'BSE', 'IPO', 'options trading', 'NIFTY', 'SENSEX', 'mutual funds', 'Calculators'],
 }
 
 export const viewport = {
