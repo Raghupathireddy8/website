@@ -10,15 +10,13 @@ import { Footer } from "@/components/footer"
 import {
   Eye, EyeOff, Phone, Lock, User, ArrowRight, Mail,
   TrendingUp, TrendingDown, RefreshCw, LogOut,
-  X, History, BarChart2, ChevronDown, Wallet,
+  X, History, BarChart2, ChevronDown, Wallet, KeyRound,
 } from "lucide-react"
 
-// NSE F&O Lot Sizes — effective January 2026
-// Update when NSE revises (check nseindia.com/circulars)
+// ─── NSE F&O Lot Sizes — effective 2025-26 ───────────────────────────────────
+// Update when NSE revises: check nseindia.com/circulars
 const LOT_SIZES: Record<string, number> = {
-  // Indices
-  NIFTY: 65, BANKNIFTY: 30, FINNIFTY: 60, MIDCPNIFTY: 120,
-  // Large cap stocks
+  NIFTY: 75, BANKNIFTY: 30, FINNIFTY: 60, MIDCPNIFTY: 120,
   RELIANCE: 250, TCS: 150, INFY: 300, HDFCBANK: 550,
   ICICIBANK: 700, SBIN: 1500, BHARTIARTL: 950, ITC: 3200,
   AXISBANK: 1200, BAJFINANCE: 125, MARUTI: 100, SUNPHARMA: 350,
@@ -26,86 +24,154 @@ const LOT_SIZES: Record<string, number> = {
   HINDUNILVR: 300, KOTAKBANK: 400, LT: 150, ASIANPAINT: 200,
   TITAN: 175, DRREDDY: 125, CIPLA: 650, JSWSTEEL: 600,
   TATASTEEL: 5500, HINDALCO: 1075, ADANIENT: 625, BAJAJFINSV: 500,
+  NESTLEIND: 40, COALINDIA: 4200, ULTRACEMCO: 100, POWERGRID: 4700,
+  NTPC: 3750, BPCL: 4800, EICHERMOT: 175, HEROMOTOCO: 300,
+  GRASIM: 475, INDUSINDBK: 700, TATACONSUM: 1100, DIVISLAB: 200,
 }
 
-const EQUITY_SYMBOLS = [
-  "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR",
-  "SBIN","BHARTIARTL","ITC","KOTAKBANK","LT","AXISBANK",
-  "ASIANPAINT","MARUTI","TITAN","SUNPHARMA","WIPRO","HCLTECH",
-  "ONGC","COALINDIA","TATAMOTORS","JSWSTEEL","BAJFINANCE","NESTLEIND",
+// ─── Nifty 50 stocks only ─────────────────────────────────────────────────────
+const NIFTY50_EQUITY = [
+  "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","SBIN",
+  "BHARTIARTL","ITC","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI",
+  "TITAN","SUNPHARMA","WIPRO","HCLTECH","ONGC","COALINDIA","TATAMOTORS",
+  "JSWSTEEL","BAJFINANCE","NESTLEIND","NTPC","POWERGRID","ULTRACEMCO",
+  "BPCL","EICHERMOT","HEROMOTOCO","GRASIM","TATASTEEL","HINDALCO",
+  "ADANIENT","BAJAJFINSV","DRREDDY","CIPLA","DIVISLAB","INDUSINDBK","TATACONSUM",
 ]
 
-const FNO_SYMBOLS = [
-  "NIFTY","BANKNIFTY","RELIANCE","TCS","HDFCBANK","INFY",
-  "ICICIBANK","SBIN","BHARTIARTL","ITC","AXISBANK","BAJFINANCE",
-  "MARUTI","SUNPHARMA","TATAMOTORS","WIPRO","HCLTECH","ONGC",
+const NIFTY50_FNO = [
+  "NIFTY","BANKNIFTY","FINNIFTY",
+  ...NIFTY50_EQUITY,
 ]
 
 type InstrumentType = "EQUITY" | "OPTIONS" | "FUTURES"
 type TradeType      = "BUY" | "SELL"
 type OptionType     = "CE" | "PE"
-type AuthMode       = "login" | "signup" | "forgot" | "verify"
+type AuthMode       = "login" | "signup" | "forgot" | "verify" | "reset"
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmt  = (n: number) =>
   new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(n)
 const fmtN = (n: number) =>
   new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n)
 
-function calcCharges(price: number, qty: number, type: InstrumentType, side: TradeType) {
-  const to        = price * qty
+// ─── Generate expiry dates ────────────────────────────────────────────────────
+// NSE expiry: last Thursday of each month for monthly, every Thursday for weekly (Nifty)
+function getThursdaysForNext3Months(): string[] {
+  const dates: string[] = []
+  const now = new Date()
+  const end = new Date(now)
+  end.setMonth(end.getMonth() + 3)
+
+  const d = new Date(now)
+  d.setDate(d.getDate() + ((4 - d.getDay() + 7) % 7 || 7)) // next Thursday
+
+  while (d <= end) {
+    dates.push(d.toISOString().split("T")[0])
+    d.setDate(d.getDate() + 7)
+  }
+  return dates
+}
+
+function getMonthlyExpiries(): string[] {
+  // Last Thursday of each month for next 3 months
+  const dates: string[] = []
+  const now = new Date()
+  for (let m = 0; m < 3; m++) {
+    const month = new Date(now.getFullYear(), now.getMonth() + m + 1, 0) // last day of month
+    // Find last Thursday
+    while (month.getDay() !== 4) month.setDate(month.getDate() - 1)
+    const iso = month.toISOString().split("T")[0]
+    if (!dates.includes(iso)) dates.push(iso)
+  }
+  return dates
+}
+
+function formatExpiry(iso: string): string {
+  const d = new Date(iso)
+  return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "2-digit" })
+}
+
+// ─── Black-Scholes option pricing ────────────────────────────────────────────
+function normalCDF(x: number): number {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911
+  const sign = x < 0 ? -1 : 1
+  x = Math.abs(x) / Math.sqrt(2)
+  const t = 1.0 / (1.0 + p * x)
+  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x)
+  return 0.5 * (1.0 + sign * y)
+}
+
+function blackScholes(
+  S: number,      // spot price
+  K: number,      // strike price
+  T: number,      // time to expiry in years
+  r: number,      // risk-free rate (0.065 for India)
+  sigma: number,  // volatility (IV)
+  type: "CE" | "PE"
+): number {
+  if (T <= 0) return Math.max(type === "CE" ? S - K : K - S, 0)
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T))
+  const d2 = d1 - sigma * Math.sqrt(T)
+  if (type === "CE") {
+    return S * normalCDF(d1) - K * Math.exp(-r * T) * normalCDF(d2)
+  } else {
+    return K * Math.exp(-r * T) * normalCDF(-d2) - S * normalCDF(-d1)
+  }
+}
+
+function calcOptionPremium(
+  spot: number,
+  strike: number,
+  expiryDate: string,
+  optType: OptionType,
+  iv = 0.18 // default 18% IV — typical for Nifty
+): number {
+  const now   = new Date()
+  const expiry = new Date(expiryDate)
+  const T     = Math.max((expiry.getTime() - now.getTime()) / (365 * 24 * 60 * 60 * 1000), 0)
+  const premium = blackScholes(spot, strike, T, 0.065, iv, optType)
+  return Math.round(premium * 100) / 100
+}
+
+// ─── Charges calculation ──────────────────────────────────────────────────────
+function calcCharges(premium: number, qty: number, type: InstrumentType, side: TradeType) {
+  // For options: turnover = premium * qty (NOT spot * qty)
+  const to        = premium * qty
   const brokerage = type === "EQUITY" ? Math.min(20, to * 0.0003) : 20
-  const stt       = side === "SELL" && type === "EQUITY" ? to * 0.001 : 0
+  const stt       = side === "SELL" && type === "EQUITY" ? to * 0.001
+                  : side === "SELL" && type === "OPTIONS" ? to * 0.0005 : 0
   const other     = to * 0.0000695
   const stamp     = side === "BUY" ? to * 0.00015 : 0
   return Math.round((brokerage + stt + other + stamp) * 100) / 100
 }
 
+// ─── Live price fetch ─────────────────────────────────────────────────────────
 async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<number | null> {
   try {
-    // Map symbol to Yahoo Finance format
-    let ySym: string
-    if (type === "EQUITY") {
-      ySym = `${symbol}.NS`
-    } else if (symbol === "NIFTY") {
-      ySym = "^NSEI"
-    } else if (symbol === "BANKNIFTY") {
-      ySym = "^NSEBANK"
-    } else if (symbol === "FINNIFTY") {
-      ySym = "^NSEMDCP50"
-    } else {
-      ySym = `${symbol}.NS`
-    }
+    const ySym = type === "EQUITY" ? `${symbol}.NS`
+      : symbol === "NIFTY"     ? "^NSEI"
+      : symbol === "BANKNIFTY" ? "^NSEBANK"
+      : symbol === "FINNIFTY"  ? "^NSEMDCP50"
+      : `${symbol}.NS`
 
-    // Try allorigins proxy first
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
+    const url      = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
     const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
-
-    const res  = await fetch(proxyUrl, { cache: "no-store" })
-    if (!res.ok) throw new Error("Proxy failed")
-
-    const body = await res.json()
-    if (!body.contents) throw new Error("Empty response")
-
-    const json = JSON.parse(body.contents)
+    const res      = await fetch(proxyUrl, { cache: "no-store" })
+    if (!res.ok) throw new Error("proxy failed")
+    const body  = await res.json()
+    const json  = JSON.parse(body.contents)
     const price = json.chart?.result?.[0]?.meta?.regularMarketPrice
-
     if (price && price > 0) return Math.round(price * 100) / 100
-
-    throw new Error("No price in response")
-  } catch (err) {
-    // Try backup proxy
+    throw new Error("no price")
+  } catch {
     try {
-      const ySym2 = type === "EQUITY" ? `${symbol}.NS`
-        : symbol === "NIFTY" ? "^NSEI"
-        : symbol === "BANKNIFTY" ? "^NSEBANK"
-        : `${symbol}.NS`
-
-      const backupUrl = `https://corsproxy.io/?${encodeURIComponent(
-        `https://query2.finance.yahoo.com/v8/finance/chart/${ySym2}?interval=1d&range=1d`
-      )}`
-      const res2  = await fetch(backupUrl, { cache: "no-store" })
-      const json2 = await res2.json()
-      const price2 = json2.chart?.result?.[0]?.meta?.regularMarketPrice
+      const ySym2    = symbol === "NIFTY" ? "^NSEI" : symbol === "BANKNIFTY" ? "^NSEBANK" : `${symbol}.NS`
+      const backup   = `https://corsproxy.io/?${encodeURIComponent(`https://query2.finance.yahoo.com/v8/finance/chart/${ySym2}?interval=1d&range=1d`)}`
+      const res2     = await fetch(backup, { cache: "no-store" })
+      const json2    = await res2.json()
+      const price2   = json2.chart?.result?.[0]?.meta?.regularMarketPrice
       if (price2 && price2 > 0) return Math.round(price2 * 100) / 100
     } catch { }
     return null
@@ -130,73 +196,143 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
 
   const normMobile = (m: string) => m.replace(/\D/g, "").slice(-10)
 
+  // ── Check if coming back from password reset email ────────────────────────
+  useEffect(() => {
+    const hash = window.location.hash
+    if (hash.includes("type=recovery")) {
+      setMode("reset")
+    }
+  }, [])
+
   function validate() {
     if (mode === "forgot") return email ? "" : "Enter your registered email"
+    if (mode === "reset")  {
+      if (!password)              return "Enter new password"
+      if (password.length < 8)   return "Password must be at least 8 characters"
+      if (password !== confirm)  return "Passwords do not match"
+      return ""
+    }
     const m = normMobile(mobile)
     if (m.length !== 10)  return "Enter a valid 10-digit mobile number"
     if (!password)        return "Enter your password"
     if (mode === "signup") {
-      if (!fullName.trim())          return "Enter your full name"
-      if (!email.trim())             return "Enter your email address"
+      if (!fullName.trim())             return "Enter your full name"
+      if (!email.trim())                return "Enter your email address"
       if (!/\S+@\S+\.\S+/.test(email)) return "Enter a valid email"
-      if (password.length < 8)      return "Password must be at least 8 characters"
-      if (password !== confirm)     return "Passwords do not match"
+      if (password.length < 8)         return "Password must be at least 8 characters"
+      if (password !== confirm)        return "Passwords do not match"
     }
     return ""
   }
 
+  // ── Signup ────────────────────────────────────────────────────────────────
   async function handleSignup() {
     const m = normMobile(mobile)
 
-    const { data: exMobile } = await supabase.from("profiles").select("id").eq("mobile", m).maybeSingle()
-    if (exMobile) { setError("Mobile already registered. Please sign in."); setLoading(false); return }
+    // Check mobile uniqueness
+    const { data: exMobile } = await supabase
+      .from("profiles").select("id").eq("mobile", m).maybeSingle()
+    if (exMobile) {
+      setError("Mobile already registered. Please sign in.")
+      setLoading(false); return
+    }
 
-    const { data: exEmail } = await supabase.from("profiles").select("id").eq("email", email.toLowerCase()).maybeSingle()
-    if (exEmail) { setError("Email already registered. Please sign in."); setLoading(false); return }
+    // Check email uniqueness
+    const { data: exEmail } = await supabase
+      .from("profiles").select("id").eq("email", email.toLowerCase()).maybeSingle()
+    if (exEmail) {
+      setError("Email already registered. Please sign in.")
+      setLoading(false); return
+    }
 
     const { data, error: e } = await supabase.auth.signUp({
-      email: email.toLowerCase(), password,
-      options: {
-        data: { full_name: fullName, mobile: m },        
-      },
+      email: email.toLowerCase(),
+      password,
     })
-    if (e) { setError(e.message); setLoading(false); return }
+
+    if (e) {
+      // "User already registered" means they signed up but never verified email
+      if (e.message.toLowerCase().includes("already registered") ||
+          e.message.toLowerCase().includes("already exists")) {
+        setError("An account with this email exists but may not be verified. Check your inbox for a verification link, or use Forgot Password.")
+      } else {
+        setError(e.message)
+      }
+      setLoading(false); return
+    }
 
     const uid = data.user?.id
     if (!uid) { setError("Signup failed. Try again."); setLoading(false); return }
 
-    await supabase.from("profiles").insert({ id: uid, mobile: m, full_name: fullName, email: email.toLowerCase() })
-    await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
+    // Insert profile — upsert to handle edge case of re-signup
+    await supabase.from("profiles").upsert({
+      id: uid, mobile: m, full_name: fullName, email: email.toLowerCase()
+    })
+
+    // Create wallet only if it doesn't exist
+    const { data: existingWallet } = await supabase
+      .from("wallets").select("id").eq("user_id", uid).maybeSingle()
+    if (!existingWallet) {
+      await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
+    }
 
     setMode("verify")
     setLoading(false)
   }
 
+  // ── Login ─────────────────────────────────────────────────────────────────
   async function handleLogin() {
     const m = normMobile(mobile)
-    const { data: profile } = await supabase.from("profiles").select("email").eq("mobile", m).maybeSingle()
-    if (!profile?.email) { setError("Mobile number not registered. Please sign up first."); setLoading(false); return }
 
-    const { error: e } = await supabase.auth.signInWithPassword({ email: profile.email, password })
-    if (e) {
-      setError(e.message.includes("Email not confirmed")
-        ? "Please verify your email first. Check your inbox for the verification link."
-        : "Invalid mobile number or password.")
-      setLoading(false)
-      return
+    // Look up email from mobile
+    const { data: profile, error: profileErr } = await supabase
+      .from("profiles").select("email").eq("mobile", m).maybeSingle()
+
+    if (profileErr || !profile?.email) {
+      setError("Mobile number not registered. Please sign up first.")
+      setLoading(false); return
     }
+
+    const { error: e } = await supabase.auth.signInWithPassword({
+      email: profile.email,
+      password,
+    })
+
+    if (e) {
+      if (e.message.toLowerCase().includes("email not confirmed")) {
+        setError("Email not verified. Check your inbox for the verification link.")
+      } else if (e.message.toLowerCase().includes("invalid login")) {
+        setError("Wrong password. Try again or use Forgot Password.")
+      } else {
+        setError(e.message)
+      }
+      setLoading(false); return
+    }
+
     onAuth()
     setLoading(false)
   }
 
+  // ── Forgot password ───────────────────────────────────────────────────────
   async function handleForgot() {
-  const { error: e } = await supabase.auth.resetPasswordForEmail(
-    email.toLowerCase()
-  )
-  if (e) { setError(e.message); setLoading(false); return }
-  setSuccess("Password reset link sent! Check your email inbox and spam folder.")
-  setLoading(false)
-}
+    const { error: e } = await supabase.auth.resetPasswordForEmail(
+      email.toLowerCase()
+    )
+    if (e) { setError(e.message); setLoading(false); return }
+    setSuccess("Reset link sent! Check your inbox and spam folder. Click the link to set a new password.")
+    setLoading(false)
+  }
+
+  // ── Reset password (after clicking email link) ────────────────────────────
+  async function handleReset() {
+    const { error: e } = await supabase.auth.updateUser({ password })
+    if (e) { setError(e.message); setLoading(false); return }
+    setSuccess("Password updated successfully!")
+    // Clear hash from URL
+    window.history.replaceState({}, document.title, window.location.pathname)
+    setTimeout(() => { setMode("login"); setPassword(""); setConfirm("") }, 1500)
+    setLoading(false)
+  }
 
   async function submit(ev: React.FormEvent) {
     ev.preventDefault()
@@ -206,6 +342,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     if (mode === "signup") await handleSignup()
     if (mode === "login")  await handleLogin()
     if (mode === "forgot") await handleForgot()
+    if (mode === "reset")  await handleReset()
   }
 
   const switchMode = (m: AuthMode) => {
@@ -213,7 +350,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     setMobile(""); setEmail(""); setPassword(""); setConfirm(""); setFullName("")
   }
 
-  // Email verification screen
+  // ── Email verification screen ─────────────────────────────────────────────
   if (mode === "verify") {
     return (
       <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
@@ -226,10 +363,9 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
             We sent a verification link to <strong>{email}</strong>
           </p>
           <div className="bg-card border border-border rounded-2xl p-5 text-left space-y-3 mb-6">
-            <p className="text-xs font-semibold text-foreground">Steps to activate your account:</p>
             {[
               `Open your inbox for ${email}`,
-              `Click "Confirm your email" link from MarketGreeks`,
+              `Click the "Confirm your email" link from MarketGreeks`,
               "Come back here and sign in with your mobile number and password",
               "Check spam/junk folder if you don't see it",
             ].map((step, i) => (
@@ -254,30 +390,81 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     )
   }
 
+  // ── Reset password screen (shown when user clicks email link) ─────────────
+  if (mode === "reset") {
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
+        <div className="w-full max-w-md">
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center justify-center w-14 h-14 bg-primary rounded-2xl mb-3">
+              <KeyRound className="w-7 h-7 text-primary-foreground" />
+            </div>
+            <h2 className="text-2xl font-bold text-foreground">Set New Password</h2>
+            <p className="text-sm text-muted-foreground mt-1">Choose a strong password for your account</p>
+          </div>
+          <div className="bg-card border border-border rounded-2xl p-6">
+            {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
+            {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
+            <form onSubmit={submit} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">New Password</label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input type={showPass ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)}
+                    placeholder="Min 8 characters"
+                    className="w-full pl-9 pr-10 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                  <button type="button" onClick={() => setShowPass(!showPass)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                    {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Confirm New Password</label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input type={showPass ? "text" : "password"} value={confirm} onChange={e => setConfirm(e.target.value)}
+                    placeholder="Re-enter new password"
+                    className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                </div>
+              </div>
+              <button type="submit" disabled={loading}
+                className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
+                {loading
+                  ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                  : <><span>Update Password</span><ArrowRight className="w-4 h-4" /></>
+                }
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Main auth form ────────────────────────────────────────────────────────
   return (
     <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
       <div className="w-full max-w-md">
-
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-14 h-14 bg-primary rounded-2xl mb-3">
             <TrendingUp className="w-7 h-7 text-primary-foreground" />
           </div>
           <h2 className="text-2xl font-bold text-foreground">Virtual Trading</h2>
           <p className="text-sm text-muted-foreground mt-1">
-            {mode === "signup" ? "Create account & get ₹10L virtual money" :
-             mode === "forgot" ? "Reset your password via email" :
-             "Sign in with your mobile number"}
+            {mode === "signup" ? "Create account & get ₹10L virtual money"
+            : mode === "forgot" ? "Reset your password via email"
+            : "Sign in with your mobile number"}
           </p>
         </div>
 
         <div className="bg-card border border-border rounded-2xl p-6">
-
           {mode === "signup" && (
             <div className="bg-primary/10 rounded-xl p-3 mb-5 flex items-center gap-3">
               <span className="text-2xl">💰</span>
               <div>
                 <p className="text-xs font-bold text-primary">Free ₹10,00,000 Virtual Wallet</p>
-                <p className="text-[11px] text-muted-foreground">Trade Equity, Options & Futures. No real money.</p>
+                <p className="text-[11px] text-muted-foreground">Trade Nifty 50 Equity, Options & Futures. No real money.</p>
               </div>
             </div>
           )}
@@ -286,7 +473,6 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
           {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
 
           <form onSubmit={submit} className="space-y-4">
-
             {mode === "signup" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Full Name</label>
@@ -322,9 +508,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
                   <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@gmail.com"
                     className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
                 </div>
-                {mode === "signup" && (
-                  <p className="text-[10px] text-muted-foreground mt-1">Verification link sent here. Also used for password reset.</p>
-                )}
+                {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">Verification link sent here. Also used for password reset.</p>}
               </div>
             )}
 
@@ -376,7 +560,6 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
             {mode === "forgot" && <button onClick={() => switchMode("login")} className="text-primary font-semibold hover:underline">← Back to Sign In</button>}
           </div>
         </div>
-
         <p className="text-center text-[10px] text-muted-foreground mt-4">
           Virtual trading only. No real money. For educational purposes. Not SEBI registered.
         </p>
@@ -390,64 +573,134 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 function TradeForm({ userId, balance, onDone }: { userId: string; balance: number; onDone: () => void }) {
-  const [inst,     setInst]     = useState<InstrumentType>("EQUITY")
-  const [side,     setSide]     = useState<TradeType>("BUY")
-  const [symbol,   setSymbol]   = useState("RELIANCE")
-  const [qty,      setQty]      = useState(1)
-  const [price,    setPrice]    = useState<number | "">("")
-  const [strike,   setStrike]   = useState<number | "">("")
-  const [optType,  setOptType]  = useState<OptionType>("CE")
-  const [expiry,   setExpiry]   = useState("")
-  const [fetching, setFetching] = useState(false)
-  const [loading,  setLoading]  = useState(false)
-  const [error,    setError]    = useState("")
-  const [success,  setSuccess]  = useState("")
+  const [inst,      setInst]      = useState<InstrumentType>("EQUITY")
+  const [side,      setSide]      = useState<TradeType>("BUY")
+  const [symbol,    setSymbol]    = useState("RELIANCE")
+  const [qty,       setQty]       = useState(1)
+  const [price,     setPrice]     = useState<number | "">("")
+  const [strike,    setStrike]    = useState<number | "">("")
+  const [optType,   setOptType]   = useState<OptionType>("CE")
+  const [expiry,    setExpiry]    = useState("")
+  const [fetching,  setFetching]  = useState(false)
+  const [loading,   setLoading]   = useState(false)
+  const [error,     setError]     = useState("")
+  const [success,   setSuccess]   = useState("")
+  const [spotPrice, setSpotPrice] = useState<number | null>(null)
 
-  const symbols   = inst === "EQUITY" ? EQUITY_SYMBOLS : FNO_SYMBOLS
-  const lotSize   = LOT_SIZES[symbol] ?? 1
+  const symbols  = inst === "EQUITY" ? NIFTY50_EQUITY : NIFTY50_FNO
+  const lotSize  = LOT_SIZES[symbol] ?? 1
   const actualQty = inst === "EQUITY" ? qty : qty * lotSize
-  const turnover  = price ? (price as number) * actualQty : 0
-  const charges   = price ? calcCharges(price as number, actualQty, inst, side) : 0
-  const net       = side === "BUY" ? turnover + charges : turnover - charges
 
-  useEffect(() => { setSymbol(symbols[0]); setPrice("") }, [inst])
-  useEffect(() => { setPrice("") }, [symbol])
+  // Expiry options — weekly for Nifty, monthly for others
+  const expiryOptions = symbol === "NIFTY"
+    ? getThursdaysForNext3Months()
+    : getMonthlyExpiries()
+
+  // For options: cost = premium * qty (not spot * qty)
+  // For equity/futures: cost = price * qty
+  const premiumPerUnit = price as number || 0
+  const turnover = premiumPerUnit * actualQty
+  const charges  = premiumPerUnit ? calcCharges(premiumPerUnit, actualQty, inst, side) : 0
+  const net      = side === "BUY" ? turnover + charges : turnover - charges
+
+  useEffect(() => { setSymbol(symbols[0]); setPrice(""); setSpotPrice(null) }, [inst])
+  useEffect(() => { setPrice(""); setSpotPrice(null) }, [symbol])
+  useEffect(() => {
+    if (expiryOptions.length > 0 && !expiry) setExpiry(expiryOptions[0])
+  }, [symbol, inst])
 
   async function getPrice() {
     setFetching(true); setError("")
     const p = await fetchLivePrice(symbol, inst)
-    if (p) setPrice(Math.round(p * 100) / 100)
-    else   setError("Could not fetch price. Enter manually.")
+    if (p) {
+      setSpotPrice(p)
+      if (inst === "OPTIONS" && strike && expiry) {
+        // Calculate Black-Scholes premium
+        const bs = calcOptionPremium(p, strike as number, expiry, optType)
+        setPrice(bs)
+      } else if (inst !== "OPTIONS") {
+        setPrice(p)
+      }
+    } else {
+      setError("Could not fetch price. Enter manually.")
+    }
     setFetching(false)
   }
+
+  // Auto-recalculate BS premium when strike/expiry/optType changes
+  useEffect(() => {
+    if (inst === "OPTIONS" && spotPrice && strike && expiry) {
+      const bs = calcOptionPremium(spotPrice, strike as number, expiry, optType)
+      setPrice(bs)
+    }
+  }, [strike, expiry, optType, spotPrice, inst])
 
   async function placeTrade(ev: React.FormEvent) {
     ev.preventDefault()
     setError(""); setSuccess("")
-    if (!price || (price as number) <= 0) { setError("Enter a valid price"); return }
+
+    if (!price || (price as number) <= 0) { setError("Enter or fetch a valid price"); return }
     if (qty < 1)                           { setError("Enter valid quantity"); return }
     if (inst !== "EQUITY" && !expiry)      { setError("Select expiry date"); return }
     if (inst === "OPTIONS" && !strike)     { setError("Enter strike price"); return }
-    if (side === "BUY" && net > balance)   { setError(`Insufficient balance. Need ${fmt(net)}, have ${fmt(balance)}`); return }
+    if (side === "BUY" && net > balance)   {
+      setError(`Insufficient balance. Need ${fmt(net)}, have ${fmt(balance)}`); return
+    }
+
     setLoading(true)
 
-    await supabase.from("positions").insert({
-      user_id: userId, symbol, instrument_type: inst, trade_type: side,
-      quantity: actualQty, avg_price: price, current_price: price,
-      expiry: expiry || null,
-      strike_price: inst === "OPTIONS" ? strike : null,
-      option_type:  inst === "OPTIONS" ? optType : null,
-      lot_size: lotSize, status: "OPEN", pnl: 0,
+    // ── Insert position ──────────────────────────────────────────────────────
+    const { error: posErr } = await supabase.from("positions").insert({
+      user_id:         userId,
+      symbol,
+      instrument_type: inst,
+      trade_type:      side,
+      quantity:        actualQty,
+      avg_price:       price,
+      current_price:   price,
+      expiry:          expiry || null,
+      strike_price:    inst === "OPTIONS" ? strike : null,
+      option_type:     inst === "OPTIONS" ? optType : null,
+      lot_size:        lotSize,
+      status:          "OPEN",
+      pnl:             0,
     })
+
+    if (posErr) {
+      setError(`Failed to place trade: ${posErr.message}`)
+      setLoading(false); return
+    }
+
+    // ── Insert trade history ─────────────────────────────────────────────────
     await supabase.from("trade_history").insert({
-      user_id: userId, symbol, instrument_type: inst, trade_type: side,
-      quantity: actualQty, price, total_value: turnover, charges, net_value: net,
+      user_id:         userId,
+      symbol,
+      instrument_type: inst,
+      trade_type:      side,
+      quantity:        actualQty,
+      price:           price,
+      total_value:     turnover,
+      charges,
+      net_value:       net,
     })
-    await supabase.from("wallets")
-      .update({ balance: side === "BUY" ? balance - net : balance + net, updated_at: new Date().toISOString() })
+
+    // ── Update wallet balance ────────────────────────────────────────────────
+    const newBalance = side === "BUY" ? balance - net : balance + net
+    const { error: walletErr } = await supabase
+      .from("wallets")
+      .update({ balance: newBalance, updated_at: new Date().toISOString() })
       .eq("user_id", userId)
 
-    setSuccess(`✅ ${side} ${actualQty} ${symbol} @ ₹${price} | Charges ₹${charges.toFixed(2)}`)
+    if (walletErr) {
+      setError(`Trade saved but wallet update failed: ${walletErr.message}`)
+      setLoading(false); return
+    }
+
+    setSuccess(
+      inst === "OPTIONS"
+        ? `✅ ${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${price} premium | Charges ₹${charges.toFixed(2)}`
+        : `✅ ${side} ${actualQty} ${symbol} @ ₹${price} | Charges ₹${charges.toFixed(2)}`
+    )
     setLoading(false)
     onDone()
   }
@@ -455,9 +708,11 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   return (
     <form onSubmit={placeTrade} className="bg-card border border-border rounded-xl p-5">
       <h3 className="text-base font-semibold text-foreground mb-4">Place Order</h3>
+
       {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-3">{error}</div>}
       {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-3">{success}</div>}
 
+      {/* Instrument tabs */}
       <div className="flex gap-1 bg-muted p-1 rounded-xl mb-4">
         {(["EQUITY","OPTIONS","FUTURES"] as InstrumentType[]).map(t => (
           <button key={t} type="button" onClick={() => setInst(t)}
@@ -467,6 +722,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         ))}
       </div>
 
+      {/* BUY / SELL */}
       <div className="flex gap-2 mb-4">
         {(["BUY","SELL"] as TradeType[]).map(s => (
           <button key={s} type="button" onClick={() => setSide(s)}
@@ -481,8 +737,12 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       </div>
 
       <div className="space-y-3">
+
+        {/* Symbol */}
         <div>
-          <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Symbol</label>
+          <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
+            Symbol <span className="text-primary">(Nifty 50)</span>
+          </label>
           <div className="relative">
             <select value={symbol} onChange={e => setSymbol(e.target.value)}
               className="w-full appearance-none bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary">
@@ -492,11 +752,31 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           </div>
         </div>
 
+        {/* Expiry — options and futures */}
+        {inst !== "EQUITY" && (
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
+              Expiry Date {symbol === "NIFTY" && <span className="text-primary">(Weekly)</span>}
+            </label>
+            <div className="relative">
+              <select value={expiry} onChange={e => setExpiry(e.target.value)}
+                className="w-full appearance-none bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary">
+                {expiryOptions.map(d => (
+                  <option key={d} value={d}>{formatExpiry(d)}</option>
+                ))}
+              </select>
+              <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+            </div>
+          </div>
+        )}
+
+        {/* Options: strike + CE/PE */}
         {inst === "OPTIONS" && (
           <div className="grid grid-cols-2 gap-2">
             <div>
               <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Strike Price ₹</label>
-              <input type="number" value={strike} onChange={e => setStrike(Number(e.target.value))} placeholder="e.g. 24800"
+              <input type="number" value={strike} onChange={e => setStrike(Number(e.target.value))}
+                placeholder="e.g. 24800" step="50"
                 className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
             </div>
             <div>
@@ -513,29 +793,28 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           </div>
         )}
 
-        {inst !== "EQUITY" && (
-          <div>
-            <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Expiry Date</label>
-            <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)}
-              min={new Date().toISOString().split("T")[0]}
-              className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-          </div>
-        )}
-
+        {/* Price / Premium */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "OPTIONS" ? "Option Premium ₹" : "Price ₹"}
+            {inst === "OPTIONS" ? "Option Premium ₹ (Black-Scholes)" : "Price ₹"}
           </label>
           <div className="flex gap-2">
-            <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))} placeholder="Enter or fetch live"
+            <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
+              placeholder={inst === "OPTIONS" ? "Fetch after entering strike" : "Enter or fetch live"}
               className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
             <button type="button" onClick={getPrice} disabled={fetching}
-              className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50">
-              {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Live ₹"}
+              className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap">
+              {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : inst === "OPTIONS" ? "Fetch & Calc" : "Live ₹"}
             </button>
           </div>
+          {inst === "OPTIONS" && spotPrice && (
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Spot: ₹{fmtN(spotPrice)} · Premium calculated using Black-Scholes (IV 18%)
+            </p>
+          )}
         </div>
 
+        {/* Quantity */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
             {inst === "EQUITY" ? "Quantity (shares)" : `Lots (1 lot = ${lotSize} qty)`}
@@ -545,10 +824,23 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           {inst !== "EQUITY" && <p className="text-[10px] text-muted-foreground mt-1">Total qty: {fmtN(actualQty)}</p>}
         </div>
 
+        {/* Order summary */}
         {price ? (
           <div className="bg-muted rounded-xl p-3 space-y-1.5 text-xs">
-            <div className="flex justify-between"><span className="text-muted-foreground">Turnover</span><span className="font-mono font-semibold">{fmt(turnover)}</span></div>
-            <div className="flex justify-between"><span className="text-muted-foreground">Charges</span><span className="font-mono text-warning">+{fmt(charges)}</span></div>
+            {inst === "OPTIONS" && (
+              <div className="flex justify-between text-primary font-semibold border-b border-border pb-1.5 mb-1">
+                <span>Premium × Qty</span>
+                <span className="font-mono">₹{fmtN(premiumPerUnit)} × {actualQty} = {fmt(turnover)}</span>
+              </div>
+            )}
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">{inst === "OPTIONS" ? "Total Premium" : "Turnover"}</span>
+              <span className="font-mono font-semibold">{fmt(turnover)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Charges</span>
+              <span className="font-mono text-warning">+{fmt(charges)}</span>
+            </div>
             <div className="flex justify-between border-t border-border pt-1.5">
               <span className="font-semibold text-foreground">{side === "BUY" ? "Total debit" : "Total credit"}</span>
               <span className={`font-mono font-bold ${side === "BUY" ? "text-destructive" : "text-success"}`}>{fmt(net)}</span>
@@ -566,7 +858,9 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
           }`}>
           {loading
             ? <div className="w-4 h-4 border-2 border-current/30 border-t-current rounded-full animate-spin" />
-            : `${side} ${inst === "EQUITY" ? `${qty} shares` : `${qty} lot${qty > 1 ? "s" : ""}`} of ${symbol}`
+            : inst === "OPTIONS"
+              ? `${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike || ""}${optType}`
+              : `${side} ${inst === "EQUITY" ? `${qty} shares` : `${qty} lot${qty > 1 ? "s" : ""}`} of ${symbol}`
           }
         </button>
       </div>
@@ -606,12 +900,24 @@ function TradingDashboard({ userId }: { userId: string }) {
   async function closePos(pos: any) {
     setClosing(pos.id)
     const lp  = await fetchLivePrice(pos.symbol, pos.instrument_type) ?? pos.current_price
-    const pnl = (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
-    await supabase.from("positions").update({ status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl }).eq("id", pos.id)
+
+    // For options: P&L based on premium change, not spot change
+    const pnl = pos.instrument_type === "OPTIONS"
+      ? (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+      : (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+
+    await supabase.from("positions").update({
+      status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl,
+    }).eq("id", pos.id)
+
     const closeVal = lp * pos.quantity
     const ch       = calcCharges(lp, pos.quantity, pos.instrument_type, pos.trade_type === "BUY" ? "SELL" : "BUY")
     const ret      = pos.trade_type === "BUY" ? closeVal - ch : closeVal + ch
-    await supabase.from("wallets").update({ balance: balance + ret, updated_at: new Date().toISOString() }).eq("user_id", userId)
+
+    await supabase.from("wallets")
+      .update({ balance: balance + ret, updated_at: new Date().toISOString() })
+      .eq("user_id", userId)
+
     await supabase.from("trade_history").insert({
       user_id: userId, symbol: pos.symbol, instrument_type: pos.instrument_type,
       trade_type: pos.trade_type === "BUY" ? "SELL" : "BUY",
@@ -668,7 +974,7 @@ function TradingDashboard({ userId }: { userId: string }) {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-6">
         <TradeForm userId={userId} balance={balance} onDone={load} />
         <div>
           <div className="flex gap-1 bg-card border border-border p-1 rounded-xl mb-4 w-fit">
@@ -678,7 +984,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                 <Icon className="w-3.5 h-3.5" />{label}
               </button>
             ))}
-            <button onClick={load} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors">
+            <button onClick={load} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors" title="Refresh">
               <RefreshCw className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -707,8 +1013,14 @@ function TradingDashboard({ userId }: { userId: string }) {
                           <tr key={pos.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
                             <td className="px-4 py-3">
                               <div className="font-bold text-foreground">{pos.symbol}</div>
-                              {pos.instrument_type === "OPTIONS" && <div className="text-[10px] text-muted-foreground">{pos.strike_price} {pos.option_type} {pos.expiry}</div>}
-                              {pos.instrument_type === "FUTURES" && <div className="text-[10px] text-muted-foreground">Fut {pos.expiry}</div>}
+                              {pos.instrument_type === "OPTIONS" && (
+                                <div className="text-[10px] text-muted-foreground">
+                                  {pos.strike_price} {pos.option_type} · {pos.expiry ? formatExpiry(pos.expiry) : ""}
+                                </div>
+                              )}
+                              {pos.instrument_type === "FUTURES" && (
+                                <div className="text-[10px] text-muted-foreground">Fut · {pos.expiry ? formatExpiry(pos.expiry) : ""}</div>
+                              )}
                             </td>
                             <td className="px-4 py-3">
                               <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
@@ -718,18 +1030,26 @@ function TradingDashboard({ userId }: { userId: string }) {
                                 {pos.instrument_type}
                               </span>
                             </td>
-                            <td className="px-4 py-3"><span className={`font-bold ${pos.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{pos.trade_type}</span></td>
+                            <td className="px-4 py-3">
+                              <span className={`font-bold ${pos.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{pos.trade_type}</span>
+                            </td>
                             <td className="px-4 py-3 font-mono">{fmtN(pos.quantity)}</td>
                             <td className="px-4 py-3 font-mono">₹{fmtN(pos.avg_price)}</td>
                             <td className="px-4 py-3 font-mono">₹{fmtN(pos.current_price)}</td>
                             <td className="px-4 py-3">
-                              <div className={`font-mono font-bold ${pos_ ? "text-success" : "text-destructive"}`}>{pos_ ? "+" : ""}₹{fmtN(Math.abs(pnl))}</div>
-                              <div className={`text-[10px] ${pos_ ? "text-success" : "text-destructive"}`}>{pos_ ? "▲" : "▼"}{Math.abs(pnl / (pos.avg_price * pos.quantity) * 100).toFixed(2)}%</div>
+                              <div className={`font-mono font-bold ${pos_ ? "text-success" : "text-destructive"}`}>
+                                {pos_ ? "+" : ""}₹{fmtN(Math.abs(pnl))}
+                              </div>
+                              <div className={`text-[10px] ${pos_ ? "text-success" : "text-destructive"}`}>
+                                {pos_ ? "▲" : "▼"}{Math.abs(pnl / (pos.avg_price * pos.quantity) * 100).toFixed(2)}%
+                              </div>
                             </td>
                             <td className="px-4 py-3">
                               <button onClick={() => closePos(pos)} disabled={closing === pos.id}
                                 className="flex items-center gap-1 px-2.5 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50">
-                                {closing === pos.id ? <div className="w-3 h-3 border border-destructive/30 border-t-destructive rounded-full animate-spin" /> : <X className="w-3 h-3" />}
+                                {closing === pos.id
+                                  ? <div className="w-3 h-3 border border-destructive/30 border-t-destructive rounded-full animate-spin" />
+                                  : <X className="w-3 h-3" />}
                                 Close
                               </button>
                             </td>
@@ -764,7 +1084,9 @@ function TradingDashboard({ userId }: { userId: string }) {
                           </td>
                           <td className="px-4 py-2.5 font-bold text-foreground">{t.symbol}</td>
                           <td className="px-4 py-2.5 text-muted-foreground">{t.instrument_type}</td>
-                          <td className="px-4 py-2.5"><span className={`font-bold ${t.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{t.trade_type}</span></td>
+                          <td className="px-4 py-2.5">
+                            <span className={`font-bold ${t.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{t.trade_type}</span>
+                          </td>
                           <td className="px-4 py-2.5 font-mono">{fmtN(t.quantity)}</td>
                           <td className="px-4 py-2.5 font-mono">₹{fmtN(t.price)}</td>
                           <td className="px-4 py-2.5 font-mono text-warning">₹{fmtN(t.charges)}</td>
@@ -781,7 +1103,8 @@ function TradingDashboard({ userId }: { userId: string }) {
       </div>
 
       <p className="text-[10px] text-muted-foreground text-center mt-8">
-        ⚠️ Virtual trading only. No real money. Prices from Yahoo Finance (~15 min delay). Charges simulated (Zerodha model). Not SEBI registered.
+        ⚠️ Virtual trading only. No real money. Options priced using Black-Scholes model (IV 18%).
+        Equity/Futures prices from Yahoo Finance (~15 min delay). Charges simulated (Zerodha model). Not SEBI registered.
       </p>
     </div>
   )
@@ -815,7 +1138,7 @@ export default function VirtualTradePage() {
           <div className="mb-6">
             <h1 className="text-2xl font-bold text-foreground">Virtual Trading</h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Practice Equity, Options & Futures with ₹10,00,000 virtual money — zero real risk
+              Practice Nifty 50 Equity, Options & Futures with ₹10,00,000 virtual money — zero real risk
             </p>
           </div>
           {!checked ? (
