@@ -56,39 +56,17 @@ const fmtN = (n: number) =>
   new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n)
 
 // ─── Generate expiry dates ────────────────────────────────────────────────────
-// NSE rules (updated):
+// NSE rules:
 //   Nifty 50  → weekly expiry every TUESDAY
 //   All others → monthly expiry = LAST TUESDAY of the contract month
-//   Holiday rule → if Tuesday is NSE holiday, expiry moves to previous Monday;
-//                  if Monday is also holiday, moves to previous Friday
-
-// Known NSE holidays (update each year)
-const NSE_HOLIDAYS = new Set([
-  "2026-01-26", // Republic Day
-  "2026-03-25", // Holi
-  "2026-04-03", // Good Friday
-  "2026-04-14", // Dr Ambedkar Jayanti
-  "2026-05-01", // Maharashtra Day
-  "2026-08-15", // Independence Day
-  "2026-10-02", // Gandhi Jayanti
-  "2026-11-04", // Diwali Laxmi Puja
-  "2026-11-05", // Diwali Balipratipada
-  "2026-12-25", // Christmas
-])
+//   Holiday rule → user enters date manually
 
 function toISO(d: Date): string {
-  return d.toISOString().split("T")[0]
-}
-
-// If expiry Tuesday is a holiday, roll back to Monday, then Friday
-function adjustForHoliday(d: Date): Date {
-  const iso = toISO(d)
-  if (!NSE_HOLIDAYS.has(iso)) return d
-  const prev = new Date(d)
-  prev.setDate(prev.getDate() - 1) // Monday
-  if (!NSE_HOLIDAYS.has(toISO(prev))) return prev
-  prev.setDate(prev.getDate() - 3) // Friday
-  return prev
+  // Use local date (not UTC) to avoid off-by-one due to timezone
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, "0")
+  const day = String(d.getDate()).padStart(2, "0")
+  return `${y}-${m}-${day}`
 }
 
 // Nifty weekly: every Tuesday for next 3 months
@@ -98,12 +76,14 @@ function getThursdaysForNext3Months(): string[] {
   const end = new Date(now); end.setMonth(end.getMonth() + 3)
 
   const d = new Date(now)
-  // days until next Tuesday (weekday 2)
-  const daysAhead = (2 - d.getDay() + 7) % 7 || 7
+  // days until next Tuesday (JS weekday: 0=Sun,1=Mon,2=Tue)
+  let daysAhead = (2 - d.getDay() + 7) % 7
+  if (daysAhead === 0) daysAhead = 7  // if today is Tuesday, go to next Tuesday
   d.setDate(d.getDate() + daysAhead)
+  d.setHours(0, 0, 0, 0)
 
   while (d <= end) {
-    dates.push(toISO(adjustForHoliday(new Date(d))))
+    dates.push(toISO(d))
     d.setDate(d.getDate() + 7)
   }
   return dates
@@ -118,11 +98,12 @@ function getMonthlyExpiries(): string[] {
     const totalMonth = now.getMonth() + m
     const year  = now.getFullYear() + Math.floor(totalMonth / 12)
     const month = totalMonth % 12
-    // Start from last day of month, walk back to Tuesday (weekday 2)
+    // Last day of this month
     const d = new Date(year, month + 1, 0)
+    d.setHours(0, 0, 0, 0)
+    // Walk back to last Tuesday (weekday 2)
     while (d.getDay() !== 2) d.setDate(d.getDate() - 1)
-    const expiry = adjustForHoliday(d)
-    if (expiry >= now) dates.push(toISO(expiry))
+    if (d >= now) dates.push(toISO(d))
   }
   return dates
 }
@@ -775,6 +756,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   const [strike,    setStrike]    = useState<number | "">("")
   const [optType,   setOptType]   = useState<OptionType>("CE")
   const [expiry,    setExpiry]    = useState("")
+  const [manualExpiry, setManualExpiry] = useState(false)
   const [fetching,  setFetching]  = useState(false)
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState("")
@@ -950,17 +932,35 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {inst !== "EQUITY" && (
           <div>
             <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-              Expiry Date {symbol === "NIFTY" && <span className="text-primary">(Weekly)</span>}
+              Expiry Date {symbol === "NIFTY" && <span className="text-primary">(Weekly · Every Tuesday)</span>}
             </label>
-            <div className="relative">
-              <select value={expiry} onChange={e => setExpiry(e.target.value)}
-                className="w-full appearance-none bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary">
-                {expiryOptions.map(d => (
-                  <option key={d} value={d}>{formatExpiry(d)}</option>
-                ))}
-              </select>
-              <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-            </div>
+            {!manualExpiry ? (
+              <>
+                <div className="relative">
+                  <select value={expiry} onChange={e => setExpiry(e.target.value)}
+                    className="w-full appearance-none bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary">
+                    {expiryOptions.map(d => (
+                      <option key={d} value={d}>{formatExpiry(d)}</option>
+                    ))}
+                  </select>
+                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                </div>
+                <button type="button" onClick={() => { setManualExpiry(true); setExpiry("") }}
+                  className="text-[10px] text-primary hover:underline mt-1 block">
+                  Holiday? Enter expiry manually
+                </button>
+              </>
+            ) : (
+              <>
+                <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)}
+                  min={new Date().toISOString().split("T")[0]}
+                  className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary" />
+                <button type="button" onClick={() => { setManualExpiry(false); setExpiry(expiryOptions[0] ?? "") }}
+                  className="text-[10px] text-primary hover:underline mt-1 block">
+                  ← Back to standard dates
+                </button>
+              </>
+            )}
           </div>
         )}
 
