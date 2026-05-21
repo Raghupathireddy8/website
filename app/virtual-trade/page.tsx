@@ -212,16 +212,21 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
       if (password !== confirm)  return "Passwords do not match"
       return ""
     }
+    if (mode === "login") {
+      const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
+      if (!isEmail && normMobile(mobile).length !== 10) return "Enter a valid 10-digit mobile number or email address"
+      if (!password) return "Enter your password"
+      return ""
+    }
+    // signup
     const m = normMobile(mobile)
     if (m.length !== 10)  return "Enter a valid 10-digit mobile number"
     if (!password)        return "Enter your password"
-    if (mode === "signup") {
-      if (!fullName.trim())             return "Enter your full name"
-      if (!email.trim())                return "Enter your email address"
-      if (!/\S+@\S+\.\S+/.test(email)) return "Enter a valid email"
-      if (password.length < 8)         return "Password must be at least 8 characters"
-      if (password !== confirm)        return "Passwords do not match"
-    }
+    if (!fullName.trim())             return "Enter your full name"
+    if (!email.trim())                return "Enter your email address"
+    if (!/\S+@\S+\.\S+/.test(email)) return "Enter a valid email"
+    if (password.length < 8)         return "Password must be at least 8 characters"
+    if (password !== confirm)        return "Passwords do not match"
     return ""
   }
 
@@ -248,6 +253,10 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     const { data, error: e } = await supabase.auth.signUp({
       email: email.toLowerCase(),
       password,
+      options: {
+        emailRedirectTo: `${window.location.origin}/virtual-trade`,
+        data: { full_name: fullName, mobile: m },
+      },
     })
 
     if (e) {
@@ -284,24 +293,36 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
   async function handleLogin() {
     const m = normMobile(mobile)
 
-    // Look up email from mobile
-    const { data: profile, error: profileErr } = await supabase
-      .from("profiles").select("email").eq("mobile", m).maybeSingle()
+    // Determine if the user typed an email or a mobile number
+    const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
+    let loginEmail = ""
 
-    if (profileErr || !profile?.email) {
-      setError("Mobile number not registered. Please sign up first.")
-      setLoading(false); return
+    if (isEmail) {
+      // Direct email login
+      loginEmail = mobile.trim().toLowerCase()
+    } else {
+      // Look up email from mobile number
+      const { data: profile, error: profileErr } = await supabase
+        .from("profiles").select("email").eq("mobile", m).maybeSingle()
+
+      if (profileErr || !profile?.email) {
+        // Profile lookup failed — could be a timing issue after signup.
+        // Give the user a helpful message and suggest email login.
+        setError("Mobile number not found. If you just signed up, please verify your email first, then try logging in with your email address instead.")
+        setLoading(false); return
+      }
+      loginEmail = profile.email
     }
 
     const { error: e } = await supabase.auth.signInWithPassword({
-      email: profile.email,
+      email: loginEmail,
       password,
     })
 
     if (e) {
       if (e.message.toLowerCase().includes("email not confirmed")) {
-        setError("Email not verified. Check your inbox for the verification link.")
-      } else if (e.message.toLowerCase().includes("invalid login")) {
+        setError("Email not verified yet. Please check your inbox (and spam folder) for the verification link from MarketGreeks.")
+      } else if (e.message.toLowerCase().includes("invalid login") || e.message.toLowerCase().includes("invalid credentials")) {
         setError("Wrong password. Try again or use Forgot Password.")
       } else {
         setError(e.message)
@@ -454,7 +475,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
           <p className="text-sm text-muted-foreground mt-1">
             {mode === "signup" ? "Create account & get ₹10L virtual money"
             : mode === "forgot" ? "Reset your password via email"
-            : "Sign in with your mobile number"}
+            : "Sign in with your mobile number or email"}
           </p>
         </div>
 
@@ -486,13 +507,23 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
 
             {mode !== "forgot" && (
               <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Mobile Number</label>
+                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
+                  {mode === "login" ? "Mobile Number or Email" : "Mobile Number"}
+                </label>
                 <div className="flex">
-                  <span className="inline-flex items-center px-3 text-sm text-muted-foreground bg-muted border border-r-0 border-border rounded-l-xl">
-                    <Phone className="w-3.5 h-3.5 mr-1" />+91
-                  </span>
-                  <input type="tel" value={mobile} onChange={e => setMobile(e.target.value)} placeholder="9876543210" maxLength={10}
-                    className="flex-1 px-4 py-2.5 text-sm border border-border rounded-r-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                  {mode !== "login" && (
+                    <span className="inline-flex items-center px-3 text-sm text-muted-foreground bg-muted border border-r-0 border-border rounded-l-xl">
+                      <Phone className="w-3.5 h-3.5 mr-1" />+91
+                    </span>
+                  )}
+                  {mode === "login" ? (
+                    <input type="text" value={mobile} onChange={e => setMobile(e.target.value)}
+                      placeholder="9876543210 or you@email.com"
+                      className="w-full px-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                  ) : (
+                    <input type="tel" value={mobile} onChange={e => setMobile(e.target.value)} placeholder="9876543210" maxLength={10}
+                      className="flex-1 px-4 py-2.5 text-sm border border-border rounded-r-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                  )}
                 </div>
                 {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">Used for login. Each number registers only once.</p>}
               </div>
