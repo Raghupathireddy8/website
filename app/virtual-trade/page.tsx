@@ -274,10 +274,25 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
       setLoading(false); return
     }
 
-    const uid = data.user?.id
-    if (!uid) { setError("Signup failed. Try again."); setLoading(false); return }
+    // When "Confirm email" is ON, Supabase may return user with empty identities
+    // (unconfirmed) or null user if already exists unconfirmed.
+    // We get the uid from data.user OR look it up by email as fallback.
+    let uid = data.user?.id
+    if (!uid) {
+      // User may already exist unconfirmed — look up by email
+      const { data: existing } = await supabase
+        .from("profiles").select("id").eq("email", email.toLowerCase()).maybeSingle()
+      uid = existing?.id ?? null
+    }
 
-    // Save profile row (user exists in auth.users, unverified)
+    if (!uid) {
+      // Still no uid — Supabase confirmation email was sent, profile will be
+      // saved when they confirm. Show the verify screen.
+      setMode("verify")
+      setLoading(false); return
+    }
+
+    // Save profile row (user exists in auth.users)
     await supabase.from("profiles").upsert({
       id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
     })
@@ -289,17 +304,14 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
       await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
     }
 
-    // Step 2: Send OTP to the email using Supabase’s signInWithOtp.
-    // This sends a 6-digit numeric code when "Email OTP" is enabled in
-    // Supabase Dashboard > Auth > Providers > Email.
-    // Make sure "Confirm email" = ON and "Enable Email OTP" = ON.
+    // Send OTP for email verification
     const { error: otpErr } = await supabase.auth.signInWithOtp({
       email: email.toLowerCase(),
       options: { shouldCreateUser: false },
     })
 
     if (otpErr) {
-      // OTP failed (e.g. rate limit) — show link-based fallback
+      // OTP failed — show link-based fallback (confirmation email already sent by signUp)
       setMode("verify")
       setLoading(false); return
     }
@@ -1293,7 +1305,7 @@ export default function VirtualTradePage() {
       setChecked(true)
     })
 
-    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange(async (event, session) => {
       if (event === "PASSWORD_RECOVERY") {
         // User clicked the reset-password email link.
         // Show AuthSection in reset mode, hide dashboard even if session exists.
@@ -1305,7 +1317,29 @@ export default function VirtualTradePage() {
         setIsRecovery(false)
         setUserId(session?.user?.id ?? null)
       } else if (event === "SIGNED_IN") {
-        if (!isRecovery) setUserId(session?.user?.id ?? null)
+        if (!isRecovery) {
+          const uid = session?.user?.id
+          if (uid) {
+            // Ensure profile + wallet exist (handles email-confirmation link flow)
+            const { data: prof } = await supabase
+              .from("profiles").select("id").eq("id", uid).maybeSingle()
+            if (!prof) {
+              const meta = session?.user?.user_metadata ?? {}
+              await supabase.from("profiles").upsert({
+                id: uid,
+                email: session?.user?.email?.toLowerCase() ?? "",
+                mobile: meta.mobile ?? "",
+                full_name: meta.full_name ?? "",
+              })
+            }
+            const { data: wal } = await supabase
+              .from("wallets").select("id").eq("user_id", uid).maybeSingle()
+            if (!wal) {
+              await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
+            }
+          }
+          setUserId(uid ?? null)
+        }
       } else if (event === "SIGNED_OUT") {
         setUserId(null)
         setIsRecovery(false)
