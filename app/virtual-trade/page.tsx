@@ -56,33 +56,73 @@ const fmtN = (n: number) =>
   new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n)
 
 // ─── Generate expiry dates ────────────────────────────────────────────────────
-// NSE expiry: last Thursday of each month for monthly, every Thursday for weekly (Nifty)
+// NSE rules (updated):
+//   Nifty 50  → weekly expiry every TUESDAY
+//   All others → monthly expiry = LAST TUESDAY of the contract month
+//   Holiday rule → if Tuesday is NSE holiday, expiry moves to previous Monday;
+//                  if Monday is also holiday, moves to previous Friday
+
+// Known NSE holidays (update each year)
+const NSE_HOLIDAYS = new Set([
+  "2026-01-26", // Republic Day
+  "2026-03-25", // Holi
+  "2026-04-03", // Good Friday
+  "2026-04-14", // Dr Ambedkar Jayanti
+  "2026-05-01", // Maharashtra Day
+  "2026-08-15", // Independence Day
+  "2026-10-02", // Gandhi Jayanti
+  "2026-11-04", // Diwali Laxmi Puja
+  "2026-11-05", // Diwali Balipratipada
+  "2026-12-25", // Christmas
+])
+
+function toISO(d: Date): string {
+  return d.toISOString().split("T")[0]
+}
+
+// If expiry Tuesday is a holiday, roll back to Monday, then Friday
+function adjustForHoliday(d: Date): Date {
+  const iso = toISO(d)
+  if (!NSE_HOLIDAYS.has(iso)) return d
+  const prev = new Date(d)
+  prev.setDate(prev.getDate() - 1) // Monday
+  if (!NSE_HOLIDAYS.has(toISO(prev))) return prev
+  prev.setDate(prev.getDate() - 3) // Friday
+  return prev
+}
+
+// Nifty weekly: every Tuesday for next 3 months
 function getThursdaysForNext3Months(): string[] {
   const dates: string[] = []
-  const now = new Date()
-  const end = new Date(now)
-  end.setMonth(end.getMonth() + 3)
+  const now = new Date(); now.setHours(0, 0, 0, 0)
+  const end = new Date(now); end.setMonth(end.getMonth() + 3)
 
   const d = new Date(now)
-  d.setDate(d.getDate() + ((4 - d.getDay() + 7) % 7 || 7)) // next Thursday
+  // days until next Tuesday (weekday 2)
+  const daysAhead = (2 - d.getDay() + 7) % 7 || 7
+  d.setDate(d.getDate() + daysAhead)
 
   while (d <= end) {
-    dates.push(d.toISOString().split("T")[0])
+    dates.push(toISO(adjustForHoliday(new Date(d))))
     d.setDate(d.getDate() + 7)
   }
   return dates
 }
 
+// Monthly: last Tuesday of each month for next 6 months
 function getMonthlyExpiries(): string[] {
-  // Last Thursday of each month for next 3 months
   const dates: string[] = []
-  const now = new Date()
-  for (let m = 0; m < 3; m++) {
-    const month = new Date(now.getFullYear(), now.getMonth() + m + 1, 0) // last day of month
-    // Find last Thursday
-    while (month.getDay() !== 4) month.setDate(month.getDate() - 1)
-    const iso = month.toISOString().split("T")[0]
-    if (!dates.includes(iso)) dates.push(iso)
+  const now = new Date(); now.setHours(0, 0, 0, 0)
+
+  for (let m = 0; m < 6; m++) {
+    const totalMonth = now.getMonth() + m
+    const year  = now.getFullYear() + Math.floor(totalMonth / 12)
+    const month = totalMonth % 12
+    // Start from last day of month, walk back to Tuesday (weekday 2)
+    const d = new Date(year, month + 1, 0)
+    while (d.getDay() !== 2) d.setDate(d.getDate() - 1)
+    const expiry = adjustForHoliday(d)
+    if (expiry >= now) dates.push(toISO(expiry))
   }
   return dates
 }
