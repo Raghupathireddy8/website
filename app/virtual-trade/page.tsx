@@ -210,10 +210,23 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     return () => clearTimeout(t)
   }, [resendCD])
 
-  // Check if coming back from password reset email
+  // Check if coming back from password reset email.
+  // Supabase fires PASSWORD_RECOVERY on the auth state change listener
+  // when the user lands with a recovery token in the URL — this is more
+  // reliable than parsing window.location.hash directly in Next.js.
   useEffect(() => {
-    const hash = window.location.hash
-    if (hash.includes("type=recovery")) setMode("reset")
+    // Immediate hash check (handles cases where hash is already present)
+    const href = window.location.href
+    if (href.includes("type=recovery") || href.includes("type=magiclink")) {
+      setMode("reset")
+    }
+    // Listen for Supabase's PASSWORD_RECOVERY event (fires after token is exchanged)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "PASSWORD_RECOVERY") {
+        setMode("reset")
+      }
+    })
+    return () => subscription.unsubscribe()
   }, [])
 
   function validate() {
@@ -246,7 +259,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     return ""
   }
 
-  // ── Signup → creates auth user → sends OTP ────────────────────────────────
+  // ── Signup → creates auth user → sends custom OTP ────────────────────────
   async function handleSignup() {
     const m = normMobile(mobile)
 
@@ -257,8 +270,8 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
       setLoading(false); return
     }
 
-    // Create auth user (email+password). Supabase will send its own confirmation
-    // email — we override with our OTP flow below.
+    // Create auth user — Supabase may send a confirmation email too,
+    // but we handle verification ourselves via OTP below.
     const { data, error: signUpErr } = await supabase.auth.signUp({
       email: email.toLowerCase(),
       password,
@@ -281,9 +294,18 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     const uid = data.user?.id
     if (!uid) { setError("Signup failed. Try again."); setLoading(false); return }
 
-    // Save profile row immediately (user exists in auth, just unverified)
+    // Generate a 6-digit OTP and store it with a 10-minute expiry
+    const otpCode   = String(Math.floor(100000 + Math.random() * 900000))
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+
+    // Save profile row with OTP (user exists in auth, just unverified)
     await supabase.from("profiles").upsert({
-      id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
+      id: uid,
+      mobile: m,
+      full_name: fullName,
+      email: email.toLowerCase(),
+      otp_code: otpCode,
+      otp_expires_at: otpExpiry,
     })
 
     // Create wallet if not exists
@@ -293,18 +315,27 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
       await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
     }
 
-    // Now send OTP via Supabase email OTP
-    const { error: otpErr } = await supabase.auth.signInWithOtp({
-      email: email.toLowerCase(),
-      options: { shouldCreateUser: false }, // user already created above
+    // Send OTP email via Supabase Edge Function or our own email API.
+    // We use a simple mailto-style approach via a Supabase RPC that
+    // triggers pg_net / your SMTP — see README. As a reliable fallback
+    // we call the send_otp_email RPC you should create (see below).
+    const { error: sendErr } = await supabase.rpc("send_otp_email", {
+      p_email: email.toLowerCase(),
+      p_name:  fullName,
+      p_otp:   otpCode,
     })
 
-    if (otpErr) {
-      // OTP send failed — fall back to link-based verify screen
-      setPendingUid(uid)
-      setPendingMobile(m)
-      setMode("verify")
-      setLoading(false); return
+    if (sendErr) {
+      // RPC not set up yet — fall back to Supabase's built-in OTP
+      const { error: otpErr } = await supabase.auth.signInWithOtp({
+        email: email.toLowerCase(),
+        options: { shouldCreateUser: false, data: { otp_override: otpCode } },
+      })
+      if (otpErr) {
+        // Final fallback: show link-based verify screen
+        setMode("verify")
+        setLoading(false); return
+      }
     }
 
     setPendingUid(uid)
@@ -316,31 +347,71 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
 
   // ── Verify OTP (after signup) ─────────────────────────────────────────────
   async function handleVerifyOtp() {
-    const { data, error: e } = await supabase.auth.verifyOtp({
+    const code = otp.replace(/\s/g, "")
+
+    // First try: verify against our stored OTP in profiles
+    const { data: profile } = await supabase
+      .rpc("verify_otp_code", { p_email: email.toLowerCase(), p_code: code })
+
+    if (profile === true) {
+      // OTP matched — now sign the user in
+      const { error: signInErr } = await supabase.auth.signInWithPassword({
+        email: email.toLowerCase(),
+        password,
+      })
+      if (signInErr) {
+        // Email may not be confirmed in Supabase yet — try verifyOtp as fallback
+        const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
+          email: email.toLowerCase(),
+          token: code,
+          type: "email",
+        })
+        if (otpErr || !otpData.session) {
+          setError("Account created but sign-in failed. Please use Sign In with your email and password.")
+          setLoading(false); return
+        }
+      }
+      onAuth()
+      setLoading(false)
+      return
+    }
+
+    // Fallback: try Supabase's own OTP verify (if we used signInWithOtp)
+    const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
       email: email.toLowerCase(),
-      token: otp.replace(/\D/g, ""),
+      token: code,
       type: "email",
     })
 
-    if (e || !data.session) {
-      setError("Invalid or expired code. Please try again or resend.")
+    if (otpErr || !otpData.session) {
+      setError("Invalid or expired code. Please try again or resend a new code.")
       setLoading(false); return
     }
 
-    // Session is now active — user is logged in
     onAuth()
     setLoading(false)
   }
 
   // ── Resend OTP ────────────────────────────────────────────────────────────
   async function handleResendOtp() {
-    setError(""); setSuccess("")
-    const { error: e } = await supabase.auth.signInWithOtp({
-      email: email.toLowerCase(),
-      options: { shouldCreateUser: false },
+    setError(""); setSuccess(""); setResendCD(60)
+    // Regenerate OTP
+    const otpCode   = String(Math.floor(100000 + Math.random() * 900000))
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    await supabase.from("profiles")
+      .update({ otp_code: otpCode, otp_expires_at: otpExpiry })
+      .eq("email", email.toLowerCase())
+    // Try RPC email first, then Supabase OTP
+    const { error: sendErr } = await supabase.rpc("send_otp_email", {
+      p_email: email.toLowerCase(), p_name: fullName, p_otp: otpCode,
     })
-    if (e) { setError(e.message); return }
-    setResendCD(60)
+    if (sendErr) {
+      const { error: otpErr } = await supabase.auth.signInWithOtp({
+        email: email.toLowerCase(),
+        options: { shouldCreateUser: false },
+      })
+      if (otpErr) { setError(otpErr.message); setResendCD(0); return }
+    }
     setSuccess("New code sent! Check your inbox.")
   }
 
