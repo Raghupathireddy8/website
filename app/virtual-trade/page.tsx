@@ -183,8 +183,8 @@ async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<num
 // AUTH
 // ═════════════════════════════════════════════════════════════════════════════
 
-function AuthSection({ onAuth }: { onAuth: () => void }) {
-  const [mode,     setMode]     = useState<AuthMode>("login")
+function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; initialMode?: AuthMode }) {
+  const [mode,     setMode]     = useState<AuthMode>(initialMode)
   const [mobile,   setMobile]   = useState("")
   const [email,    setEmail]    = useState("")
   const [password, setPassword] = useState("")
@@ -210,24 +210,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     return () => clearTimeout(t)
   }, [resendCD])
 
-  // Check if coming back from password reset email.
-  // Supabase fires PASSWORD_RECOVERY on the auth state change listener
-  // when the user lands with a recovery token in the URL — this is more
-  // reliable than parsing window.location.hash directly in Next.js.
-  useEffect(() => {
-    // Immediate hash check (handles cases where hash is already present)
-    const href = window.location.href
-    if (href.includes("type=recovery") || href.includes("type=magiclink")) {
-      setMode("reset")
-    }
-    // Listen for Supabase's PASSWORD_RECOVERY event (fires after token is exchanged)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
-      if (event === "PASSWORD_RECOVERY") {
-        setMode("reset")
-      }
-    })
-    return () => subscription.unsubscribe()
-  }, [])
+  // Recovery mode is controlled by parent VirtualTradePage via initialMode prop.
 
   function validate() {
     if (mode === "otp") {
@@ -259,7 +242,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     return ""
   }
 
-  // ── Signup → creates auth user → sends custom OTP ────────────────────────
+  // ── Signup: create user then send Supabase OTP ─────────────────────────────────
   async function handleSignup() {
     const m = normMobile(mobile)
 
@@ -270,8 +253,8 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
       setLoading(false); return
     }
 
-    // Create auth user — Supabase may send a confirmation email too,
-    // but we handle verification ourselves via OTP below.
+    // Step 1: Create the auth user with email+password.
+    // We set shouldSendConfirmationEmail implicitly via signUp.
     const { data, error: signUpErr } = await supabase.auth.signUp({
       email: email.toLowerCase(),
       password,
@@ -294,18 +277,9 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     const uid = data.user?.id
     if (!uid) { setError("Signup failed. Try again."); setLoading(false); return }
 
-    // Generate a 6-digit OTP and store it with a 10-minute expiry
-    const otpCode   = String(Math.floor(100000 + Math.random() * 900000))
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString()
-
-    // Save profile row with OTP (user exists in auth, just unverified)
+    // Save profile row (user exists in auth.users, unverified)
     await supabase.from("profiles").upsert({
-      id: uid,
-      mobile: m,
-      full_name: fullName,
-      email: email.toLowerCase(),
-      otp_code: otpCode,
-      otp_expires_at: otpExpiry,
+      id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
     })
 
     // Create wallet if not exists
@@ -315,76 +289,40 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
       await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
     }
 
-    // Send OTP email via Supabase Edge Function or our own email API.
-    // We use a simple mailto-style approach via a Supabase RPC that
-    // triggers pg_net / your SMTP — see README. As a reliable fallback
-    // we call the send_otp_email RPC you should create (see below).
-    const { error: sendErr } = await supabase.rpc("send_otp_email", {
-      p_email: email.toLowerCase(),
-      p_name:  fullName,
-      p_otp:   otpCode,
+    // Step 2: Send OTP to the email using Supabase’s signInWithOtp.
+    // This sends a 6-digit numeric code when "Email OTP" is enabled in
+    // Supabase Dashboard > Auth > Providers > Email.
+    // Make sure "Confirm email" = ON and "Enable Email OTP" = ON.
+    const { error: otpErr } = await supabase.auth.signInWithOtp({
+      email: email.toLowerCase(),
+      options: { shouldCreateUser: false },
     })
 
-    if (sendErr) {
-      // RPC not set up yet — fall back to Supabase's built-in OTP
-      const { error: otpErr } = await supabase.auth.signInWithOtp({
-        email: email.toLowerCase(),
-        options: { shouldCreateUser: false, data: { otp_override: otpCode } },
-      })
-      if (otpErr) {
-        // Final fallback: show link-based verify screen
-        setMode("verify")
-        setLoading(false); return
-      }
+    if (otpErr) {
+      // OTP failed (e.g. rate limit) — show link-based fallback
+      setMode("verify")
+      setLoading(false); return
     }
 
-    setPendingUid(uid)
-    setPendingMobile(m)
     setResendCD(60)
     setMode("otp")
     setLoading(false)
   }
 
-  // ── Verify OTP (after signup) ─────────────────────────────────────────────
+    // ── Verify OTP (after signup) ──────────────────────────────────────────
   async function handleVerifyOtp() {
     const code = otp.replace(/\s/g, "")
 
-    // First try: verify against our stored OTP in profiles
-    const { data: profile } = await supabase
-      .rpc("verify_otp_code", { p_email: email.toLowerCase(), p_code: code })
-
-    if (profile === true) {
-      // OTP matched — now sign the user in
-      const { error: signInErr } = await supabase.auth.signInWithPassword({
-        email: email.toLowerCase(),
-        password,
-      })
-      if (signInErr) {
-        // Email may not be confirmed in Supabase yet — try verifyOtp as fallback
-        const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
-          email: email.toLowerCase(),
-          token: code,
-          type: "email",
-        })
-        if (otpErr || !otpData.session) {
-          setError("Account created but sign-in failed. Please use Sign In with your email and password.")
-          setLoading(false); return
-        }
-      }
-      onAuth()
-      setLoading(false)
-      return
-    }
-
-    // Fallback: try Supabase's own OTP verify (if we used signInWithOtp)
-    const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
+    // Verify using Supabase’s native OTP verifier.
+    // type "email" covers both signup confirmation and signInWithOtp codes.
+    const { data, error: e } = await supabase.auth.verifyOtp({
       email: email.toLowerCase(),
       token: code,
       type: "email",
     })
 
-    if (otpErr || !otpData.session) {
-      setError("Invalid or expired code. Please try again or resend a new code.")
+    if (e || !data.session) {
+      setError("Invalid or expired code. Please check the code or click Resend.")
       setLoading(false); return
     }
 
@@ -392,30 +330,18 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     setLoading(false)
   }
 
-  // ── Resend OTP ────────────────────────────────────────────────────────────
+  // ── Resend OTP ────────────────────────────────────────────────────────────────────────
   async function handleResendOtp() {
     setError(""); setSuccess(""); setResendCD(60)
-    // Regenerate OTP
-    const otpCode   = String(Math.floor(100000 + Math.random() * 900000))
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString()
-    await supabase.from("profiles")
-      .update({ otp_code: otpCode, otp_expires_at: otpExpiry })
-      .eq("email", email.toLowerCase())
-    // Try RPC email first, then Supabase OTP
-    const { error: sendErr } = await supabase.rpc("send_otp_email", {
-      p_email: email.toLowerCase(), p_name: fullName, p_otp: otpCode,
+    const { error: e } = await supabase.auth.signInWithOtp({
+      email: email.toLowerCase(),
+      options: { shouldCreateUser: false },
     })
-    if (sendErr) {
-      const { error: otpErr } = await supabase.auth.signInWithOtp({
-        email: email.toLowerCase(),
-        options: { shouldCreateUser: false },
-      })
-      if (otpErr) { setError(otpErr.message); setResendCD(0); return }
-    }
+    if (e) { setError(e.message); setResendCD(0); return }
     setSuccess("New code sent! Check your inbox.")
   }
 
-  // ── Login ─────────────────────────────────────────────────────────────────
+    // ── Login ─────────────────────────────────────────────────────────────────
   async function handleLogin() {
     const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
     let loginEmail = ""
@@ -1357,19 +1283,37 @@ function TradingDashboard({ userId }: { userId: string }) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 export default function VirtualTradePage() {
-  const [userId,  setUserId]  = useState<string | null>(null)
-  const [checked, setChecked] = useState(false)
+  const [userId,     setUserId]     = useState<string | null>(null)
+  const [checked,    setChecked]    = useState(false)
+  const [isRecovery, setIsRecovery] = useState(false)
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       setUserId(data.session?.user?.id ?? null)
       setChecked(true)
     })
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-      setUserId(s?.user?.id ?? null)
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY") {
+        // User clicked the reset-password email link.
+        // Show AuthSection in reset mode, hide dashboard even if session exists.
+        setIsRecovery(true)
+        setUserId(null)
+        setChecked(true)
+      } else if (event === "USER_UPDATED") {
+        // Password was successfully saved — go to dashboard
+        setIsRecovery(false)
+        setUserId(session?.user?.id ?? null)
+      } else if (event === "SIGNED_IN") {
+        if (!isRecovery) setUserId(session?.user?.id ?? null)
+      } else if (event === "SIGNED_OUT") {
+        setUserId(null)
+        setIsRecovery(false)
+      }
     })
+
     return () => sub.subscription.unsubscribe()
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -1387,12 +1331,16 @@ export default function VirtualTradePage() {
             <div className="flex items-center justify-center py-24">
               <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
             </div>
-          ) : userId ? (
+          ) : userId && !isRecovery ? (
             <TradingDashboard userId={userId} />
           ) : (
-            <AuthSection onAuth={() => {
-              supabase.auth.getUser().then(({ data }) => setUserId(data.user?.id ?? null))
-            }} />
+            <AuthSection
+              initialMode={isRecovery ? "reset" : "login"}
+              onAuth={() => {
+                setIsRecovery(false)
+                supabase.auth.getUser().then(({ data }) => setUserId(data.user?.id ?? null))
+              }}
+            />
           )}
         </div>
       </main>
