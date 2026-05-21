@@ -333,14 +333,21 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
     if (isEmail) {
       loginEmail = mobile.trim().toLowerCase()
     } else {
-      // Use RPC to bypass RLS for mobile → email lookup
       const m = normMobile(mobile)
-      const { data: foundEmail, error: rpcErr } = await supabase.rpc("get_email_by_mobile", { p_mobile: m })
-      if (rpcErr || !foundEmail) {
-        setError("Mobile number not registered. Please sign up first, or try logging in with your email address.")
+      // Try plain 10-digit first, then with +91 prefix (handles both storage formats)
+      let foundEmail: string | null = null
+      const { data: d1 } = await supabase.rpc("get_email_by_mobile", { p_mobile: m })
+      if (d1) {
+        foundEmail = d1 as string
+      } else {
+        const { data: d2 } = await supabase.rpc("get_email_by_mobile", { p_mobile: "+91" + m })
+        if (d2) foundEmail = d2 as string
+      }
+      if (!foundEmail) {
+        setError("Mobile number not registered. Please sign up first, or log in with your email address.")
         setLoading(false); return
       }
-      loginEmail = foundEmail as string
+      loginEmail = foundEmail
     }
 
     const { error: e } = await supabase.auth.signInWithPassword({
