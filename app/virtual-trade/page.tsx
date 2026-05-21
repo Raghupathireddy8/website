@@ -274,50 +274,22 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
       setLoading(false); return
     }
 
-    // When "Confirm email" is ON, Supabase may return user with empty identities
-    // (unconfirmed) or null user if already exists unconfirmed.
-    // We get the uid from data.user OR look it up by email as fallback.
-    let uid = data.user?.id
-    if (!uid) {
-      // User may already exist unconfirmed — look up by email
-      const { data: existing } = await supabase
-        .from("profiles").select("id").eq("email", email.toLowerCase()).maybeSingle()
-      uid = existing?.id ?? null
+    const uid = data.user?.id
+
+    // Save profile + wallet if we have a uid (user confirmed or auto-confirmed)
+    if (uid) {
+      await supabase.from("profiles").upsert({
+        id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
+      })
+      const { data: existingWallet } = await supabase
+        .from("wallets").select("id").eq("user_id", uid).maybeSingle()
+      if (!existingWallet) {
+        await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
+      }
     }
-
-    if (!uid) {
-      // Still no uid — Supabase confirmation email was sent, profile will be
-      // saved when they confirm. Show the verify screen.
-      setMode("verify")
-      setLoading(false); return
-    }
-
-    // Save profile row (user exists in auth.users)
-    await supabase.from("profiles").upsert({
-      id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
-    })
-
-    // Create wallet if not exists
-    const { data: existingWallet } = await supabase
-      .from("wallets").select("id").eq("user_id", uid).maybeSingle()
-    if (!existingWallet) {
-      await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
-    }
-
-    // Send OTP for email verification
-    const { error: otpErr } = await supabase.auth.signInWithOtp({
-      email: email.toLowerCase(),
-      options: { shouldCreateUser: false },
-    })
-
-    if (otpErr) {
-      // OTP failed — show link-based fallback (confirmation email already sent by signUp)
-      setMode("verify")
-      setLoading(false); return
-    }
-
-    setResendCD(60)
-    setMode("otp")
+    // Whether uid exists or not, Supabase has sent a confirmation email.
+    // Show the verify screen — user must click the link to activate account.
+    setMode("verify")
     setLoading(false)
   }
 
@@ -516,37 +488,32 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
     )
   }
 
-  // ── Verify screen (fallback if OTP send failed) ───────────────────────────
+  // ── Verify screen ────────────────────────────────────────────────────────
   if (mode === "verify") {
     return (
       <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
         <div className="w-full max-w-md text-center">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-primary/10 rounded-2xl mb-4">
-            <Mail className="w-8 h-8 text-primary" />
+          <div className="inline-flex items-center justify-center w-16 h-16 bg-green-100 dark:bg-green-900/30 rounded-2xl mb-4">
+            <Mail className="w-8 h-8 text-green-600 dark:text-green-400" />
           </div>
-          <h2 className="text-2xl font-bold text-foreground mb-2">Verify your email</h2>
-          <p className="text-muted-foreground text-sm mb-6">
-            We sent a verification link to <strong>{email}</strong>
-          </p>
+          <h2 className="text-2xl font-bold text-foreground mb-2">Verification link sent!</h2>
+          <p className="text-muted-foreground text-sm mb-1">Please check your inbox at</p>
+          <p className="font-bold text-foreground text-sm mb-6">{email}</p>
           <div className="bg-card border border-border rounded-2xl p-5 text-left space-y-3 mb-6">
             {[
-              `Open your inbox for ${email}`,
-              `Click the "Confirm your email" link from MarketGreeks`,
-              "Come back here and sign in with your mobile number or email",
-              "Check spam/junk folder if you don't see it",
+              "Open your email inbox",
+              "Click the confirmation link from MarketGreeks",
+              "You will be automatically signed in after confirming",
+              "Check spam/junk folder if you don’t see it",
             ].map((step, i) => (
               <div key={i} className="flex items-start gap-3">
-                <span className={`w-5 h-5 rounded-full text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5 ${i < 3 ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"}`}>
-                  {i < 3 ? i + 1 : "!"}
+                <span className="w-5 h-5 rounded-full text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5 bg-primary text-primary-foreground">
+                  {i + 1}
                 </span>
                 <p className="text-xs text-muted-foreground">{step}</p>
               </div>
             ))}
           </div>
-          <button onClick={() => switchMode("login")}
-            className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors">
-            Go to Sign In →
-          </button>
           <p className="text-xs text-muted-foreground mt-3">
             Wrong email?{" "}
             <button onClick={() => switchMode("signup")} className="text-primary hover:underline font-semibold">Sign up again</button>
@@ -1300,49 +1267,61 @@ export default function VirtualTradePage() {
   const [isRecovery, setIsRecovery] = useState(false)
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setUserId(data.session?.user?.id ?? null)
-      setChecked(true)
-    })
-
+    // IMPORTANT: Do NOT call getSession() first.
+    // onAuthStateChange fires INITIAL_SESSION immediately with the current
+    // session, AND fires PASSWORD_RECOVERY before SIGNED_IN when the user
+    // lands from a reset link. Letting it control everything avoids a race
+    // condition where getSession sets checked=true before recovery is detected.
     const { data: sub } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (event === "PASSWORD_RECOVERY") {
-        // User clicked the reset-password email link.
-        // Show AuthSection in reset mode, hide dashboard even if session exists.
+
+      if (event === "INITIAL_SESSION") {
+        // Page just loaded normally — no recovery token in URL
+        setUserId(session?.user?.id ?? null)
+        setChecked(true)
+
+      } else if (event === "PASSWORD_RECOVERY") {
+        // User clicked the forgot-password link in their email.
+        // Show the reset password form immediately.
         setIsRecovery(true)
         setUserId(null)
         setChecked(true)
+
       } else if (event === "USER_UPDATED") {
-        // Password was successfully saved — go to dashboard
+        // User successfully saved their new password
         setIsRecovery(false)
         setUserId(session?.user?.id ?? null)
+
       } else if (event === "SIGNED_IN") {
-        if (!isRecovery) {
-          const uid = session?.user?.id
-          if (uid) {
-            // Ensure profile + wallet exist (handles email-confirmation link flow)
-            const { data: prof } = await supabase
-              .from("profiles").select("id").eq("id", uid).maybeSingle()
-            if (!prof) {
-              const meta = session?.user?.user_metadata ?? {}
-              await supabase.from("profiles").upsert({
-                id: uid,
-                email: session?.user?.email?.toLowerCase() ?? "",
-                mobile: meta.mobile ?? "",
-                full_name: meta.full_name ?? "",
-              })
-            }
-            const { data: wal } = await supabase
-              .from("wallets").select("id").eq("user_id", uid).maybeSingle()
-            if (!wal) {
-              await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
-            }
+        // Skip SIGNED_IN if we are in recovery mode (it fires right after
+        // PASSWORD_RECOVERY — we don't want it to override the reset form)
+        if (isRecovery) return
+        const uid = session?.user?.id
+        if (uid) {
+          // Ensure profile + wallet exist (handles email confirmation link flow)
+          const { data: prof } = await supabase
+            .from("profiles").select("id").eq("id", uid).maybeSingle()
+          if (!prof) {
+            const meta = session?.user?.user_metadata ?? {}
+            await supabase.from("profiles").upsert({
+              id: uid,
+              email: session?.user?.email?.toLowerCase() ?? "",
+              mobile: meta.mobile ?? "",
+              full_name: meta.full_name ?? "",
+            })
           }
-          setUserId(uid ?? null)
+          const { data: wal } = await supabase
+            .from("wallets").select("id").eq("user_id", uid).maybeSingle()
+          if (!wal) {
+            await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
+          }
         }
+        setUserId(uid ?? null)
+        setChecked(true)
+
       } else if (event === "SIGNED_OUT") {
         setUserId(null)
         setIsRecovery(false)
+        setChecked(true)
       }
     })
 
