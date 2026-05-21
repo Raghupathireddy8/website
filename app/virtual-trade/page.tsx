@@ -47,7 +47,7 @@ const NIFTY50_FNO = [
 type InstrumentType = "EQUITY" | "OPTIONS" | "FUTURES"
 type TradeType      = "BUY" | "SELL"
 type OptionType     = "CE" | "PE"
-type AuthMode       = "login" | "signup" | "forgot" | "verify" | "reset"
+type AuthMode       = "login" | "signup" | "forgot" | "verify" | "otp" | "reset"
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmt  = (n: number) =>
@@ -179,6 +179,7 @@ async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<num
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
 // AUTH
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -189,26 +190,41 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
   const [password, setPassword] = useState("")
   const [confirm,  setConfirm]  = useState("")
   const [fullName, setFullName] = useState("")
+  const [otp,      setOtp]      = useState("")
+  const [otpRefs]               = useState(() => Array.from({ length: 6 }, () => ({ current: null as HTMLInputElement | null })))
   const [showPass, setShowPass] = useState(false)
   const [loading,  setLoading]  = useState(false)
+  const [resendCD, setResendCD] = useState(0)
   const [error,    setError]    = useState("")
   const [success,  setSuccess]  = useState("")
+  // Saved signup data to upsert profile after OTP verify
+  const [pendingUid,    setPendingUid]    = useState("")
+  const [pendingMobile, setPendingMobile] = useState("")
 
   const normMobile = (m: string) => m.replace(/\D/g, "").slice(-10)
 
-  // ── Check if coming back from password reset email ────────────────────────
+  // Resend countdown timer
+  useEffect(() => {
+    if (resendCD <= 0) return
+    const t = setTimeout(() => setResendCD(c => c - 1), 1000)
+    return () => clearTimeout(t)
+  }, [resendCD])
+
+  // Check if coming back from password reset email
   useEffect(() => {
     const hash = window.location.hash
-    if (hash.includes("type=recovery")) {
-      setMode("reset")
-    }
+    if (hash.includes("type=recovery")) setMode("reset")
   }, [])
 
   function validate() {
+    if (mode === "otp") {
+      if (otp.replace(/\D/g, "").length !== 6) return "Enter the 6-digit code sent to your email"
+      return ""
+    }
     if (mode === "forgot") return email ? "" : "Enter your registered email"
-    if (mode === "reset")  {
-      if (!password)              return "Enter new password"
-      if (password.length < 8)   return "Password must be at least 8 characters"
+    if (mode === "reset") {
+      if (!password)             return "Enter new password"
+      if (password.length < 8)  return "Password must be at least 8 characters"
       if (password !== confirm)  return "Passwords do not match"
       return ""
     }
@@ -220,37 +236,30 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     }
     // signup
     const m = normMobile(mobile)
-    if (m.length !== 10)  return "Enter a valid 10-digit mobile number"
-    if (!password)        return "Enter your password"
-    if (!fullName.trim())             return "Enter your full name"
-    if (!email.trim())                return "Enter your email address"
-    if (!/\S+@\S+\.\S+/.test(email)) return "Enter a valid email"
-    if (password.length < 8)         return "Password must be at least 8 characters"
-    if (password !== confirm)        return "Passwords do not match"
+    if (m.length !== 10)                      return "Enter a valid 10-digit mobile number"
+    if (!fullName.trim())                     return "Enter your full name"
+    if (!email.trim())                        return "Enter your email address"
+    if (!/\S+@\S+\.\S+/.test(email))         return "Enter a valid email"
+    if (!password)                            return "Enter your password"
+    if (password.length < 8)                 return "Password must be at least 8 characters"
+    if (password !== confirm)                return "Passwords do not match"
     return ""
   }
 
-  // ── Signup ────────────────────────────────────────────────────────────────
+  // ── Signup → creates auth user → sends OTP ────────────────────────────────
   async function handleSignup() {
     const m = normMobile(mobile)
 
-    // Check mobile uniqueness
-    const { data: exMobile } = await supabase
-      .from("profiles").select("id").eq("mobile", m).maybeSingle()
-    if (exMobile) {
-      setError("Mobile already registered. Please sign in.")
+    // Check mobile uniqueness via RPC (bypasses RLS)
+    const { data: mobileExists } = await supabase.rpc("mobile_registered", { p_mobile: m })
+    if (mobileExists) {
+      setError("Mobile number already registered. Please sign in.")
       setLoading(false); return
     }
 
-    // Check email uniqueness
-    const { data: exEmail } = await supabase
-      .from("profiles").select("id").eq("email", email.toLowerCase()).maybeSingle()
-    if (exEmail) {
-      setError("Email already registered. Please sign in.")
-      setLoading(false); return
-    }
-
-    const { data, error: e } = await supabase.auth.signUp({
+    // Create auth user (email+password). Supabase will send its own confirmation
+    // email — we override with our OTP flow below.
+    const { data, error: signUpErr } = await supabase.auth.signUp({
       email: email.toLowerCase(),
       password,
       options: {
@@ -259,13 +268,12 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
       },
     })
 
-    if (e) {
-      // "User already registered" means they signed up but never verified email
-      if (e.message.toLowerCase().includes("already registered") ||
-          e.message.toLowerCase().includes("already exists")) {
-        setError("An account with this email exists but may not be verified. Check your inbox for a verification link, or use Forgot Password.")
+    if (signUpErr) {
+      if (signUpErr.message.toLowerCase().includes("already registered") ||
+          signUpErr.message.toLowerCase().includes("already exists")) {
+        setError("Email already registered. Please sign in or use Forgot Password.")
       } else {
-        setError(e.message)
+        setError(signUpErr.message)
       }
       setLoading(false); return
     }
@@ -273,45 +281,85 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     const uid = data.user?.id
     if (!uid) { setError("Signup failed. Try again."); setLoading(false); return }
 
-    // Insert profile — upsert to handle edge case of re-signup
+    // Save profile row immediately (user exists in auth, just unverified)
     await supabase.from("profiles").upsert({
-      id: uid, mobile: m, full_name: fullName, email: email.toLowerCase()
+      id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
     })
 
-    // Create wallet only if it doesn't exist
+    // Create wallet if not exists
     const { data: existingWallet } = await supabase
       .from("wallets").select("id").eq("user_id", uid).maybeSingle()
     if (!existingWallet) {
       await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
     }
 
-    setMode("verify")
+    // Now send OTP via Supabase email OTP
+    const { error: otpErr } = await supabase.auth.signInWithOtp({
+      email: email.toLowerCase(),
+      options: { shouldCreateUser: false }, // user already created above
+    })
+
+    if (otpErr) {
+      // OTP send failed — fall back to link-based verify screen
+      setPendingUid(uid)
+      setPendingMobile(m)
+      setMode("verify")
+      setLoading(false); return
+    }
+
+    setPendingUid(uid)
+    setPendingMobile(m)
+    setResendCD(60)
+    setMode("otp")
     setLoading(false)
+  }
+
+  // ── Verify OTP (after signup) ─────────────────────────────────────────────
+  async function handleVerifyOtp() {
+    const { data, error: e } = await supabase.auth.verifyOtp({
+      email: email.toLowerCase(),
+      token: otp.replace(/\D/g, ""),
+      type: "email",
+    })
+
+    if (e || !data.session) {
+      setError("Invalid or expired code. Please try again or resend.")
+      setLoading(false); return
+    }
+
+    // Session is now active — user is logged in
+    onAuth()
+    setLoading(false)
+  }
+
+  // ── Resend OTP ────────────────────────────────────────────────────────────
+  async function handleResendOtp() {
+    setError(""); setSuccess("")
+    const { error: e } = await supabase.auth.signInWithOtp({
+      email: email.toLowerCase(),
+      options: { shouldCreateUser: false },
+    })
+    if (e) { setError(e.message); return }
+    setResendCD(60)
+    setSuccess("New code sent! Check your inbox.")
   }
 
   // ── Login ─────────────────────────────────────────────────────────────────
   async function handleLogin() {
-    const m = normMobile(mobile)
-
-    // Determine if the user typed an email or a mobile number
     const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
     let loginEmail = ""
 
     if (isEmail) {
-      // Direct email login
       loginEmail = mobile.trim().toLowerCase()
     } else {
-      // Look up email from mobile number
-      const { data: profile, error: profileErr } = await supabase
-        .from("profiles").select("email").eq("mobile", m).maybeSingle()
-
-      if (profileErr || !profile?.email) {
-        // Profile lookup failed — could be a timing issue after signup.
-        // Give the user a helpful message and suggest email login.
-        setError("Mobile number not found. If you just signed up, please verify your email first, then try logging in with your email address instead.")
+      // Use RPC to bypass RLS for mobile → email lookup
+      const m = normMobile(mobile)
+      const { data: foundEmail, error: rpcErr } = await supabase.rpc("get_email_by_mobile", { p_mobile: m })
+      if (rpcErr || !foundEmail) {
+        setError("Mobile number not registered. Please sign up first, or try logging in with your email address.")
         setLoading(false); return
       }
-      loginEmail = profile.email
+      loginEmail = foundEmail as string
     }
 
     const { error: e } = await supabase.auth.signInWithPassword({
@@ -321,8 +369,9 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
 
     if (e) {
       if (e.message.toLowerCase().includes("email not confirmed")) {
-        setError("Email not verified yet. Please check your inbox (and spam folder) for the verification link from MarketGreeks.")
-      } else if (e.message.toLowerCase().includes("invalid login") || e.message.toLowerCase().includes("invalid credentials")) {
+        setError("Email not verified. Check your inbox for the OTP or verification link, or sign up again.")
+      } else if (e.message.toLowerCase().includes("invalid login") ||
+                 e.message.toLowerCase().includes("invalid credentials")) {
         setError("Wrong password. Try again or use Forgot Password.")
       } else {
         setError(e.message)
@@ -336,11 +385,11 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
 
   // ── Forgot password ───────────────────────────────────────────────────────
   async function handleForgot() {
-    const { error: e } = await supabase.auth.resetPasswordForEmail(
-      email.toLowerCase()
-    )
+    const { error: e } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), {
+      redirectTo: `${window.location.origin}/virtual-trade`,
+    })
     if (e) { setError(e.message); setLoading(false); return }
-    setSuccess("Reset link sent! Check your inbox and spam folder. Click the link to set a new password.")
+    setSuccess("Reset link sent! Check your inbox and spam folder.")
     setLoading(false)
   }
 
@@ -349,7 +398,6 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     const { error: e } = await supabase.auth.updateUser({ password })
     if (e) { setError(e.message); setLoading(false); return }
     setSuccess("Password updated successfully!")
-    // Clear hash from URL
     window.history.replaceState({}, document.title, window.location.pathname)
     setTimeout(() => { setMode("login"); setPassword(""); setConfirm("") }, 1500)
     setLoading(false)
@@ -362,16 +410,104 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     setLoading(true); setError(""); setSuccess("")
     if (mode === "signup") await handleSignup()
     if (mode === "login")  await handleLogin()
+    if (mode === "otp")    await handleVerifyOtp()
     if (mode === "forgot") await handleForgot()
     if (mode === "reset")  await handleReset()
   }
 
   const switchMode = (m: AuthMode) => {
     setMode(m); setError(""); setSuccess("")
-    setMobile(""); setEmail(""); setPassword(""); setConfirm(""); setFullName("")
+    setMobile(""); setEmail(""); setPassword(""); setConfirm(""); setFullName(""); setOtp("")
   }
 
-  // ── Email verification screen ─────────────────────────────────────────────
+  // ── OTP input: auto-advance on digit entry ────────────────────────────────
+  function handleOtpKey(i: number, e: React.KeyboardEvent<HTMLInputElement>) {
+    const val = e.key
+    if (/^\d$/.test(val)) {
+      const arr = otp.split("")
+      arr[i] = val
+      const next = arr.join("")
+      setOtp(next.padEnd(6, " ").slice(0, 6))
+      if (i < 5) otpRefs[i + 1].current?.focus()
+      e.preventDefault()
+    } else if (val === "Backspace") {
+      const arr = otp.split("")
+      arr[i] = " "
+      setOtp(arr.join(""))
+      if (i > 0) otpRefs[i - 1].current?.focus()
+      e.preventDefault()
+    }
+  }
+
+  // ── OTP screen ────────────────────────────────────────────────────────────
+  if (mode === "otp") {
+    const digits = otp.padEnd(6, " ").split("")
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
+        <div className="w-full max-w-md">
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center justify-center w-16 h-16 bg-primary/10 rounded-2xl mb-4">
+              <Mail className="w-8 h-8 text-primary" />
+            </div>
+            <h2 className="text-2xl font-bold text-foreground">Check your email</h2>
+            <p className="text-sm text-muted-foreground mt-2">
+              We sent a 6-digit code to <strong>{email}</strong>
+            </p>
+          </div>
+          <div className="bg-card border border-border rounded-2xl p-6">
+            {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
+            {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
+            <form onSubmit={submit} className="space-y-5">
+              <div>
+                <label className="text-xs font-semibold text-muted-foreground mb-3 block text-center">Enter verification code</label>
+                <div className="flex gap-2 justify-center">
+                  {digits.map((d, i) => (
+                    <input
+                      key={i}
+                      ref={el => { otpRefs[i].current = el }}
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={1}
+                      value={d.trim()}
+                      onKeyDown={e => handleOtpKey(i, e)}
+                      onChange={() => {}}
+                      onFocus={e => e.target.select()}
+                      className="w-11 h-12 text-center text-lg font-bold border-2 border-border rounded-xl bg-background focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-colors"
+                    />
+                  ))}
+                </div>
+              </div>
+              <button type="submit" disabled={loading || otp.replace(/\s/g, "").length < 6}
+                className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
+                {loading
+                  ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                  : <><span>Verify & Continue</span><ArrowRight className="w-4 h-4" /></>
+                }
+              </button>
+            </form>
+            <div className="mt-4 text-center">
+              {resendCD > 0 ? (
+                <p className="text-xs text-muted-foreground">Resend code in <span className="font-semibold text-foreground">{resendCD}s</span></p>
+              ) : (
+                <button onClick={handleResendOtp} className="text-xs text-primary hover:underline font-semibold">
+                  Didn't receive it? Resend code
+                </button>
+              )}
+            </div>
+            <p className="text-center text-xs text-muted-foreground mt-3">
+              Check spam/junk if you don't see it in inbox
+            </p>
+          </div>
+          <p className="text-center text-xs text-muted-foreground mt-3">
+            Wrong email?{" "}
+            <button onClick={() => switchMode("signup")} className="text-primary hover:underline font-semibold">Start over</button>
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Verify screen (fallback if OTP send failed) ───────────────────────────
   if (mode === "verify") {
     return (
       <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
@@ -387,7 +523,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
             {[
               `Open your inbox for ${email}`,
               `Click the "Confirm your email" link from MarketGreeks`,
-              "Come back here and sign in with your mobile number and password",
+              "Come back here and sign in with your mobile number or email",
               "Check spam/junk folder if you don't see it",
             ].map((step, i) => (
               <div key={i} className="flex items-start gap-3">
@@ -411,7 +547,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     )
   }
 
-  // ── Reset password screen (shown when user clicks email link) ─────────────
+  // ── Reset password screen ─────────────────────────────────────────────────
   if (mode === "reset") {
     return (
       <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
@@ -463,7 +599,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     )
   }
 
-  // ── Main auth form ────────────────────────────────────────────────────────
+  // ── Main auth form (login / signup / forgot) ──────────────────────────────
   return (
     <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
       <div className="w-full max-w-md">
@@ -475,7 +611,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
           <p className="text-sm text-muted-foreground mt-1">
             {mode === "signup" ? "Create account & get ₹10L virtual money"
             : mode === "forgot" ? "Reset your password via email"
-            : "Sign in with your mobile number or email"}
+            : "Sign in with mobile number or email"}
           </p>
         </div>
 
@@ -494,6 +630,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
           {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
 
           <form onSubmit={submit} className="space-y-4">
+            {/* Full name — signup only */}
             {mode === "signup" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Full Name</label>
@@ -505,30 +642,30 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
               </div>
             )}
 
+            {/* Mobile — signup; mobile or email — login */}
             {mode !== "forgot" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
                   {mode === "login" ? "Mobile Number or Email" : "Mobile Number"}
                 </label>
-                <div className="flex">
-                  {mode !== "login" && (
+                {mode === "login" ? (
+                  <input type="text" value={mobile} onChange={e => setMobile(e.target.value)}
+                    placeholder="9876543210 or you@email.com"
+                    className="w-full px-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                ) : (
+                  <div className="flex">
                     <span className="inline-flex items-center px-3 text-sm text-muted-foreground bg-muted border border-r-0 border-border rounded-l-xl">
                       <Phone className="w-3.5 h-3.5 mr-1" />+91
                     </span>
-                  )}
-                  {mode === "login" ? (
-                    <input type="text" value={mobile} onChange={e => setMobile(e.target.value)}
-                      placeholder="9876543210 or you@email.com"
-                      className="w-full px-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                  ) : (
                     <input type="tel" value={mobile} onChange={e => setMobile(e.target.value)} placeholder="9876543210" maxLength={10}
                       className="flex-1 px-4 py-2.5 text-sm border border-border rounded-r-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                  )}
-                </div>
+                  </div>
+                )}
                 {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">Used for login. Each number registers only once.</p>}
               </div>
             )}
 
+            {/* Email — signup + forgot */}
             {(mode === "signup" || mode === "forgot") && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
@@ -539,10 +676,11 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
                   <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@gmail.com"
                     className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
                 </div>
-                {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">Verification link sent here. Also used for password reset.</p>}
+                {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">A 6-digit OTP will be sent here to verify your account.</p>}
               </div>
             )}
 
+            {/* Password — login + signup */}
             {mode !== "forgot" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Password</label>
@@ -559,6 +697,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
               </div>
             )}
 
+            {/* Confirm password — signup only */}
             {mode === "signup" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Confirm Password</label>
@@ -580,7 +719,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
               className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
               {loading
                 ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                : <><span>{mode === "login" ? "Sign In" : mode === "signup" ? "Create Account & Verify Email" : "Send Reset Link"}</span><ArrowRight className="w-4 h-4" /></>
+                : <><span>{mode === "login" ? "Sign In" : mode === "signup" ? "Create Account & Send OTP" : "Send Reset Link"}</span><ArrowRight className="w-4 h-4" /></>
               }
             </button>
           </form>
@@ -598,6 +737,7 @@ function AuthSection({ onAuth }: { onAuth: () => void }) {
     </div>
   )
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TRADE FORM
