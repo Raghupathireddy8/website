@@ -829,7 +829,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     const { error: posErr } = await supabase.from("positions").insert({
       user_id:         userId,
       symbol,
-      instrument_type: inst,
+      instrument: inst,
       trade_type:      side,
       quantity:        actualQty,
       avg_price:       price,
@@ -851,7 +851,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     await supabase.from("trade_history").insert({
       user_id:         userId,
       symbol,
-      instrument_type: inst,
+      instrument: inst,
       trade_type:      side,
       quantity:        actualQty,
       price:           price,
@@ -1093,10 +1093,10 @@ function TradingDashboard({ userId }: { userId: string }) {
 
   async function closePos(pos: any) {
     setClosing(pos.id)
-    const lp  = await fetchLivePrice(pos.symbol, pos.instrument_type) ?? pos.current_price
+    const lp  = await fetchLivePrice(pos.symbol, pos.instrument) ?? pos.current_price
 
     // For options: P&L based on premium change, not spot change
-    const pnl = pos.instrument_type === "OPTIONS"
+    const pnl = pos.instrument === "OPTIONS"
       ? (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
       : (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
 
@@ -1105,7 +1105,7 @@ function TradingDashboard({ userId }: { userId: string }) {
     }).eq("id", pos.id)
 
     const closeVal = lp * pos.quantity
-    const ch       = calcCharges(lp, pos.quantity, pos.instrument_type, pos.trade_type === "BUY" ? "SELL" : "BUY")
+    const ch       = calcCharges(lp, pos.quantity, pos.instrument, pos.trade_type === "BUY" ? "SELL" : "BUY")
     const ret      = pos.trade_type === "BUY" ? closeVal - ch : closeVal + ch
 
     await supabase.from("wallets")
@@ -1113,7 +1113,7 @@ function TradingDashboard({ userId }: { userId: string }) {
       .eq("user_id", userId)
 
     await supabase.from("trade_history").insert({
-      user_id: userId, symbol: pos.symbol, instrument_type: pos.instrument_type,
+      user_id: userId, symbol: pos.symbol, instrument: pos.instrument,
       trade_type: pos.trade_type === "BUY" ? "SELL" : "BUY",
       quantity: pos.quantity, price: lp, total_value: closeVal, charges: ch, net_value: ret,
     })
@@ -1207,21 +1207,21 @@ function TradingDashboard({ userId }: { userId: string }) {
                           <tr key={pos.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
                             <td className="px-4 py-3">
                               <div className="font-bold text-foreground">{pos.symbol}</div>
-                              {pos.instrument_type === "OPTIONS" && (
+                              {pos.instrument === "OPTIONS" && (
                                 <div className="text-[10px] text-muted-foreground">
                                   {pos.strike_price} {pos.option_type} · {pos.expiry ? formatExpiry(pos.expiry) : ""}
                                 </div>
                               )}
-                              {pos.instrument_type === "FUTURES" && (
+                              {pos.instrument === "FUTURES" && (
                                 <div className="text-[10px] text-muted-foreground">Fut · {pos.expiry ? formatExpiry(pos.expiry) : ""}</div>
                               )}
                             </td>
                             <td className="px-4 py-3">
                               <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                                pos.instrument_type === "EQUITY"  ? "bg-primary/10 text-primary" :
-                                pos.instrument_type === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+                                pos.instrument === "EQUITY"  ? "bg-primary/10 text-primary" :
+                                pos.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
                                 "bg-warning/10 text-warning"}`}>
-                                {pos.instrument_type}
+                                {pos.instrument}
                               </span>
                             </td>
                             <td className="px-4 py-3">
@@ -1277,7 +1277,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                             {new Date(t.executed_at).toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
                           </td>
                           <td className="px-4 py-2.5 font-bold text-foreground">{t.symbol}</td>
-                          <td className="px-4 py-2.5 text-muted-foreground">{t.instrument_type}</td>
+                          <td className="px-4 py-2.5 text-muted-foreground">{t.instrument}</td>
                           <td className="px-4 py-2.5">
                             <span className={`font-bold ${t.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{t.trade_type}</span>
                           </td>
