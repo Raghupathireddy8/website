@@ -6,6 +6,8 @@
 //   ALTER TABLE positions     ADD COLUMN IF NOT EXISTS margin_blocked NUMERIC DEFAULT 0;
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS margin_blocked NUMERIC DEFAULT 0;
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS realized_pnl   NUMERIC;
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS executed_at    TIMESTAMPTZ DEFAULT NOW();
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS created_at     TIMESTAMPTZ DEFAULT NOW();
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -809,10 +811,12 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState("")
   const [success,   setSuccess]   = useState("")
-  const [spotPrice, setSpotPrice] = useState<number | null>(null)  // kept for BS display only — no longer fetched automatically
+  const [spotPrice, setSpotPrice] = useState<number | null>(null)
+  const [lotSizeOverride, setLotSizeOverride] = useState<number | "">("")  // manual lot size override
 
   const symbols  = inst === "EQUITY" ? NIFTY50_EQUITY : NIFTY50_FNO
-  const lotSize  = LOT_SIZES[symbol] ?? 1
+  const defaultLotSize = LOT_SIZES[symbol] ?? 1
+  const lotSize  = (lotSizeOverride !== "" && (lotSizeOverride as number) > 0) ? (lotSizeOverride as number) : defaultLotSize
   const actualQty = inst === "EQUITY" ? qty : qty * lotSize
 
   // Expiry options — weekly for Nifty, monthly for others
@@ -827,8 +831,8 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   const charges  = premiumPerUnit ? calcCharges(premiumPerUnit, actualQty, inst, side) : 0
   const net      = side === "BUY" ? turnover + charges : turnover - charges
 
-  useEffect(() => { setSymbol(symbols[0]); setPrice(""); setSpotPrice(null) }, [inst])
-  useEffect(() => { setPrice(""); setSpotPrice(null) }, [symbol])
+  useEffect(() => { setSymbol(symbols[0]); setPrice(""); setSpotPrice(null); setLotSizeOverride("") }, [inst])
+  useEffect(() => { setPrice(""); setSpotPrice(null); setLotSizeOverride("") }, [symbol])
   useEffect(() => {
     if (expiryOptions.length > 0 && !expiry) setExpiry(expiryOptions[0])
   }, [symbol, inst])
@@ -903,15 +907,15 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         // Only premium × qty is debited
         walletDebit = tradeTurnover + tradeCharges
       } else {
-        // SELL: block margin; use spot price if available, else use strike as proxy
-        const spotForMargin = spotPrice ?? (strike as number) ?? tradePrice
+        // SELL: block margin based on strike price (best proxy for spot when not fetched)
+        // spotPrice is only set if user clicked "Auto BS". Otherwise use strike.
+        const spotForMargin = spotPrice ?? (strike as number)
         marginBlocked = calcOptionsMargin(spotForMargin, lotSize, qty)
         walletDebit = marginBlocked
       }
     } else {
-      // FUTURES
-      const spotForMargin = spotPrice ?? tradePrice
-      marginBlocked = calcFuturesMargin(spotForMargin, lotSize, qty)
+      // FUTURES: margin based on futures price (close to spot)
+      marginBlocked = calcFuturesMargin(tradePrice, lotSize, qty)
       walletDebit = marginBlocked
     }
 
@@ -986,17 +990,20 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     }
 
     // ── Insert trade history ──────────────────────────────────────────────────
+    const now = new Date().toISOString()
     await supabase.from("trade_history").insert({
-      user_id:      userId,
+      user_id:        userId,
       symbol,
-      instrument:   inst,
-      trade_type:   side,
-      quantity:     tradeQty,
-      price:        tradePrice,
-      total_value:  tradeTurnover,
-      charges:      tradeCharges,
-      net_value:    tradeNet,
+      instrument:     inst,
+      trade_type:     side,
+      quantity:       tradeQty,
+      price:          tradePrice,
+      total_value:    tradeTurnover,
+      charges:        tradeCharges,
+      net_value:      tradeNet,
       margin_blocked: marginBlocked,
+      executed_at:    now,
+      created_at:     now,
     })
 
     // ── Update wallet ─────────────────────────────────────────────────────────
@@ -1134,30 +1141,24 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {/* Price / Premium */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "OPTIONS" ? "Spot Price ₹ (auto-calc premium via Black-Scholes)" : "Price ₹"}
+            {inst === "OPTIONS" ? "Option Premium ₹" : "Price ₹"}
           </label>
           {inst === "OPTIONS" ? (
             <>
-              <div className="flex gap-2 mb-2">
-                <input
-                  type="number" value={spotPrice ?? ""} min={0} step="0.05"
-                  onChange={e => recalcBS(Number(e.target.value))}
-                  placeholder="Enter or fetch spot price"
+              <div className="flex gap-2">
+                <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
+                  placeholder="Enter premium (e.g. 86)"
                   className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
                 <button type="button" onClick={fetchPrice} disabled={fetching}
+                  title="Fetch spot price and auto-calculate premium via Black-Scholes"
                   className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap flex items-center gap-1">
-                  {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Live ₹"}
+                  {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Auto BS"}
                 </button>
               </div>
-              <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Option Premium ₹ (editable)</label>
-              <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
-                placeholder="Auto-filled or enter manually"
-                className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-              {spotPrice && (
-                <p className="text-[10px] text-muted-foreground mt-1">
-                  Spot: ₹{fmtN(spotPrice)} · Premium via Black-Scholes (IV 18%)
-                </p>
-              )}
+              <p className="text-[10px] text-muted-foreground mt-1">
+                Enter premium manually, or click <strong>Auto BS</strong> to fetch spot price &amp; calculate via Black-Scholes (IV 18%)
+                {spotPrice ? ` · Spot fetched: ₹${fmtN(spotPrice)}` : ""}
+              </p>
             </>
           ) : (
             <div className="flex gap-2">
@@ -1175,14 +1176,35 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {/* Quantity */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "EQUITY" ? "Quantity (shares)" : `Lots  ·  1 lot = ${fmtN(lotSize)} qty`}
+            {inst === "EQUITY" ? "Quantity (shares)" : "Lots"}
           </label>
           <input type="number" value={qty} min={1} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))}
             className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
           {inst !== "EQUITY" && (
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Total qty: {fmtN(actualQty)} shares · Lot size for {symbol}: {fmtN(lotSize)}
-            </p>
+            <div className="mt-2">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-[11px] font-semibold text-muted-foreground">
+                  Lot size <span className="text-primary">(NSE default: {fmtN(defaultLotSize)})</span>
+                </label>
+                {lotSizeOverride !== "" && (
+                  <button type="button" onClick={() => setLotSizeOverride("")}
+                    className="text-[10px] text-primary hover:underline">Reset to default</button>
+                )}
+              </div>
+              <input
+                type="number" value={lotSizeOverride === "" ? defaultLotSize : lotSizeOverride}
+                min={1}
+                onChange={e => {
+                  const v = parseInt(e.target.value) || 1
+                  setLotSizeOverride(v === defaultLotSize ? "" : v)
+                }}
+                className={`w-full bg-muted border rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-primary ${lotSizeOverride !== "" ? "border-warning text-warning font-semibold" : "border-border"}`}
+              />
+              <p className="text-[10px] text-muted-foreground mt-1">
+                Total qty: <strong>{fmtN(actualQty)}</strong> shares
+                {lotSizeOverride !== "" && <span className="text-warning ml-1">⚠ Custom lot size</span>}
+              </p>
+            </div>
           )}
         </div>
 
@@ -1190,9 +1212,9 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {price ? (() => {
           const p = price as number
           const marginForSell = (inst === "OPTIONS" && side === "SELL")
-            ? calcOptionsMargin(spotPrice ?? (strike as number) ?? p, lotSize, qty)
+            ? calcOptionsMargin(spotPrice ?? (strike as number) ?? (price as number), lotSize, qty)
             : (inst === "FUTURES")
-            ? calcFuturesMargin(spotPrice ?? p, lotSize, qty)
+            ? calcFuturesMargin(price as number, lotSize, qty)
             : 0
           const displayDebit = (inst === "OPTIONS" && side === "SELL") || inst === "FUTURES"
             ? marginForSell
@@ -1297,7 +1319,7 @@ function TradingDashboard({ userId }: { userId: string }) {
     const [w, p, h, pr] = await Promise.all([
       supabase.from("wallets").select("balance").eq("user_id", userId).single(),
       supabase.from("positions").select("*").eq("user_id", userId).eq("status", "OPEN").order("opened_at", { ascending: false }),
-      supabase.from("trade_history").select("*").eq("user_id", userId).order("executed_at", { ascending: false }).limit(50),
+    supabase.from("trade_history").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(100),
       supabase.from("profiles").select("full_name,mobile").eq("id", userId).single(),
     ])
     if (w.data)  setBalance(w.data.balance)
@@ -1356,7 +1378,13 @@ function TradingDashboard({ userId }: { userId: string }) {
   async function closePos(pos: any, forcePrice?: number) {
     setClosing(pos.id)
     const liveKey = `${pos.symbol}__${pos.instrument}`
-    const lp      = forcePrice ?? (livePrices[liveKey] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price)
+    // OPTIONS: Yahoo returns spot price, not option premium. Use stored current_price (last known premium).
+    // EQUITY/FUTURES: use live Yahoo price.
+    const lp = forcePrice !== undefined
+      ? forcePrice
+      : pos.instrument === "OPTIONS"
+        ? (pos.current_price ?? pos.avg_price ?? pos.entry_price)
+        : (livePrices[liveKey] ?? pos.current_price ?? pos.avg_price ?? pos.entry_price)
     const entryP  = pos.avg_price ?? pos.entry_price
     const qty     = pos.quantity
     const margin  = pos.margin_blocked ?? 0
@@ -1414,17 +1442,20 @@ function TradingDashboard({ userId }: { userId: string }) {
 
     await supabase.from("wallets").update({ balance: freshBal + walletCredit }).eq("user_id", userId)
 
+    const exitNow = new Date().toISOString()
     await supabase.from("trade_history").insert({
-      user_id:     userId,
-      symbol:      pos.symbol,
-      instrument:  pos.instrument,
-      trade_type:  pos.trade_type === "BUY" ? "SELL" : "BUY",
-      quantity:    qty,
-      price:       lp,
-      total_value: exitValue,
-      charges:     0,
-      net_value:   walletCredit,
+      user_id:      userId,
+      symbol:       pos.symbol,
+      instrument:   pos.instrument,
+      trade_type:   pos.trade_type === "BUY" ? "SELL" : "BUY",
+      quantity:     qty,
+      price:        lp,
+      total_value:  exitValue,
+      charges:      0,
+      net_value:    walletCredit,
       realized_pnl: realizedPnl,
+      executed_at:  exitNow,
+      created_at:   exitNow,
     })
 
     setClosing(null)
@@ -1462,8 +1493,14 @@ function TradingDashboard({ userId }: { userId: string }) {
     }
   }
 
-  const getLivePrice = (pos: any) =>
-    livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
+  // For OPTIONS: live price from Yahoo is the SPOT price, not premium.
+  // We only use Yahoo prices for EQUITY and FUTURES. For OPTIONS, use stored current_price (premium).
+  const getLivePrice = (pos: any) => {
+    if (pos.instrument === "OPTIONS") {
+      return pos.current_price ?? pos.avg_price ?? pos.entry_price
+    }
+    return livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
+  }
 
   const totalPnL = positions.reduce((s, p) => {
     const entryP   = p.avg_price ?? p.entry_price
@@ -1558,17 +1595,21 @@ function TradingDashboard({ userId }: { userId: string }) {
                       {positions.map((pos, i) => {
                         const entryP  = pos.avg_price ?? pos.entry_price
                         const liveKey = `${pos.symbol}__${pos.instrument}`
-                        const ltp     = livePrices[liveKey] ?? pos.current_price ?? entryP
-                        const hasLive = !!livePrices[liveKey]
-                        // P&L: buyers profit when price rises, sellers profit when price falls
-                        const pnl     = pos.trade_type === "BUY"
+                        // OPTIONS: Yahoo returns spot price, NOT option premium. Use stored current_price (premium).
+                        // EQUITY/FUTURES: use live price from Yahoo.
+                        const ltp = pos.instrument === "OPTIONS"
+                          ? (pos.current_price ?? entryP)
+                          : (livePrices[liveKey] ?? pos.current_price ?? entryP)
+                        const hasLive = pos.instrument === "OPTIONS"
+                          ? true   // always show — it's the stored premium
+                          : !!livePrices[liveKey]
+                        // P&L: buyers profit when premium rises, sellers profit when premium falls
+                        const pnl = pos.trade_type === "BUY"
                           ? (ltp - entryP) * pos.quantity
                           : (entryP - ltp) * pos.quantity
                         const isProfit = pnl >= 0
                         const pnlPct  = entryP > 0 ? pnl / (entryP * pos.quantity) * 100 : 0
-                        // For sell positions: show margin at risk
                         const marginBlocked = pos.margin_blocked ?? 0
-                        // Auto square-off warning: loss > 80% of margin
                         const lossNearMargin = pos.trade_type === "SELL" && marginBlocked > 0 && (-pnl) > marginBlocked * 0.8
                         return (
                           <tr key={pos.id} className={`border-t border-border ${lossNearMargin ? "bg-destructive/5" : i % 2 ? "bg-muted/30" : ""}`}>
@@ -1680,7 +1721,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                         return (
                         <tr key={t.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
                           <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap">
-                            {new Date(t.executed_at).toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
+                            {new Date(t.executed_at ?? t.created_at).toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
                           </td>
                           <td className="px-4 py-2.5">
                             <div className="font-bold text-foreground">{t.symbol}</div>
