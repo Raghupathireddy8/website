@@ -826,7 +826,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     const newBalance = side === "BUY" ? balance - net : balance + net
     const { error: walletErr } = await supabase
       .from("wallets")
-      .update({ balance: newBalance, updated_at: new Date().toISOString() })
+      .update({ balance: newBalance })
       .eq("user_id", userId)
 
     if (walletErr) {
@@ -1077,7 +1077,7 @@ function TradingDashboard({ userId }: { userId: string }) {
     const ret      = pos.trade_type === "BUY" ? closeVal - ch : closeVal + ch
 
     await supabase.from("wallets")
-      .update({ balance: balance + ret, updated_at: new Date().toISOString() })
+      .update({ balance: balance + ret })
       .eq("user_id", userId)
 
     await supabase.from("trade_history").insert({
