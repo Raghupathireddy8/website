@@ -1,5 +1,14 @@
 "use client"
 
+// ─── DB MIGRATION REQUIRED ────────────────────────────────────────────────────
+// Run these SQL statements in your Supabase SQL editor if not already present:
+//
+//   ALTER TABLE positions     ADD COLUMN IF NOT EXISTS margin_blocked NUMERIC DEFAULT 0;
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS margin_blocked NUMERIC DEFAULT 0;
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS realized_pnl   NUMERIC;
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const dynamic = "force-dynamic"
 
 import { useState, useEffect, useCallback, useRef } from "react"
@@ -14,19 +23,31 @@ import {
 } from "lucide-react"
 
 // ─── NSE F&O Lot Sizes — effective 2025-26 ───────────────────────────────────
-// Update when NSE revises: check nseindia.com/circulars
+// Source: NSE circulars. Update when NSE revises: nseindia.com/circulars
 const LOT_SIZES: Record<string, number> = {
-  NIFTY: 75, BANKNIFTY: 30, FINNIFTY: 60, MIDCPNIFTY: 120,
-  RELIANCE: 250, TCS: 150, INFY: 300, HDFCBANK: 550,
-  ICICIBANK: 700, SBIN: 1500, BHARTIARTL: 950, ITC: 3200,
-  AXISBANK: 1200, BAJFINANCE: 125, MARUTI: 100, SUNPHARMA: 350,
-  TATAMOTORS: 1425, WIPRO: 1500, HCLTECH: 700, ONGC: 1925,
-  HINDUNILVR: 300, KOTAKBANK: 400, LT: 150, ASIANPAINT: 200,
-  TITAN: 175, DRREDDY: 125, CIPLA: 650, JSWSTEEL: 600,
+  NIFTY: 75,    BANKNIFTY: 30,  FINNIFTY: 60,   MIDCPNIFTY: 120,
+  RELIANCE: 500, TCS: 175,      INFY: 400,      HDFCBANK: 550,
+  ICICIBANK: 700, SBIN: 1500,   BHARTIARTL: 950, ITC: 3200,
+  AXISBANK: 1200, BAJFINANCE: 125, MARUTI: 100,  SUNPHARMA: 350,
+  TATAMOTORS: 1425, WIPRO: 1500, HCLTECH: 700,   ONGC: 1925,
+  HINDUNILVR: 300, KOTAKBANK: 400, LT: 150,      ASIANPAINT: 200,
+  TITAN: 175,   DRREDDY: 125,   CIPLA: 650,     JSWSTEEL: 600,
   TATASTEEL: 5500, HINDALCO: 1075, ADANIENT: 625, BAJAJFINSV: 500,
   NESTLEIND: 40, COALINDIA: 4200, ULTRACEMCO: 100, POWERGRID: 4700,
-  NTPC: 3750, BPCL: 4800, EICHERMOT: 175, HEROMOTOCO: 300,
-  GRASIM: 475, INDUSINDBK: 700, TATACONSUM: 1100, DIVISLAB: 200,
+  NTPC: 3750,   BPCL: 4800,    EICHERMOT: 175,  HEROMOTOCO: 300,
+  GRASIM: 475,  INDUSINDBK: 700, TATACONSUM: 1100, DIVISLAB: 200,
+}
+
+// ─── Margin calculator (Zerodha SPAN approximation) ──────────────────────────
+// Options sell: ~20-25% of notional. Futures: ~15% of notional.
+// These are approximations — real margin fluctuates with volatility.
+function calcOptionsMargin(spot: number, lotSize: number, lots: number): number {
+  // ~20% of notional as initial margin (SPAN + Exposure approx)
+  return Math.round(spot * lotSize * lots * 0.20)
+}
+function calcFuturesMargin(spot: number, lotSize: number, lots: number): number {
+  // ~15% of notional (lower than options short margin)
+  return Math.round(spot * lotSize * lots * 0.15)
 }
 
 // ─── Nifty 50 stocks only ─────────────────────────────────────────────────────
@@ -858,14 +879,45 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
 
     setLoading(true)
 
-    // ── Use local variables (not state) to avoid stale closure bugs ──────────
-    const tradePrice  = price as number
-    const tradeQty    = actualQty
+    // ── Local variables to avoid stale closure bugs ───────────────────────────
+    const tradePrice    = price as number
+    const tradeQty      = actualQty   // shares for equity, lots×lotSize for F&O
     const tradeTurnover = tradePrice * tradeQty
     const tradeCharges  = calcCharges(tradePrice, tradeQty, inst, side)
-    const tradeNet      = side === "BUY" ? tradeTurnover + tradeCharges : tradeTurnover - tradeCharges
 
-    // ── Fetch FRESH wallet balance from DB (avoid stale React state) ─────────
+    // ── WALLET IMPACT LOGIC ──────────────────────────────────────────────────
+    // EQUITY BUY:         debit  full value + charges
+    // EQUITY SELL:        credit full value − charges
+    // OPTIONS BUY:        debit  premium × qty + charges  (not notional!)
+    // OPTIONS SELL:       debit  margin (blocked); P&L settled on exit
+    // FUTURES BUY/SELL:   debit  margin (blocked)
+    let walletDebit  = 0  // amount to subtract from wallet
+    let walletCredit = 0  // amount to add to wallet
+    let marginBlocked = 0 // stored in position for future release
+
+    if (inst === "EQUITY") {
+      if (side === "BUY")  walletDebit  = tradeTurnover + tradeCharges
+      else                  walletCredit = tradeTurnover - tradeCharges
+    } else if (inst === "OPTIONS") {
+      if (side === "BUY") {
+        // Only premium × qty is debited
+        walletDebit = tradeTurnover + tradeCharges
+      } else {
+        // SELL: block margin; use spot price if available, else use strike as proxy
+        const spotForMargin = spotPrice ?? (strike as number) ?? tradePrice
+        marginBlocked = calcOptionsMargin(spotForMargin, lotSize, qty)
+        walletDebit = marginBlocked
+      }
+    } else {
+      // FUTURES
+      const spotForMargin = spotPrice ?? tradePrice
+      marginBlocked = calcFuturesMargin(spotForMargin, lotSize, qty)
+      walletDebit = marginBlocked
+    }
+
+    const tradeNet = walletDebit > 0 ? walletDebit : walletCredit
+
+    // ── Fetch FRESH wallet balance ────────────────────────────────────────────
     const { data: walletData, error: walletFetchErr } = await supabase
       .from("wallets").select("balance").eq("user_id", userId).single()
     if (walletFetchErr || !walletData) {
@@ -874,36 +926,35 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     }
     const freshBalance = walletData.balance
 
-    if (side === "BUY" && tradeNet > freshBalance) {
-      setError(`Insufficient balance. Need ${fmt(tradeNet)}, have ${fmt(freshBalance)}`)
+    if (walletDebit > freshBalance) {
+      setError(`Insufficient balance. Need ${fmt(walletDebit)}, have ${fmt(freshBalance)}`)
       setLoading(false); return
     }
 
-    // ── Upsert position: average if same symbol+instrument already open ───────
-    // Check for existing open BUY position for same symbol+instrument
+    // ── Check for existing open position to average ───────────────────────────
     const matchQuery = supabase
       .from("positions")
-      .select("id, quantity, entry_price, avg_price")
+      .select("id, quantity, entry_price, avg_price, margin_blocked")
       .eq("user_id", userId)
       .eq("symbol", symbol)
       .eq("instrument", inst)
-      .eq("trade_type", "BUY")
+      .eq("trade_type", side)
       .eq("status", "OPEN")
     if (inst !== "EQUITY") matchQuery.eq("expiry", expiry || "")
     if (inst === "OPTIONS") matchQuery.eq("strike_price", strike as number).eq("option_type", optType)
 
     const { data: existing } = await matchQuery.maybeSingle()
 
-    if (side === "BUY" && existing) {
-      // Average down/up: new_avg = (old_qty * old_avg + new_qty * new_price) / (old_qty + new_qty)
+    if (existing) {
       const oldQty   = existing.quantity
       const oldAvg   = existing.avg_price ?? existing.entry_price
       const newTotalQty = oldQty + tradeQty
       const newAvg   = Math.round(((oldQty * oldAvg) + (tradeQty * tradePrice)) / newTotalQty * 100) / 100
+      const newMargin = (existing.margin_blocked ?? 0) + marginBlocked
 
       const { error: updErr } = await supabase
         .from("positions")
-        .update({ quantity: newTotalQty, avg_price: newAvg, current_price: tradePrice })
+        .update({ quantity: newTotalQty, avg_price: newAvg, current_price: tradePrice, margin_blocked: newMargin })
         .eq("id", existing.id)
 
       if (updErr) {
@@ -911,22 +962,22 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         setLoading(false); return
       }
     } else {
-      // New position
       const { error: posErr } = await supabase.from("positions").insert({
-        user_id:      userId,
+        user_id:       userId,
         symbol,
-        instrument:   inst,
-        trade_type:   side,
-        quantity:     tradeQty,
-        entry_price:  tradePrice,
-        avg_price:    tradePrice,
+        instrument:    inst,
+        trade_type:    side,
+        quantity:      tradeQty,
+        entry_price:   tradePrice,
+        avg_price:     tradePrice,
         current_price: tradePrice,
-        expiry:       expiry || null,
-        strike_price: inst === "OPTIONS" ? strike : null,
-        option_type:  inst === "OPTIONS" ? optType : null,
-        lot_size:     lotSize,
-        status:       "OPEN",
-        pnl:          0,
+        expiry:        expiry || null,
+        strike_price:  inst === "OPTIONS" ? strike : null,
+        option_type:   inst === "OPTIONS" ? optType : null,
+        lot_size:      lotSize,
+        margin_blocked: marginBlocked,
+        status:        "OPEN",
+        pnl:           0,
       })
       if (posErr) {
         setError(`Failed to place trade: ${posErr.message}`)
@@ -934,36 +985,42 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       }
     }
 
-    // ── Insert trade history ─────────────────────────────────────────────────
+    // ── Insert trade history ──────────────────────────────────────────────────
     await supabase.from("trade_history").insert({
-      user_id:     userId,
+      user_id:      userId,
       symbol,
-      instrument:  inst,
-      trade_type:  side,
-      quantity:    tradeQty,
-      price:       tradePrice,
-      total_value: tradeTurnover,
-      charges:     tradeCharges,
-      net_value:   tradeNet,
+      instrument:   inst,
+      trade_type:   side,
+      quantity:     tradeQty,
+      price:        tradePrice,
+      total_value:  tradeTurnover,
+      charges:      tradeCharges,
+      net_value:    tradeNet,
+      margin_blocked: marginBlocked,
     })
 
-    // ── Update wallet balance using FRESH balance ─────────────────────────────
-    const newBalance = side === "BUY" ? freshBalance - tradeNet : freshBalance + tradeNet
+    // ── Update wallet ─────────────────────────────────────────────────────────
+    const newBalance = freshBalance - walletDebit + walletCredit
     const { error: walletErr } = await supabase
-      .from("wallets")
-      .update({ balance: newBalance })
-      .eq("user_id", userId)
+      .from("wallets").update({ balance: newBalance }).eq("user_id", userId)
 
     if (walletErr) {
       setError(`Trade saved but wallet update failed: ${walletErr.message}`)
       setLoading(false); return
     }
 
-    setSuccess(
-      inst === "OPTIONS"
-        ? `✅ ${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${tradePrice} premium | Charges ₹${tradeCharges.toFixed(2)}`
-        : `✅ ${side} ${tradeQty} ${symbol} @ ₹${tradePrice} | Total ₹${fmt(tradeTurnover)} | Charges ₹${tradeCharges.toFixed(2)}`
-    )
+    // ── Success message ───────────────────────────────────────────────────────
+    let msg = ""
+    if (inst === "OPTIONS" && side === "BUY") {
+      msg = `✅ Bought ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${tradePrice} premium | Debited ₹${fmtN(tradeTurnover)} + charges`
+    } else if (inst === "OPTIONS" && side === "SELL") {
+      msg = `✅ Sold ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${tradePrice} | Margin blocked ₹${fmtN(marginBlocked)}`
+    } else if (inst === "FUTURES") {
+      msg = `✅ ${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} Futures @ ₹${tradePrice} | Margin blocked ₹${fmtN(marginBlocked)}`
+    } else {
+      msg = `✅ ${side} ${tradeQty} ${symbol} @ ₹${tradePrice} | Total ₹${fmt(tradeTurnover)} | Charges ₹${tradeCharges.toFixed(2)}`
+    }
+    setSuccess(msg)
     setLoading(false)
     onDone()
   }
@@ -1118,40 +1175,89 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {/* Quantity */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "EQUITY" ? "Quantity (shares)" : `Lots (1 lot = ${lotSize} qty)`}
+            {inst === "EQUITY" ? "Quantity (shares)" : `Lots  ·  1 lot = ${fmtN(lotSize)} qty`}
           </label>
           <input type="number" value={qty} min={1} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))}
             className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-          {inst !== "EQUITY" && <p className="text-[10px] text-muted-foreground mt-1">Total qty: {fmtN(actualQty)}</p>}
+          {inst !== "EQUITY" && (
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Total qty: {fmtN(actualQty)} shares · Lot size for {symbol}: {fmtN(lotSize)}
+            </p>
+          )}
         </div>
 
         {/* Order summary */}
-        {price ? (
+        {price ? (() => {
+          const p = price as number
+          const marginForSell = (inst === "OPTIONS" && side === "SELL")
+            ? calcOptionsMargin(spotPrice ?? (strike as number) ?? p, lotSize, qty)
+            : (inst === "FUTURES")
+            ? calcFuturesMargin(spotPrice ?? p, lotSize, qty)
+            : 0
+          const displayDebit = (inst === "OPTIONS" && side === "SELL") || inst === "FUTURES"
+            ? marginForSell
+            : inst === "OPTIONS" ? turnover + charges
+            : side === "BUY" ? turnover + charges : 0
+          const displayCredit = (inst === "EQUITY" && side === "SELL") ? turnover - charges : 0
+          const balAfter = balance - displayDebit + displayCredit
+
+          return (
           <div className="bg-muted rounded-xl p-3 space-y-1.5 text-xs">
-            {inst === "OPTIONS" && (
+            {inst === "OPTIONS" && side === "BUY" && (
               <div className="flex justify-between text-primary font-semibold border-b border-border pb-1.5 mb-1">
                 <span>Premium × Qty</span>
-                <span className="font-mono">₹{fmtN(premiumPerUnit)} × {actualQty} = {fmt(turnover)}</span>
+                <span className="font-mono">₹{fmtN(p)} × {actualQty} = {fmt(turnover)}</span>
               </div>
             )}
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">{inst === "OPTIONS" ? "Total Premium" : "Turnover"}</span>
-              <span className="font-mono font-semibold">{fmt(turnover)}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Charges</span>
-              <span className="font-mono text-warning">+{fmt(charges)}</span>
-            </div>
+            {(inst === "OPTIONS" || inst === "FUTURES") && side === "SELL" && (
+              <div className="flex justify-between text-warning font-semibold border-b border-border pb-1.5 mb-1">
+                <span>Margin blocked (SPAN approx)</span>
+                <span className="font-mono">{fmt(marginForSell)}</span>
+              </div>
+            )}
+            {inst === "EQUITY" && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Turnover</span>
+                <span className="font-mono font-semibold">{fmt(turnover)}</span>
+              </div>
+            )}
+            {(inst === "OPTIONS" && side === "BUY") && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Total Premium</span>
+                <span className="font-mono font-semibold">{fmt(turnover)}</span>
+              </div>
+            )}
+            {inst !== "OPTIONS" || side === "BUY" ? (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Charges</span>
+                <span className="font-mono text-warning">+{fmt(charges)}</span>
+              </div>
+            ) : null}
             <div className="flex justify-between border-t border-border pt-1.5">
-              <span className="font-semibold text-foreground">{side === "BUY" ? "Total debit" : "Total credit"}</span>
-              <span className={`font-mono font-bold ${side === "BUY" ? "text-destructive" : "text-success"}`}>{fmt(net)}</span>
+              <span className="font-semibold text-foreground">
+                {(inst === "OPTIONS" || inst === "FUTURES") && side === "SELL" ? "Margin blocked" : side === "BUY" ? "Total debit" : "Total credit"}
+              </span>
+              <span className={`font-mono font-bold ${displayDebit > 0 ? "text-destructive" : "text-success"}`}>
+                {displayDebit > 0 ? fmt(displayDebit) : fmt(displayCredit)}
+              </span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">Balance after</span>
-              <span className="font-mono font-semibold">{fmt(side === "BUY" ? balance - net : balance + net)}</span>
+              <span className="font-mono font-semibold">{fmt(balAfter)}</span>
             </div>
+            {(inst === "OPTIONS" || inst === "FUTURES") && side === "SELL" && (
+              <p className="text-[10px] text-warning/80 pt-1 border-t border-border">
+                ⚠️ If loss reaches margin, position auto squares off
+              </p>
+            )}
+            {inst === "OPTIONS" && side === "BUY" && (
+              <p className="text-[10px] text-muted-foreground pt-1 border-t border-border">
+                At expiry — worthless if OTM. P&L = (exit premium − entry premium) × {actualQty}
+              </p>
+            )}
           </div>
-        ) : null}
+          )
+        })() : null}
 
         <button type="submit" disabled={loading}
           className={`w-full py-3 rounded-xl text-sm font-bold transition-colors disabled:opacity-60 flex items-center justify-center gap-2 ${
@@ -1223,7 +1329,15 @@ function TradingDashboard({ userId }: { userId: string }) {
     setFetching(false)
   }, [])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    load().then(() => {
+      // After positions load, check for expired options and auto square-offs
+      setTimeout(() => {
+        checkExpiry()
+        checkSquareOff()
+      }, 1500)
+    })
+  }, [load]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-refresh prices every 30s
   useEffect(() => {
@@ -1239,44 +1353,125 @@ function TradingDashboard({ userId }: { userId: string }) {
     if (posLen > 0) refreshLivePrices()
   }, [posLen, refreshLivePrices])
 
-  async function closePos(pos: any) {
+  async function closePos(pos: any, forcePrice?: number) {
     setClosing(pos.id)
     const liveKey = `${pos.symbol}__${pos.instrument}`
-    const lp      = livePrices[liveKey] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
-    const entryP  = pos.entry_price ?? pos.avg_price
-    const pnl     = (lp - entryP) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+    const lp      = forcePrice ?? (livePrices[liveKey] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price)
+    const entryP  = pos.avg_price ?? pos.entry_price
+    const qty     = pos.quantity
+    const margin  = pos.margin_blocked ?? 0
+
+    let walletCredit = 0
+    let realizedPnl  = 0
+    let exitValue    = 0
+
+    if (pos.instrument === "EQUITY") {
+      // Standard: credit sell proceeds minus charges
+      const ch    = calcCharges(lp, qty, "EQUITY", "SELL")
+      exitValue   = lp * qty - ch
+      realizedPnl = (lp - entryP) * qty - ch
+      walletCredit = exitValue
+    } else if (pos.instrument === "OPTIONS") {
+      if (pos.trade_type === "BUY") {
+        // Credit exit premium × qty (minus charges)
+        const ch     = calcCharges(lp, qty, "OPTIONS", "SELL")
+        exitValue    = lp * qty - ch
+        realizedPnl  = (lp - entryP) * qty - ch
+        walletCredit = Math.max(exitValue, 0) // can't receive negative
+      } else {
+        // SELL position: release margin + P&L
+        // P&L = (entry_premium − exit_premium) × qty  [seller profits when premium falls]
+        const ch     = calcCharges(lp, qty, "OPTIONS", "BUY")
+        realizedPnl  = (entryP - lp) * qty - ch
+        // Release margin adjusted by P&L
+        walletCredit = Math.max(margin + realizedPnl, 0)
+        exitValue    = lp * qty
+      }
+    } else {
+      // FUTURES — same as options sell logic
+      const ch     = calcCharges(lp, qty, "FUTURES" as any, pos.trade_type === "BUY" ? "SELL" : "BUY")
+      if (pos.trade_type === "BUY") {
+        realizedPnl  = (lp - entryP) * qty - ch
+      } else {
+        realizedPnl  = (entryP - lp) * qty - ch
+      }
+      walletCredit = Math.max(margin + realizedPnl, 0)
+      exitValue    = lp * qty
+    }
+
+    const isProfit = realizedPnl >= 0
 
     await supabase.from("positions").update({
-      status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl,
+      status:      "CLOSED",
+      closed_at:   new Date().toISOString(),
+      current_price: lp,
+      pnl:         realizedPnl,
     }).eq("id", pos.id)
-
-    // Credit: sell proceeds = exit_price × qty − sell charges
-    const sellValue = lp * pos.quantity
-    const ch        = calcCharges(lp, pos.quantity, pos.instrument, "SELL")
-    const proceeds  = sellValue - ch
 
     const { data: walletData } = await supabase
       .from("wallets").select("balance").eq("user_id", userId).single()
     const freshBal = walletData?.balance ?? balance
 
-    await supabase.from("wallets").update({ balance: freshBal + proceeds }).eq("user_id", userId)
+    await supabase.from("wallets").update({ balance: freshBal + walletCredit }).eq("user_id", userId)
 
     await supabase.from("trade_history").insert({
-      user_id: userId, symbol: pos.symbol, instrument: pos.instrument,
-      trade_type: "SELL",
-      quantity: pos.quantity, price: lp, total_value: sellValue, charges: ch, net_value: proceeds,
+      user_id:     userId,
+      symbol:      pos.symbol,
+      instrument:  pos.instrument,
+      trade_type:  pos.trade_type === "BUY" ? "SELL" : "BUY",
+      quantity:    qty,
+      price:       lp,
+      total_value: exitValue,
+      charges:     0,
+      net_value:   walletCredit,
+      realized_pnl: realizedPnl,
     })
+
     setClosing(null)
     load()
+  }
+
+  // ── Expiry worthless check: close options at 0 on expiry ───────────────────
+  async function checkExpiry() {
+    const today = new Date(); today.setHours(0,0,0,0)
+    const expired = positions.filter(p =>
+      p.instrument === "OPTIONS" &&
+      p.expiry &&
+      new Date(p.expiry) <= today
+    )
+    for (const pos of expired) {
+      await closePos(pos, 0)
+    }
+  }
+
+  // ── Auto square-off: close sell positions if loss >= margin ────────────────
+  async function checkSquareOff() {
+    const sellPos = positions.filter(p =>
+      (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
+      p.trade_type === "SELL" &&
+      p.margin_blocked > 0
+    )
+    for (const pos of sellPos) {
+      const liveKey = `${pos.symbol}__${pos.instrument}`
+      const lp = livePrices[liveKey] ?? pos.current_price ?? pos.entry_price
+      const entryP = pos.avg_price ?? pos.entry_price
+      const loss = (lp - entryP) * pos.quantity  // loss is positive when price rose
+      if (loss >= pos.margin_blocked) {
+        await closePos(pos, lp)
+      }
+    }
   }
 
   const getLivePrice = (pos: any) =>
     livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
 
   const totalPnL = positions.reduce((s, p) => {
-    const entryP   = p.entry_price ?? p.avg_price
+    const entryP   = p.avg_price ?? p.entry_price
     const curPrice = getLivePrice(p)
-    return s + (curPrice - entryP) * p.quantity * (p.trade_type === "BUY" ? 1 : -1)
+    const raw = p.trade_type === "BUY"
+      ? (curPrice - entryP) * p.quantity
+      : (entryP - curPrice) * p.quantity
+    return s + raw
   }, 0)
 
   if (loading) return (
@@ -1361,24 +1556,40 @@ function TradingDashboard({ userId }: { userId: string }) {
                     </tr></thead>
                     <tbody>
                       {positions.map((pos, i) => {
-                        const entryP  = pos.entry_price ?? pos.avg_price
+                        const entryP  = pos.avg_price ?? pos.entry_price
                         const liveKey = `${pos.symbol}__${pos.instrument}`
                         const ltp     = livePrices[liveKey] ?? pos.current_price ?? entryP
                         const hasLive = !!livePrices[liveKey]
-                        const pnl     = (ltp - entryP) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+                        // P&L: buyers profit when price rises, sellers profit when price falls
+                        const pnl     = pos.trade_type === "BUY"
+                          ? (ltp - entryP) * pos.quantity
+                          : (entryP - ltp) * pos.quantity
                         const isProfit = pnl >= 0
                         const pnlPct  = entryP > 0 ? pnl / (entryP * pos.quantity) * 100 : 0
+                        // For sell positions: show margin at risk
+                        const marginBlocked = pos.margin_blocked ?? 0
+                        // Auto square-off warning: loss > 80% of margin
+                        const lossNearMargin = pos.trade_type === "SELL" && marginBlocked > 0 && (-pnl) > marginBlocked * 0.8
                         return (
-                          <tr key={pos.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
+                          <tr key={pos.id} className={`border-t border-border ${lossNearMargin ? "bg-destructive/5" : i % 2 ? "bg-muted/30" : ""}`}>
                             <td className="px-4 py-3">
                               <div className="font-bold text-foreground">{pos.symbol}</div>
                               {pos.instrument === "OPTIONS" && (
                                 <div className="text-[10px] text-muted-foreground">
                                   {pos.strike_price} {pos.option_type} · {pos.expiry ? formatExpiry(pos.expiry) : ""}
+                                  {pos.trade_type === "SELL" && <span className="ml-1 text-warning">SHORT</span>}
                                 </div>
                               )}
                               {pos.instrument === "FUTURES" && (
-                                <div className="text-[10px] text-muted-foreground">Fut · {pos.expiry ? formatExpiry(pos.expiry) : ""}</div>
+                                <div className="text-[10px] text-muted-foreground">
+                                  Fut · {pos.expiry ? formatExpiry(pos.expiry) : ""}
+                                  {pos.trade_type === "SELL" && <span className="ml-1 text-warning">SHORT</span>}
+                                </div>
+                              )}
+                              {pos.trade_type === "SELL" && marginBlocked > 0 && (
+                                <div className={`text-[9px] mt-0.5 ${lossNearMargin ? "text-destructive font-bold" : "text-muted-foreground"}`}>
+                                  {lossNearMargin ? "⚠️ Near auto sq-off" : `Margin: ₹${fmtN(marginBlocked)}`}
+                                </div>
                               )}
                             </td>
                             <td className="px-4 py-3">
@@ -1413,7 +1624,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                                 onClick={() => closePos(pos)}
                                 disabled={closing === pos.id}
                                 title={`Exit at live price ₹${fmtN(ltp)}`}
-                                className="flex items-center gap-1 px-2.5 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap">
+                                className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap ${lossNearMargin ? "bg-destructive text-destructive-foreground hover:bg-destructive/90" : "bg-destructive/10 hover:bg-destructive/20 text-destructive"}`}>
                                 {closing === pos.id
                                   ? <div className="w-3 h-3 border border-destructive/30 border-t-destructive rounded-full animate-spin" />
                                   : <X className="w-3 h-3" />}
@@ -1436,30 +1647,71 @@ function TradingDashboard({ userId }: { userId: string }) {
               </div>
             ) : (
               <div className="bg-card border border-border rounded-xl overflow-hidden">
+                {/* P&L summary bar */}
+                {(() => {
+                  const closed = history.filter(t => t.realized_pnl !== null && t.realized_pnl !== undefined)
+                  const totalRealized = closed.reduce((s: number, t: any) => s + (t.realized_pnl ?? 0), 0)
+                  const wins  = closed.filter((t: any) => (t.realized_pnl ?? 0) > 0).length
+                  const total = closed.length
+                  if (total === 0) return null
+                  return (
+                    <div className={`flex items-center justify-between px-4 py-3 border-b border-border text-xs ${totalRealized >= 0 ? "bg-success/5" : "bg-destructive/5"}`}>
+                      <div className="flex items-center gap-3">
+                        <span className="text-muted-foreground">Realised P&L</span>
+                        <span className={`font-mono font-bold ${totalRealized >= 0 ? "text-success" : "text-destructive"}`}>
+                          {totalRealized >= 0 ? "+" : ""}{fmt(totalRealized)}
+                        </span>
+                      </div>
+                      <span className="text-muted-foreground">{wins}/{total} profitable exits</span>
+                    </div>
+                  )
+                })()}
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
                     <thead><tr className="bg-muted">
-                      {["Time","Symbol","Type","B/S","Qty","Price","Charges","Net"].map(h => (
+                      {["Time","Symbol","Type","B/S","Qty","Price","P&L","Net"].map(h => (
                         <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
                       ))}
                     </tr></thead>
                     <tbody>
-                      {history.map((t, i) => (
+                      {history.map((t, i) => {
+                        const hasPnl = t.realized_pnl !== null && t.realized_pnl !== undefined
+                        const pnl    = t.realized_pnl ?? 0
+                        return (
                         <tr key={t.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
                           <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap">
                             {new Date(t.executed_at).toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
                           </td>
-                          <td className="px-4 py-2.5 font-bold text-foreground">{t.symbol}</td>
-                          <td className="px-4 py-2.5 text-muted-foreground">{t.instrument}</td>
+                          <td className="px-4 py-2.5">
+                            <div className="font-bold text-foreground">{t.symbol}</div>
+                            {t.instrument !== "EQUITY" && (
+                              <div className="text-[9px] text-muted-foreground">{t.instrument}</div>
+                            )}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-semibold ${
+                              t.instrument === "EQUITY" ? "bg-primary/10 text-primary" :
+                              t.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+                              "bg-warning/10 text-warning"}`}>
+                              {t.instrument}
+                            </span>
+                          </td>
                           <td className="px-4 py-2.5">
                             <span className={`font-bold ${t.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{t.trade_type}</span>
                           </td>
                           <td className="px-4 py-2.5 font-mono">{fmtN(t.quantity)}</td>
                           <td className="px-4 py-2.5 font-mono">₹{fmtN(t.price)}</td>
-                          <td className="px-4 py-2.5 font-mono text-warning">₹{fmtN(t.charges)}</td>
+                          <td className="px-4 py-2.5 font-mono font-semibold">
+                            {hasPnl ? (
+                              <span className={pnl >= 0 ? "text-success" : "text-destructive"}>
+                                {pnl >= 0 ? "+" : ""}₹{fmtN(Math.abs(pnl))}
+                              </span>
+                            ) : <span className="text-muted-foreground">—</span>}
+                          </td>
                           <td className="px-4 py-2.5 font-mono font-semibold">₹{fmtN(t.net_value)}</td>
                         </tr>
-                      ))}
+                        )
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1470,8 +1722,9 @@ function TradingDashboard({ userId }: { userId: string }) {
       </div>
 
       <p className="text-[10px] text-muted-foreground text-center mt-8">
-        ⚠️ Virtual trading only. No real money. Options priced using Black-Scholes model (IV 18%).
-        Equity/Futures prices from Yahoo Finance (~15 min delay). Charges simulated (Zerodha model). Not SEBI registered.
+        ⚠️ Virtual trading only. No real money. Options premium via Black-Scholes (IV 18%). Options BUY: only premium debited.
+        Options/Futures SELL: ~20% SPAN margin blocked; auto square-off if loss ≥ margin. Expired options settle worthless.
+        Equity/Futures live prices from Yahoo Finance (~15 min delay). Charges simulated (Zerodha model). Not SEBI registered.
       </p>
     </div>
   )
