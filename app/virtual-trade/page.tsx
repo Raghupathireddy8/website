@@ -168,36 +168,7 @@ function calcCharges(premium: number, qty: number, type: InstrumentType, side: T
   return Math.round((brokerage + stt + other + stamp) * 100) / 100
 }
 
-// ─── Live price fetch ─────────────────────────────────────────────────────────
-async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<number | null> {
-  try {
-    const ySym = type === "EQUITY" ? `${symbol}.NS`
-      : symbol === "NIFTY"     ? "^NSEI"
-      : symbol === "BANKNIFTY" ? "^NSEBANK"
-      : symbol === "FINNIFTY"  ? "^NSEMDCP50"
-      : `${symbol}.NS`
-
-    const url      = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1d&range=1d`
-    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
-    const res      = await fetch(proxyUrl, { cache: "no-store" })
-    if (!res.ok) throw new Error("proxy failed")
-    const body  = await res.json()
-    const json  = JSON.parse(body.contents)
-    const price = json.chart?.result?.[0]?.meta?.regularMarketPrice
-    if (price && price > 0) return Math.round(price * 100) / 100
-    throw new Error("no price")
-  } catch {
-    try {
-      const ySym2    = symbol === "NIFTY" ? "^NSEI" : symbol === "BANKNIFTY" ? "^NSEBANK" : `${symbol}.NS`
-      const backup   = `https://corsproxy.io/?${encodeURIComponent(`https://query2.finance.yahoo.com/v8/finance/chart/${ySym2}?interval=1d&range=1d`)}`
-      const res2     = await fetch(backup, { cache: "no-store" })
-      const json2    = await res2.json()
-      const price2   = json2.chart?.result?.[0]?.meta?.regularMarketPrice
-      if (price2 && price2 > 0) return Math.round(price2 * 100) / 100
-    } catch { }
-    return null
-  }
-}
+// Live price fetch removed — users enter market price manually for faster UX
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
@@ -757,11 +728,10 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   const [optType,   setOptType]   = useState<OptionType>("CE")
   const [expiry,    setExpiry]    = useState("")
   const [manualExpiry, setManualExpiry] = useState(false)
-  const [fetching,  setFetching]  = useState(false)
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState("")
   const [success,   setSuccess]   = useState("")
-  const [spotPrice, setSpotPrice] = useState<number | null>(null)
+  const [spotPrice, setSpotPrice] = useState<number | null>(null)  // kept for BS display only — no longer fetched automatically
 
   const symbols  = inst === "EQUITY" ? NIFTY50_EQUITY : NIFTY50_FNO
   const lotSize  = LOT_SIZES[symbol] ?? 1
@@ -785,25 +755,16 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     if (expiryOptions.length > 0 && !expiry) setExpiry(expiryOptions[0])
   }, [symbol, inst])
 
-  async function getPrice() {
-    setFetching(true); setError("")
-    const p = await fetchLivePrice(symbol, inst)
-    if (p) {
-      setSpotPrice(p)
-      if (inst === "OPTIONS" && strike && expiry) {
-        // Calculate Black-Scholes premium
-        const bs = calcOptionPremium(p, strike as number, expiry, optType)
-        setPrice(bs)
-      } else if (inst !== "OPTIONS") {
-        setPrice(p)
-      }
-    } else {
-      setError("Could not fetch price. Enter manually.")
+  // When user enters spot price manually for options, recalc BS premium
+  function recalcBS(spot: number) {
+    if (inst === "OPTIONS" && spot > 0 && strike && expiry) {
+      const bs = calcOptionPremium(spot, strike as number, expiry, optType)
+      setPrice(bs)
+      setSpotPrice(spot)
     }
-    setFetching(false)
   }
 
-  // Auto-recalculate BS premium when strike/expiry/optType changes
+  // Auto-recalculate BS premium when strike/expiry/optType changes (if spot already entered)
   useEffect(() => {
     if (inst === "OPTIONS" && spotPrice && strike && expiry) {
       const bs = calcOptionPremium(spotPrice, strike as number, expiry, optType)
@@ -832,6 +793,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       instrument: inst,
       trade_type:      side,
       quantity:        actualQty,
+      entry_price:     price,
       avg_price:       price,
       current_price:   price,
       expiry:          expiry || null,
@@ -990,21 +952,29 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {/* Price / Premium */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "OPTIONS" ? "Option Premium ₹ (Black-Scholes)" : "Price ₹"}
+            {inst === "OPTIONS" ? "Spot Price ₹ (to auto-calc premium)" : "Price ₹"}
           </label>
-          <div className="flex gap-2">
+          {inst === "OPTIONS" ? (
+            <>
+              <input
+                type="number" value={spotPrice ?? ""} min={0} step="0.05"
+                onChange={e => recalcBS(Number(e.target.value))}
+                placeholder="Enter current spot price (e.g. 24850)"
+                className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary mb-2" />
+              <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Option Premium ₹ (Black-Scholes · editable)</label>
+              <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
+                placeholder="Auto-filled or enter manually"
+                className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
+              {spotPrice && (
+                <p className="text-[10px] text-muted-foreground mt-1">
+                  Spot: ₹{fmtN(spotPrice)} · Premium auto-calculated via Black-Scholes (IV 18%)
+                </p>
+              )}
+            </>
+          ) : (
             <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
-              placeholder={inst === "OPTIONS" ? "Fetch after entering strike" : "Enter or fetch live"}
-              className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-            <button type="button" onClick={getPrice} disabled={fetching}
-              className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap">
-              {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : inst === "OPTIONS" ? "Fetch & Calc" : "Live ₹"}
-            </button>
-          </div>
-          {inst === "OPTIONS" && spotPrice && (
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Spot: ₹{fmtN(spotPrice)} · Premium calculated using Black-Scholes (IV 18%)
-            </p>
+              placeholder="Enter market price"
+              className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
           )}
         </div>
 
@@ -1093,12 +1063,10 @@ function TradingDashboard({ userId }: { userId: string }) {
 
   async function closePos(pos: any) {
     setClosing(pos.id)
-    const lp  = await fetchLivePrice(pos.symbol, pos.instrument) ?? pos.current_price
+    // Use the stored current_price (or entry_price fallback) — no live fetch for speed
+    const lp = pos.current_price ?? pos.entry_price ?? pos.avg_price
 
-    // For options: P&L based on premium change, not spot change
-    const pnl = pos.instrument === "OPTIONS"
-      ? (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
-      : (lp - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+    const pnl = (lp - (pos.entry_price ?? pos.avg_price)) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
 
     await supabase.from("positions").update({
       status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl,
@@ -1122,7 +1090,7 @@ function TradingDashboard({ userId }: { userId: string }) {
   }
 
   const totalPnL = positions.reduce((s, p) =>
-    s + (p.current_price - p.avg_price) * p.quantity * (p.trade_type === "BUY" ? 1 : -1), 0)
+    s + (p.current_price - (p.entry_price ?? p.avg_price)) * p.quantity * (p.trade_type === "BUY" ? 1 : -1), 0)
 
   if (loading) return (
     <div className="flex items-center justify-center py-24">
@@ -1201,7 +1169,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                     </tr></thead>
                     <tbody>
                       {positions.map((pos, i) => {
-                        const pnl  = (pos.current_price - pos.avg_price) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+                        const pnl  = (pos.current_price - (pos.entry_price ?? pos.avg_price)) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
                         const pos_ = pnl >= 0
                         return (
                           <tr key={pos.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
@@ -1228,7 +1196,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                               <span className={`font-bold ${pos.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{pos.trade_type}</span>
                             </td>
                             <td className="px-4 py-3 font-mono">{fmtN(pos.quantity)}</td>
-                            <td className="px-4 py-3 font-mono">₹{fmtN(pos.avg_price)}</td>
+                            <td className="px-4 py-3 font-mono">₹{fmtN(pos.entry_price ?? pos.avg_price)}</td>
                             <td className="px-4 py-3 font-mono">₹{fmtN(pos.current_price)}</td>
                             <td className="px-4 py-3">
                               <div className={`font-mono font-bold ${pos_ ? "text-success" : "text-destructive"}`}>
