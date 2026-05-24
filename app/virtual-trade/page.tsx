@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { supabase } from "@/lib/supabase"
 import { AnnouncementBar } from "@/components/announcement-bar"
 import { Navbar } from "@/components/navbar"
@@ -168,7 +168,63 @@ function calcCharges(premium: number, qty: number, type: InstrumentType, side: T
   return Math.round((brokerage + stt + other + stamp) * 100) / 100
 }
 
-// Live price fetch removed — users enter market price manually for faster UX
+// ─── Live price fetch (Yahoo Finance via CORS proxy) ─────────────────────────
+// Returns null on failure — caller should show last known price
+async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<number | null> {
+  const ySym = type === "EQUITY"         ? `${symbol}.NS`
+             : symbol === "NIFTY"        ? "^NSEI"
+             : symbol === "BANKNIFTY"    ? "^NSEBANK"
+             : symbol === "FINNIFTY"     ? "^NSEMDCP50"
+             : symbol === "MIDCPNIFTY"   ? "^NSEMDCP50"
+             : `${symbol}.NS`
+
+  const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1m&range=1d`
+
+  // Try proxy 1
+  try {
+    const res  = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`, { cache: "no-store" })
+    if (res.ok) {
+      const body = await res.json()
+      const json = JSON.parse(body.contents)
+      const p    = json?.chart?.result?.[0]?.meta?.regularMarketPrice
+      if (p && p > 0) return Math.round(p * 100) / 100
+    }
+  } catch { /* fall through */ }
+
+  // Try proxy 2
+  try {
+    const res2 = await fetch(
+      `https://corsproxy.io/?${encodeURIComponent(`https://query2.finance.yahoo.com/v8/finance/chart/${ySym}?interval=1m&range=1d`)}`,
+      { cache: "no-store" }
+    )
+    if (res2.ok) {
+      const json2 = await res2.json()
+      const p2    = json2?.chart?.result?.[0]?.meta?.regularMarketPrice
+      if (p2 && p2 > 0) return Math.round(p2 * 100) / 100
+    }
+  } catch { /* give up */ }
+
+  return null
+}
+
+// Fetch live prices for multiple symbols in parallel
+async function fetchLivePrices(
+  items: { symbol: string; instrument: InstrumentType }[]
+): Promise<Record<string, number>> {
+  const unique = Array.from(
+    new Map(items.map(i => [`${i.symbol}__${i.instrument}`, i])).values()
+  )
+  const results = await Promise.allSettled(
+    unique.map(i => fetchLivePrice(i.symbol, i.instrument).then(p => ({ key: `${i.symbol}__${i.instrument}`, p })))
+  )
+  const out: Record<string, number> = {}
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value.p !== null) {
+      out[r.value.key] = r.value.p
+    }
+  }
+  return out
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
@@ -728,6 +784,7 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
   const [optType,   setOptType]   = useState<OptionType>("CE")
   const [expiry,    setExpiry]    = useState("")
   const [manualExpiry, setManualExpiry] = useState(false)
+  const [fetching,  setFetching]  = useState(false)
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState("")
   const [success,   setSuccess]   = useState("")
@@ -762,6 +819,24 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       setPrice(bs)
       setSpotPrice(spot)
     }
+  }
+
+  async function fetchPrice() {
+    setFetching(true); setError("")
+    const p = await fetchLivePrice(symbol, inst)
+    if (p) {
+      if (inst === "OPTIONS") {
+        setSpotPrice(p)
+        if (strike && expiry) {
+          setPrice(calcOptionPremium(p, strike as number, expiry, optType))
+        }
+      } else {
+        setPrice(p)
+      }
+    } else {
+      setError("Could not fetch live price. Enter manually.")
+    }
+    setFetching(false)
   }
 
   // Auto-recalculate BS premium when strike/expiry/optType changes (if spot already entered)
@@ -1002,29 +1077,41 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
         {/* Price / Premium */}
         <div>
           <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "OPTIONS" ? "Spot Price ₹ (to auto-calc premium)" : "Price ₹"}
+            {inst === "OPTIONS" ? "Spot Price ₹ (auto-calc premium via Black-Scholes)" : "Price ₹"}
           </label>
           {inst === "OPTIONS" ? (
             <>
-              <input
-                type="number" value={spotPrice ?? ""} min={0} step="0.05"
-                onChange={e => recalcBS(Number(e.target.value))}
-                placeholder="Enter current spot price (e.g. 24850)"
-                className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary mb-2" />
-              <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Option Premium ₹ (Black-Scholes · editable)</label>
+              <div className="flex gap-2 mb-2">
+                <input
+                  type="number" value={spotPrice ?? ""} min={0} step="0.05"
+                  onChange={e => recalcBS(Number(e.target.value))}
+                  placeholder="Enter or fetch spot price"
+                  className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
+                <button type="button" onClick={fetchPrice} disabled={fetching}
+                  className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap flex items-center gap-1">
+                  {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Live ₹"}
+                </button>
+              </div>
+              <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Option Premium ₹ (editable)</label>
               <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
                 placeholder="Auto-filled or enter manually"
                 className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
               {spotPrice && (
                 <p className="text-[10px] text-muted-foreground mt-1">
-                  Spot: ₹{fmtN(spotPrice)} · Premium auto-calculated via Black-Scholes (IV 18%)
+                  Spot: ₹{fmtN(spotPrice)} · Premium via Black-Scholes (IV 18%)
                 </p>
               )}
             </>
           ) : (
-            <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
-              placeholder="Enter market price"
-              className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
+            <div className="flex gap-2">
+              <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
+                placeholder="Enter or fetch live price"
+                className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
+              <button type="button" onClick={fetchPrice} disabled={fetching}
+                className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap flex items-center gap-1">
+                {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Live ₹"}
+              </button>
+            </div>
           )}
         </div>
 
@@ -1087,13 +1174,18 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
 // ═════════════════════════════════════════════════════════════════════════════
 
 function TradingDashboard({ userId }: { userId: string }) {
-  const [balance,   setBalance]   = useState(0)
-  const [positions, setPositions] = useState<any[]>([])
-  const [history,   setHistory]   = useState<any[]>([])
-  const [profile,   setProfile]   = useState<{ full_name: string; mobile: string } | null>(null)
-  const [tab,       setTab]       = useState<"positions" | "history">("positions")
-  const [loading,   setLoading]   = useState(true)
-  const [closing,   setClosing]   = useState<string | null>(null)
+  const [balance,    setBalance]    = useState(0)
+  const [positions,  setPositions]  = useState<any[]>([])
+  const [history,    setHistory]    = useState<any[]>([])
+  const [profile,    setProfile]    = useState<{ full_name: string; mobile: string } | null>(null)
+  const [tab,        setTab]        = useState<"positions" | "history">("positions")
+  const [loading,    setLoading]    = useState(true)
+  const [closing,    setClosing]    = useState<string | null>(null)
+  // live prices: key = "SYMBOL__INSTRUMENT"
+  const [livePrices, setLivePrices] = useState<Record<string, number>>({})
+  const [priceTs,    setPriceTs]    = useState<Date | null>(null)   // last updated timestamp
+  const [fetching,   setFetching]   = useState(false)
+  const positionsRef = useRef<any[]>([])
 
   const load = useCallback(async () => {
     const [w, p, h, pr] = await Promise.all([
@@ -1103,47 +1195,89 @@ function TradingDashboard({ userId }: { userId: string }) {
       supabase.from("profiles").select("full_name,mobile").eq("id", userId).single(),
     ])
     if (w.data)  setBalance(w.data.balance)
-    if (p.data)  setPositions(p.data)
+    if (p.data)  { setPositions(p.data); positionsRef.current = p.data }
     if (h.data)  setHistory(h.data)
     if (pr.data) setProfile(pr.data)
     setLoading(false)
   }, [userId])
 
+  // ── Fetch live prices for all open positions ────────────────────────────────
+  const refreshLivePrices = useCallback(async () => {
+    const pos = positionsRef.current
+    if (pos.length === 0) return
+    setFetching(true)
+    const items = pos.map((p: any) => ({ symbol: p.symbol, instrument: p.instrument as InstrumentType }))
+    const prices = await fetchLivePrices(items)
+    if (Object.keys(prices).length > 0) {
+      setLivePrices(prev => ({ ...prev, ...prices }))
+      setPriceTs(new Date())
+      // Persist current_price to DB silently so close uses latest price
+      await Promise.all(
+        pos.map((p: any) => {
+          const lp = prices[`${p.symbol}__${p.instrument}`]
+          if (lp) return supabase.from("positions").update({ current_price: lp }).eq("id", p.id)
+          return Promise.resolve()
+        })
+      )
+    }
+    setFetching(false)
+  }, [])
+
   useEffect(() => { load() }, [load])
+
+  // Auto-refresh prices every 30s
+  useEffect(() => {
+    // Initial fetch after positions load
+    const init = setTimeout(() => refreshLivePrices(), 500)
+    const interval = setInterval(() => refreshLivePrices(), 30_000)
+    return () => { clearTimeout(init); clearInterval(interval) }
+  }, [refreshLivePrices])
+
+  // Re-trigger price fetch when positions change (new trade placed)
+  const posLen = positions.length
+  useEffect(() => {
+    if (posLen > 0) refreshLivePrices()
+  }, [posLen, refreshLivePrices])
 
   async function closePos(pos: any) {
     setClosing(pos.id)
-    const lp  = pos.current_price ?? pos.entry_price ?? pos.avg_price
-    const pnl = (lp - (pos.entry_price ?? pos.avg_price)) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+    const liveKey = `${pos.symbol}__${pos.instrument}`
+    const lp      = livePrices[liveKey] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
+    const entryP  = pos.entry_price ?? pos.avg_price
+    const pnl     = (lp - entryP) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
 
     await supabase.from("positions").update({
       status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl,
     }).eq("id", pos.id)
 
-    const closeVal = lp * pos.quantity
-    const ch  = calcCharges(lp, pos.quantity, pos.instrument, pos.trade_type === "BUY" ? "SELL" : "BUY")
-    const ret = pos.trade_type === "BUY" ? closeVal - ch : closeVal + ch
+    // Credit: sell proceeds = exit_price × qty − sell charges
+    const sellValue = lp * pos.quantity
+    const ch        = calcCharges(lp, pos.quantity, pos.instrument, "SELL")
+    const proceeds  = sellValue - ch
 
-    // Fetch fresh balance before crediting
     const { data: walletData } = await supabase
       .from("wallets").select("balance").eq("user_id", userId).single()
     const freshBal = walletData?.balance ?? balance
 
-    await supabase.from("wallets")
-      .update({ balance: freshBal + ret })
-      .eq("user_id", userId)
+    await supabase.from("wallets").update({ balance: freshBal + proceeds }).eq("user_id", userId)
 
     await supabase.from("trade_history").insert({
       user_id: userId, symbol: pos.symbol, instrument: pos.instrument,
-      trade_type: pos.trade_type === "BUY" ? "SELL" : "BUY",
-      quantity: pos.quantity, price: lp, total_value: closeVal, charges: ch, net_value: ret,
+      trade_type: "SELL",
+      quantity: pos.quantity, price: lp, total_value: sellValue, charges: ch, net_value: proceeds,
     })
     setClosing(null)
     load()
   }
 
-  const totalPnL = positions.reduce((s, p) =>
-    s + (p.current_price - (p.entry_price ?? p.avg_price)) * p.quantity * (p.trade_type === "BUY" ? 1 : -1), 0)
+  const getLivePrice = (pos: any) =>
+    livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
+
+  const totalPnL = positions.reduce((s, p) => {
+    const entryP   = p.entry_price ?? p.avg_price
+    const curPrice = getLivePrice(p)
+    return s + (curPrice - entryP) * p.quantity * (p.trade_type === "BUY" ? 1 : -1)
+  }, 0)
 
   if (loading) return (
     <div className="flex items-center justify-center py-24">
@@ -1199,9 +1333,14 @@ function TradingDashboard({ userId }: { userId: string }) {
                 <Icon className="w-3.5 h-3.5" />{label}
               </button>
             ))}
-            <button onClick={load} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors" title="Refresh">
-              <RefreshCw className="w-3.5 h-3.5" />
+            <button onClick={() => { load(); refreshLivePrices() }} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors" title="Refresh">
+              <RefreshCw className={`w-3.5 h-3.5 ${fetching ? "animate-spin text-primary" : ""}`} />
             </button>
+          </div>
+          {/* Live price status */}
+          <div className="flex items-center gap-2 mb-3 text-[10px] text-muted-foreground">
+            <span className={`w-1.5 h-1.5 rounded-full ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
+            {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · auto-refresh every 30s` : "Fetching prices…"}
           </div>
 
           {tab === "positions" ? (
@@ -1216,14 +1355,19 @@ function TradingDashboard({ userId }: { userId: string }) {
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
                     <thead><tr className="bg-muted">
-                      {["Symbol","Type","B/S","Qty","Avg","Current","P&L",""].map(h => (
+                      {["Symbol","Type","B/S","Qty","Entry Avg","LTP","P&L","Action"].map(h => (
                         <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
                       ))}
                     </tr></thead>
                     <tbody>
                       {positions.map((pos, i) => {
-                        const pnl  = (pos.current_price - (pos.entry_price ?? pos.avg_price)) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
-                        const pos_ = pnl >= 0
+                        const entryP  = pos.entry_price ?? pos.avg_price
+                        const liveKey = `${pos.symbol}__${pos.instrument}`
+                        const ltp     = livePrices[liveKey] ?? pos.current_price ?? entryP
+                        const hasLive = !!livePrices[liveKey]
+                        const pnl     = (ltp - entryP) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
+                        const isProfit = pnl >= 0
+                        const pnlPct  = entryP > 0 ? pnl / (entryP * pos.quantity) * 100 : 0
                         return (
                           <tr key={pos.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
                             <td className="px-4 py-3">
@@ -1249,23 +1393,31 @@ function TradingDashboard({ userId }: { userId: string }) {
                               <span className={`font-bold ${pos.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{pos.trade_type}</span>
                             </td>
                             <td className="px-4 py-3 font-mono">{fmtN(pos.quantity)}</td>
-                            <td className="px-4 py-3 font-mono">₹{fmtN(pos.entry_price ?? pos.avg_price)}</td>
-                            <td className="px-4 py-3 font-mono">₹{fmtN(pos.current_price)}</td>
+                            <td className="px-4 py-3 font-mono">₹{fmtN(entryP)}</td>
                             <td className="px-4 py-3">
-                              <div className={`font-mono font-bold ${pos_ ? "text-success" : "text-destructive"}`}>
-                                {pos_ ? "+" : ""}₹{fmtN(Math.abs(pnl))}
+                              <div className={`font-mono font-semibold ${hasLive ? "text-foreground" : "text-muted-foreground"}`}>
+                                ₹{fmtN(ltp)}
                               </div>
-                              <div className={`text-[10px] ${pos_ ? "text-success" : "text-destructive"}`}>
-                                {pos_ ? "▲" : "▼"}{Math.abs(pnl / (pos.avg_price * pos.quantity) * 100).toFixed(2)}%
+                              {!hasLive && <div className="text-[9px] text-muted-foreground">last known</div>}
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className={`font-mono font-bold ${isProfit ? "text-success" : "text-destructive"}`}>
+                                {isProfit ? "+" : ""}₹{fmtN(Math.abs(pnl))}
+                              </div>
+                              <div className={`text-[10px] ${isProfit ? "text-success" : "text-destructive"}`}>
+                                {isProfit ? "▲" : "▼"}{Math.abs(pnlPct).toFixed(2)}%
                               </div>
                             </td>
                             <td className="px-4 py-3">
-                              <button onClick={() => closePos(pos)} disabled={closing === pos.id}
-                                className="flex items-center gap-1 px-2.5 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50">
+                              <button
+                                onClick={() => closePos(pos)}
+                                disabled={closing === pos.id}
+                                title={`Exit at live price ₹${fmtN(ltp)}`}
+                                className="flex items-center gap-1 px-2.5 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap">
                                 {closing === pos.id
                                   ? <div className="w-3 h-3 border border-destructive/30 border-t-destructive rounded-full animate-spin" />
                                   : <X className="w-3 h-3" />}
-                                Close
+                                Exit @ ₹{fmtN(ltp)}
                               </button>
                             </td>
                           </tr>
