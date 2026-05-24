@@ -780,50 +780,100 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
     if (qty < 1)                           { setError("Enter valid quantity"); return }
     if (inst !== "EQUITY" && !expiry)      { setError("Select expiry date"); return }
     if (inst === "OPTIONS" && !strike)     { setError("Enter strike price"); return }
-    if (side === "BUY" && net > balance)   {
-      setError(`Insufficient balance. Need ${fmt(net)}, have ${fmt(balance)}`); return
-    }
 
     setLoading(true)
 
-    // ── Insert position ──────────────────────────────────────────────────────
-    const { error: posErr } = await supabase.from("positions").insert({
-      user_id:         userId,
-      symbol,
-      instrument: inst,
-      trade_type:      side,
-      quantity:        actualQty,
-      entry_price:     price,
-      avg_price:       price,
-      current_price:   price,
-      expiry:          expiry || null,
-      strike_price:    inst === "OPTIONS" ? strike : null,
-      option_type:     inst === "OPTIONS" ? optType : null,
-      lot_size:        lotSize,
-      status:          "OPEN",
-      pnl:             0,
-    })
+    // ── Use local variables (not state) to avoid stale closure bugs ──────────
+    const tradePrice  = price as number
+    const tradeQty    = actualQty
+    const tradeTurnover = tradePrice * tradeQty
+    const tradeCharges  = calcCharges(tradePrice, tradeQty, inst, side)
+    const tradeNet      = side === "BUY" ? tradeTurnover + tradeCharges : tradeTurnover - tradeCharges
 
-    if (posErr) {
-      setError(`Failed to place trade: ${posErr.message}`)
+    // ── Fetch FRESH wallet balance from DB (avoid stale React state) ─────────
+    const { data: walletData, error: walletFetchErr } = await supabase
+      .from("wallets").select("balance").eq("user_id", userId).single()
+    if (walletFetchErr || !walletData) {
+      setError("Could not read wallet balance. Please refresh and try again.")
       setLoading(false); return
+    }
+    const freshBalance = walletData.balance
+
+    if (side === "BUY" && tradeNet > freshBalance) {
+      setError(`Insufficient balance. Need ${fmt(tradeNet)}, have ${fmt(freshBalance)}`)
+      setLoading(false); return
+    }
+
+    // ── Upsert position: average if same symbol+instrument already open ───────
+    // Check for existing open BUY position for same symbol+instrument
+    const matchQuery = supabase
+      .from("positions")
+      .select("id, quantity, entry_price, avg_price")
+      .eq("user_id", userId)
+      .eq("symbol", symbol)
+      .eq("instrument", inst)
+      .eq("trade_type", "BUY")
+      .eq("status", "OPEN")
+    if (inst !== "EQUITY") matchQuery.eq("expiry", expiry || "")
+    if (inst === "OPTIONS") matchQuery.eq("strike_price", strike as number).eq("option_type", optType)
+
+    const { data: existing } = await matchQuery.maybeSingle()
+
+    if (side === "BUY" && existing) {
+      // Average down/up: new_avg = (old_qty * old_avg + new_qty * new_price) / (old_qty + new_qty)
+      const oldQty   = existing.quantity
+      const oldAvg   = existing.avg_price ?? existing.entry_price
+      const newTotalQty = oldQty + tradeQty
+      const newAvg   = Math.round(((oldQty * oldAvg) + (tradeQty * tradePrice)) / newTotalQty * 100) / 100
+
+      const { error: updErr } = await supabase
+        .from("positions")
+        .update({ quantity: newTotalQty, avg_price: newAvg, current_price: tradePrice })
+        .eq("id", existing.id)
+
+      if (updErr) {
+        setError(`Failed to update position: ${updErr.message}`)
+        setLoading(false); return
+      }
+    } else {
+      // New position
+      const { error: posErr } = await supabase.from("positions").insert({
+        user_id:      userId,
+        symbol,
+        instrument:   inst,
+        trade_type:   side,
+        quantity:     tradeQty,
+        entry_price:  tradePrice,
+        avg_price:    tradePrice,
+        current_price: tradePrice,
+        expiry:       expiry || null,
+        strike_price: inst === "OPTIONS" ? strike : null,
+        option_type:  inst === "OPTIONS" ? optType : null,
+        lot_size:     lotSize,
+        status:       "OPEN",
+        pnl:          0,
+      })
+      if (posErr) {
+        setError(`Failed to place trade: ${posErr.message}`)
+        setLoading(false); return
+      }
     }
 
     // ── Insert trade history ─────────────────────────────────────────────────
     await supabase.from("trade_history").insert({
-      user_id:         userId,
+      user_id:     userId,
       symbol,
-      instrument: inst,
-      trade_type:      side,
-      quantity:        actualQty,
-      price:           price,
-      total_value:     turnover,
-      charges,
-      net_value:       net,
+      instrument:  inst,
+      trade_type:  side,
+      quantity:    tradeQty,
+      price:       tradePrice,
+      total_value: tradeTurnover,
+      charges:     tradeCharges,
+      net_value:   tradeNet,
     })
 
-    // ── Update wallet balance ────────────────────────────────────────────────
-    const newBalance = side === "BUY" ? balance - net : balance + net
+    // ── Update wallet balance using FRESH balance ─────────────────────────────
+    const newBalance = side === "BUY" ? freshBalance - tradeNet : freshBalance + tradeNet
     const { error: walletErr } = await supabase
       .from("wallets")
       .update({ balance: newBalance })
@@ -836,8 +886,8 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
 
     setSuccess(
       inst === "OPTIONS"
-        ? `✅ ${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${price} premium | Charges ₹${charges.toFixed(2)}`
-        : `✅ ${side} ${actualQty} ${symbol} @ ₹${price} | Charges ₹${charges.toFixed(2)}`
+        ? `✅ ${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${tradePrice} premium | Charges ₹${tradeCharges.toFixed(2)}`
+        : `✅ ${side} ${tradeQty} ${symbol} @ ₹${tradePrice} | Total ₹${fmt(tradeTurnover)} | Charges ₹${tradeCharges.toFixed(2)}`
     )
     setLoading(false)
     onDone()
@@ -1063,9 +1113,7 @@ function TradingDashboard({ userId }: { userId: string }) {
 
   async function closePos(pos: any) {
     setClosing(pos.id)
-    // Use the stored current_price (or entry_price fallback) — no live fetch for speed
-    const lp = pos.current_price ?? pos.entry_price ?? pos.avg_price
-
+    const lp  = pos.current_price ?? pos.entry_price ?? pos.avg_price
     const pnl = (lp - (pos.entry_price ?? pos.avg_price)) * pos.quantity * (pos.trade_type === "BUY" ? 1 : -1)
 
     await supabase.from("positions").update({
@@ -1073,11 +1121,16 @@ function TradingDashboard({ userId }: { userId: string }) {
     }).eq("id", pos.id)
 
     const closeVal = lp * pos.quantity
-    const ch       = calcCharges(lp, pos.quantity, pos.instrument, pos.trade_type === "BUY" ? "SELL" : "BUY")
-    const ret      = pos.trade_type === "BUY" ? closeVal - ch : closeVal + ch
+    const ch  = calcCharges(lp, pos.quantity, pos.instrument, pos.trade_type === "BUY" ? "SELL" : "BUY")
+    const ret = pos.trade_type === "BUY" ? closeVal - ch : closeVal + ch
+
+    // Fetch fresh balance before crediting
+    const { data: walletData } = await supabase
+      .from("wallets").select("balance").eq("user_id", userId).single()
+    const freshBal = walletData?.balance ?? balance
 
     await supabase.from("wallets")
-      .update({ balance: balance + ret })
+      .update({ balance: freshBal + ret })
       .eq("user_id", userId)
 
     await supabase.from("trade_history").insert({
