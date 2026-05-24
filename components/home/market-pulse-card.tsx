@@ -95,52 +95,81 @@ export function MarketPulseCard() {
   }, [])
 
   const fetchAll = useCallback(async () => {
-    setLoading(true)
+    // Only show loading spinner if we have no data at all
+    if (stocks.length === 0) setLoading(true)
     setError(false)
-    try {
-      const symbols = NIFTY50.map(s => `${s}.NS`).join(",")
-      const url = `https://api.allorigins.win/get?url=${encodeURIComponent(
-        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketVolume,regularMarketDayHigh,regularMarketDayLow`
-      )}`
 
-      const res  = await fetch(url, { signal: AbortSignal.timeout(10000) })
-      const data = await res.json()
-      const parsed = JSON.parse(data.contents)
-      const quotes = parsed?.quoteResponse?.result ?? []
+    const symbols = NIFTY50.map(s => `${s}.NS`).join(",")
+    const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketVolume,regularMarketDayHigh,regularMarketDayLow`
 
-      if (quotes.length === 0) throw new Error("No data")
+    // Multiple CORS proxies — tried in order until one works
+    const proxies = [
+      (u: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
+      (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+      (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+      (u: string) => `https://thingproxy.freeboard.io/fetch/${u}`,
+    ]
 
-      const result: Stock[] = quotes
-        .map((q: any) => {
-          const sym = (q.symbol as string).replace(".NS", "")
-          return {
-            symbol:    sym,
-            name:      NAMES[sym] ?? sym,
-            price:     q.regularMarketPrice        ?? 0,
-            change:    q.regularMarketChange       ?? 0,
-            changePct: q.regularMarketChangePercent ?? 0,
-            volume:    q.regularMarketVolume       ?? 0,
-            high:      q.regularMarketDayHigh      ?? 0,
-            low:       q.regularMarketDayLow       ?? 0,
-          } as Stock
-        })
-        .filter((s: Stock) => s.price > 0)
+    let quotes: any[] = []
 
-      if (result.length === 0) throw new Error("Empty result")
+    for (const makeUrl of proxies) {
+      try {
+        const res = await fetch(makeUrl(yahooUrl), { signal: AbortSignal.timeout(8000) })
+        if (!res.ok) continue
+        const text = await res.text()
 
-      setStocks(result)
-      setUpdatedAt(new Date())
-      setCacheDate(null)   // fresh data — hide cache badge
-      saveCache(result)    // persist so holidays show last data
-      setError(false)
-    } catch {
-      // Don't wipe existing data — show stale cache with a warning instead
+        // allorigins wraps in { contents: "..." }, others return raw JSON
+        let json: any
+        try {
+          const outer = JSON.parse(text)
+          json = typeof outer.contents === "string" ? JSON.parse(outer.contents) : outer
+        } catch {
+          continue
+        }
+
+        const result = json?.quoteResponse?.result ?? []
+        if (result.length > 0) { quotes = result; break }
+      } catch {
+        // try next proxy
+      }
+    }
+
+    if (quotes.length === 0) {
       setError(true)
-    } finally {
       setLoading(false)
       setCountdown(300)
+      return
     }
-  }, [])
+
+    const result: Stock[] = quotes
+      .map((q: any) => {
+        const sym = (q.symbol as string).replace(".NS", "")
+        return {
+          symbol:    sym,
+          name:      NAMES[sym] ?? sym,
+          price:     q.regularMarketPrice         ?? 0,
+          change:    q.regularMarketChange        ?? 0,
+          changePct: q.regularMarketChangePercent ?? 0,
+          volume:    q.regularMarketVolume        ?? 0,
+          high:      q.regularMarketDayHigh       ?? 0,
+          low:       q.regularMarketDayLow        ?? 0,
+        } as Stock
+      })
+      .filter((s: Stock) => s.price > 0)
+
+    if (result.length === 0) {
+      setError(true)
+    } else {
+      setStocks(result)
+      setUpdatedAt(new Date())
+      setCacheDate(null)
+      saveCache(result)
+      setError(false)
+    }
+
+    setLoading(false)
+    setCountdown(300)
+  }, [stocks.length])
 
   useEffect(() => { fetchAll() }, [fetchAll])
 
@@ -230,7 +259,7 @@ export function MarketPulseCard() {
         {/* Loading skeleton */}
         {loading && stocks.length === 0 && (
           <div className="space-y-2 py-1">
-            <p className="text-[11px] text-muted-foreground text-center py-1">Fetching Nifty 50…</p>
+            <p className="text-[11px] text-muted-foreground text-center py-1">Fetching Nifty 50 data…</p>
             {[...Array(5)].map((_, i) => (
               <div key={i} className="flex items-center gap-3 py-2 animate-pulse">
                 <div className="w-4 h-3 bg-muted rounded" />
@@ -251,8 +280,11 @@ export function MarketPulseCard() {
         {error && stocks.length === 0 && (
           <div className="text-center py-8 space-y-2">
             <WifiOff className="w-8 h-8 text-muted-foreground mx-auto" />
-            <p className="text-sm text-muted-foreground">Couldn't load market data</p>
-            <button onClick={fetchAll} className="text-xs text-primary hover:underline font-medium">Try again</button>
+            <p className="text-sm text-muted-foreground font-medium">All data sources unavailable</p>
+            <p className="text-[11px] text-muted-foreground max-w-[200px] mx-auto">
+              This usually happens on market holidays. Data will appear once you've visited on a trading day.
+            </p>
+            <button onClick={fetchAll} className="text-xs text-primary hover:underline font-medium">Retry</button>
           </div>
         )}
 
