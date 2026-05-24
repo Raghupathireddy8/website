@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect, useCallback } from "react"
-import { TrendingUp, TrendingDown, BarChart2, RefreshCw, Wifi, WifiOff } from "lucide-react"
+import { TrendingUp, TrendingDown, BarChart2, RefreshCw, WifiOff } from "lucide-react"
 
 // ── All 50 Nifty 50 symbols ──────────────────────────────────────────────────
 const NIFTY50 = [
@@ -44,6 +44,23 @@ interface Stock {
 
 type Tab = "gainers" | "losers" | "volume"
 
+const CACHE_KEY = "marketgreeks_pulse_v1"
+
+const saveCache = (data: Stock[]) => {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ data, savedAt: new Date().toISOString() }))
+  } catch {}
+}
+
+const loadCache = (): { data: Stock[]; savedAt: Date } | null => {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return { data: parsed.data, savedAt: new Date(parsed.savedAt) }
+  } catch { return null }
+}
+
 const isMarketOpen = () => {
   const ist = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }))
   const day = ist.getDay()
@@ -64,14 +81,23 @@ export function MarketPulseCard() {
   const [loading,     setLoading]     = useState(true)
   const [error,       setError]       = useState(false)
   const [updatedAt,   setUpdatedAt]   = useState<Date | null>(null)
+  const [cacheDate,   setCacheDate]   = useState<Date | null>(null)  // when cached data is from
   const [countdown,   setCountdown]   = useState(300)
 
-  // ── Single-request fetch: all symbols at once via Yahoo v7/quote ─────────
+  // Load from cache immediately on mount so something shows while fetching
+  useEffect(() => {
+    const cached = loadCache()
+    if (cached && cached.data.length > 0) {
+      setStocks(cached.data)
+      setCacheDate(cached.savedAt)
+      setLoading(false)
+    }
+  }, [])
+
   const fetchAll = useCallback(async () => {
     setLoading(true)
     setError(false)
     try {
-      // Yahoo Finance v7 accepts comma-separated symbols — one round trip for all 50
       const symbols = NIFTY50.map(s => `${s}.NS`).join(",")
       const url = `https://api.allorigins.win/get?url=${encodeURIComponent(
         `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketVolume,regularMarketDayHigh,regularMarketDayLow`
@@ -90,21 +116,25 @@ export function MarketPulseCard() {
           return {
             symbol:    sym,
             name:      NAMES[sym] ?? sym,
-            price:     q.regularMarketPrice       ?? 0,
-            change:    q.regularMarketChange      ?? 0,
+            price:     q.regularMarketPrice        ?? 0,
+            change:    q.regularMarketChange       ?? 0,
             changePct: q.regularMarketChangePercent ?? 0,
-            volume:    q.regularMarketVolume      ?? 0,
-            high:      q.regularMarketDayHigh     ?? 0,
-            low:       q.regularMarketDayLow      ?? 0,
+            volume:    q.regularMarketVolume       ?? 0,
+            high:      q.regularMarketDayHigh      ?? 0,
+            low:       q.regularMarketDayLow       ?? 0,
           } as Stock
         })
         .filter((s: Stock) => s.price > 0)
 
+      if (result.length === 0) throw new Error("Empty result")
+
       setStocks(result)
       setUpdatedAt(new Date())
+      setCacheDate(null)   // fresh data — hide cache badge
+      saveCache(result)    // persist so holidays show last data
       setError(false)
     } catch {
-      // On error keep last data if available, just flag it
+      // Don't wipe existing data — show stale cache with a warning instead
       setError(true)
     } finally {
       setLoading(false)
@@ -217,7 +247,7 @@ export function MarketPulseCard() {
           </div>
         )}
 
-        {/* Error with no data */}
+        {/* Error with no data at all */}
         {error && stocks.length === 0 && (
           <div className="text-center py-8 space-y-2">
             <WifiOff className="w-8 h-8 text-muted-foreground mx-auto" />
@@ -226,12 +256,21 @@ export function MarketPulseCard() {
           </div>
         )}
 
-        {/* Stale data warning */}
-        {error && stocks.length > 0 && (
-          <p className="text-[10px] text-warning flex items-center gap-1 mb-2 px-1">
-            <Wifi className="w-3 h-3" />
-            Live feed unavailable — showing last snapshot
-          </p>
+        {/* Stale/cached data banner */}
+        {(error || cacheDate) && stocks.length > 0 && (
+          <div className="flex items-center gap-1.5 text-[10px] text-warning bg-warning/10 border border-warning/20 rounded-lg px-3 py-1.5 mb-2">
+            <WifiOff className="w-3 h-3 flex-shrink-0" />
+            <span>
+              {error ? "Live feed unavailable. " : ""}
+              Showing data from{" "}
+              <strong>
+                {(cacheDate ?? updatedAt)?.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}
+                {" "}
+                {(cacheDate ?? updatedAt)?.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
+              </strong>
+              {" "}— last trading session
+            </span>
+          </div>
         )}
 
         {/* Stock rows */}
@@ -312,7 +351,11 @@ export function MarketPulseCard() {
         <div className="flex items-center justify-between px-4 py-2 border-t border-border bg-muted/20">
           <span className="text-[10px] text-muted-foreground">
             Nifty 50 · {stocks.length} stocks
-            {updatedAt && ` · ${updatedAt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}`}
+            {cacheDate
+              ? <span className="text-warning ml-1">· cached</span>
+              : updatedAt
+              ? ` · ${updatedAt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}`
+              : ""}
           </span>
           <span className="text-[10px] text-muted-foreground">
             {isMarketOpen()
