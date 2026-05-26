@@ -22,22 +22,17 @@ export default function ContactPage() {
   }
 
 const handleSubmit = async (e: React.MouseEvent<HTMLButtonElement>) => {
-  e.preventDefault()
-  if (!formData.name || !formData.email || !formData.message) return
-  setStatus("sending")
-
-  try {
-    const res = await fetch('/api/contact', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(formData),
-    })
-    if (res.ok) setStatus("sent")
-    else setStatus("error")
-  } catch {
-    setStatus("error")
+    e.preventDefault()
+    if (!formData.name || !formData.email || !formData.message) return
+    setStatus("sending")
+    try {
+      const mailtoLink = `mailto:support@marketgreeks.com?subject=...`
+      window.location.href = mailtoLink
+      setStatus("sent")
+    } catch {
+      setStatus("error")
+    }
   }
-}
 
   const isFormValid = formData.name && formData.email && formData.message
 
