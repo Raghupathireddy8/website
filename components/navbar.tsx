@@ -15,7 +15,7 @@ const navLinks = [
   { href: "/tax-calc", label: "Tax Calc" },
   { href: "/savings", label: "Savings" },
   { label: "About", href: "/about" },
-  { label: "contact", href: "/contact" }
+  { label: "Contact", href: "/contact" }
 ]
 
 export function Navbar() {
