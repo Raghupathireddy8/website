@@ -8,6 +8,9 @@
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS realized_pnl   NUMERIC;
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS executed_at    TIMESTAMPTZ DEFAULT NOW();
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS created_at     TIMESTAMPTZ DEFAULT NOW();
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS expiry         DATE;
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS strike_price   NUMERIC;
+//   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS option_type    TEXT;
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1002,6 +1005,9 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
       charges:        tradeCharges,
       net_value:      tradeNet,
       margin_blocked: marginBlocked,
+      expiry:         expiry || null,
+      strike_price:   inst === "OPTIONS" ? strike : null,
+      option_type:    inst === "OPTIONS" ? optType : null,
       executed_at:    now,
       created_at:     now,
     })
@@ -1319,7 +1325,7 @@ function TradingDashboard({ userId }: { userId: string }) {
     const [w, p, h, pr] = await Promise.all([
       supabase.from("wallets").select("balance").eq("user_id", userId).single(),
       supabase.from("positions").select("*").eq("user_id", userId).eq("status", "OPEN").order("opened_at", { ascending: false }),
-    supabase.from("trade_history").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(100),
+    supabase.from("trade_history").select("*").eq("user_id", userId).order("executed_at", { ascending: false }).limit(200),
       supabase.from("profiles").select("full_name,mobile").eq("id", userId).single(),
     ])
     if (w.data)  setBalance(w.data.balance)
@@ -1339,9 +1345,12 @@ function TradingDashboard({ userId }: { userId: string }) {
     if (Object.keys(prices).length > 0) {
       setLivePrices(prev => ({ ...prev, ...prices }))
       setPriceTs(new Date())
-      // Persist current_price to DB silently so close uses latest price
+      // Persist current_price to DB silently so close uses latest price.
+      // IMPORTANT: Skip OPTIONS — Yahoo returns spot price, not option premium.
+      // OPTIONS current_price must stay as the last known premium (set at trade entry or manual update).
       await Promise.all(
         pos.map((p: any) => {
+          if (p.instrument === "OPTIONS") return Promise.resolve()  // never overwrite premium with spot
           const lp = prices[`${p.symbol}__${p.instrument}`]
           if (lp) return supabase.from("positions").update({ current_price: lp }).eq("id", p.id)
           return Promise.resolve()
@@ -1454,6 +1463,9 @@ function TradingDashboard({ userId }: { userId: string }) {
       charges:      0,
       net_value:    walletCredit,
       realized_pnl: realizedPnl,
+      expiry:       pos.expiry || null,
+      strike_price: pos.strike_price || null,
+      option_type:  pos.option_type || null,
       executed_at:  exitNow,
       created_at:   exitNow,
     })
@@ -1462,22 +1474,30 @@ function TradingDashboard({ userId }: { userId: string }) {
     load()
   }
 
-  // ── Expiry worthless check: close options at 0 on expiry ───────────────────
+  // ── Expiry settlement: options expire worthless (price=0); futures settle at live price ─────
   async function checkExpiry() {
-    const today = new Date(); today.setHours(0,0,0,0)
-    const expired = positions.filter(p =>
-      p.instrument === "OPTIONS" &&
+    const today = new Date(); today.setHours(23, 59, 59, 999)
+    const expired = positionsRef.current.filter(p =>
+      (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
       p.expiry &&
       new Date(p.expiry) <= today
     )
     for (const pos of expired) {
-      await closePos(pos, 0)
+      if (pos.instrument === "OPTIONS") {
+        // Options expire worthless if not squared off
+        await closePos(pos, 0)
+      } else {
+        // Futures settle at last live price (or stored current_price)
+        const liveKey = `${pos.symbol}__${pos.instrument}`
+        const settlementPrice = livePrices[liveKey] ?? pos.current_price ?? pos.avg_price ?? pos.entry_price
+        await closePos(pos, settlementPrice)
+      }
     }
   }
 
   // ── Auto square-off: close sell positions if loss >= margin ────────────────
   async function checkSquareOff() {
-    const sellPos = positions.filter(p =>
+    const sellPos = positionsRef.current.filter(p =>
       (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
       p.trade_type === "SELL" &&
       p.margin_blocked > 0
@@ -1562,7 +1582,13 @@ function TradingDashboard({ userId }: { userId: string }) {
             {([["positions","Positions",BarChart2],["history","History",History]] as const).map(([key, label, Icon]) => (
               <button key={key} onClick={() => setTab(key as any)}
                 className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2 rounded-lg transition-colors ${tab === key ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
-                <Icon className="w-3.5 h-3.5" />{label}
+                <Icon className="w-3.5 h-3.5" />
+                {label}
+                {key === "history" && history.length > 0 && (
+                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${tab === key ? "bg-primary-foreground/20 text-primary-foreground" : "bg-primary/10 text-primary"}`}>
+                    {history.length}
+                  </span>
+                )}
               </button>
             ))}
             <button onClick={() => { load(); refreshLivePrices() }} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors" title="Refresh">
@@ -1725,7 +1751,15 @@ function TradingDashboard({ userId }: { userId: string }) {
                           </td>
                           <td className="px-4 py-2.5">
                             <div className="font-bold text-foreground">{t.symbol}</div>
-                            {t.instrument !== "EQUITY" && (
+                            {t.instrument === "OPTIONS" && t.strike_price && (
+                              <div className="text-[9px] text-muted-foreground">
+                                {t.strike_price}{t.option_type} · {t.expiry ? formatExpiry(t.expiry) : ""}
+                              </div>
+                            )}
+                            {t.instrument === "FUTURES" && t.expiry && (
+                              <div className="text-[9px] text-muted-foreground">Fut · {formatExpiry(t.expiry)}</div>
+                            )}
+                            {t.instrument !== "EQUITY" && !t.strike_price && !t.expiry && (
                               <div className="text-[9px] text-muted-foreground">{t.instrument}</div>
                             )}
                           </td>
