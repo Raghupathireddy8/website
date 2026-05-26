@@ -994,23 +994,25 @@ function TradeForm({ userId, balance, onDone }: { userId: string; balance: numbe
 
     // ── Insert trade history ──────────────────────────────────────────────────
     const now = new Date().toISOString()
-    await supabase.from("trade_history").insert({
-      user_id:        userId,
+    const openHistRow: Record<string, any> = {
+      user_id:    userId,
       symbol,
-      instrument:     inst,
-      trade_type:     side,
-      quantity:       tradeQty,
-      price:          tradePrice,
-      total_value:    tradeTurnover,
-      charges:        tradeCharges,
-      net_value:      tradeNet,
-      margin_blocked: marginBlocked,
-      expiry:         expiry || null,
-      strike_price:   inst === "OPTIONS" ? strike : null,
-      option_type:    inst === "OPTIONS" ? optType : null,
-      executed_at:    now,
-      created_at:     now,
-    })
+      instrument: inst,
+      trade_type: side,
+      quantity:   tradeQty,
+      price:      tradePrice,
+      total_value: tradeTurnover,
+      charges:    tradeCharges,
+      net_value:  tradeNet,
+    }
+    try { openHistRow.margin_blocked = marginBlocked                    } catch {}
+    try { openHistRow.expiry         = expiry || null                   } catch {}
+    try { openHistRow.strike_price   = inst === "OPTIONS" ? strike : null } catch {}
+    try { openHistRow.option_type    = inst === "OPTIONS" ? optType : null } catch {}
+    try { openHistRow.executed_at    = now                              } catch {}
+    try { openHistRow.created_at     = now                              } catch {}
+    const { error: openHistErr } = await supabase.from("trade_history").insert(openHistRow)
+    if (openHistErr) console.error("trade_history open insert failed:", openHistErr.message)
 
     // ── Update wallet ─────────────────────────────────────────────────────────
     const newBalance = freshBalance - walletDebit + walletCredit
@@ -1315,11 +1317,17 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [tab,        setTab]        = useState<"positions" | "history" | "ledger">("positions")
   const [loading,    setLoading]    = useState(true)
   const [closing,    setClosing]    = useState<string | null>(null)
+  // target exit prices: key = pos.id → target price (set by user per position)
+  const [targetPrices, setTargetPrices] = useState<Record<string, number>>({})
+  const [targetInputs, setTargetInputs] = useState<Record<string, string>>({})  // raw input strings
   // live prices: key = "SYMBOL__INSTRUMENT"
   const [livePrices, setLivePrices] = useState<Record<string, number>>({})
   const [priceTs,    setPriceTs]    = useState<Date | null>(null)   // last updated timestamp
   const [fetching,   setFetching]   = useState(false)
-  const positionsRef = useRef<any[]>([])
+  const positionsRef    = useRef<any[]>([])
+  const targetPricesRef = useRef<Record<string, number>>({})
+  // Keep ref in sync with state
+  useEffect(() => { targetPricesRef.current = targetPrices }, [targetPrices])
 
   const load = useCallback(async () => {
     const [w, p, h, pr] = await Promise.all([
@@ -1387,6 +1395,30 @@ function TradingDashboard({ userId }: { userId: string }) {
           return Promise.resolve()
         })
       )
+      // ── Check target prices: auto-exit when LTP crosses user-set target ──────
+      // Read targetPrices from ref so this callback has fresh data
+      const currentTargets = targetPricesRef.current
+      for (const p of pos) {
+        const target = currentTargets[p.id]
+        if (!target || target <= 0) continue
+        const liveKey = `${p.symbol}__${p.instrument}`
+        const ltp = allPrices[liveKey] ?? p.current_price
+        if (!ltp) continue
+        // BUY position: exit when LTP >= target (take profit) or LTP <= target (stop loss)
+        // We treat target as a single exit trigger regardless of direction
+        const entryP = p.avg_price ?? p.entry_price
+        const isProfit = p.trade_type === "BUY" ? target > entryP : target < entryP
+        const triggered = p.trade_type === "BUY"
+          ? ltp >= target   // BUY: exit when price reaches or exceeds target
+          : ltp <= target   // SELL: exit when price drops to target (take profit for short)
+        if (triggered) {
+          console.log(`Target hit for ${p.symbol} @ ₹${ltp} (target ₹${target}) — auto-exiting`)
+          // Remove target before closing to prevent double-trigger
+          setTargetPrices(prev => { const n = {...prev}; delete n[p.id]; return n })
+          setTargetInputs(prev => { const n = {...prev}; delete n[p.id]; return n })
+          await closePos(p, ltp)
+        }
+      }
     }
     setFetching(false)
   }, [])
@@ -1483,26 +1515,31 @@ function TradingDashboard({ userId }: { userId: string }) {
     await supabase.from("wallets").update({ balance: freshBal + walletCredit }).eq("user_id", userId)
 
     const exitNow = new Date().toISOString()
-    await supabase.from("trade_history").insert({
-      user_id:      userId,
-      symbol:       pos.symbol,
-      instrument:   pos.instrument,
-      trade_type:   pos.trade_type === "BUY" ? "SELL" : "BUY",
-      quantity:     qty,
-      price:        lp,
-      total_value:  exitValue,
-      charges:      0,
-      net_value:    walletCredit,
-      realized_pnl: realizedPnl,
-      expiry:       pos.expiry || null,
-      strike_price: pos.strike_price || null,
-      option_type:  pos.option_type || null,
-      executed_at:  exitNow,
-      created_at:   exitNow,
-    })
+    // Build insert — always include core columns; add optional ones so older DBs don't break
+    const histRow: Record<string, any> = {
+      user_id:     userId,
+      symbol:      pos.symbol,
+      instrument:  pos.instrument,
+      trade_type:  pos.trade_type === "BUY" ? "SELL" : "BUY",
+      quantity:    qty,
+      price:       lp,
+      total_value: exitValue,
+      charges:     0,
+      net_value:   walletCredit,
+    }
+    // Optional columns — added by migration; safe to include; Supabase ignores unknown cols
+    try { histRow.realized_pnl  = realizedPnl  } catch {}
+    try { histRow.margin_blocked = pos.margin_blocked ?? 0 } catch {}
+    try { histRow.expiry        = pos.expiry || null       } catch {}
+    try { histRow.strike_price  = pos.strike_price || null } catch {}
+    try { histRow.option_type   = pos.option_type || null  } catch {}
+    try { histRow.executed_at   = exitNow                  } catch {}
+    try { histRow.created_at    = exitNow                  } catch {}
+    const { error: histErr } = await supabase.from("trade_history").insert(histRow)
+    if (histErr) console.error("trade_history insert failed:", histErr.message, histErr.details)
 
     setClosing(null)
-    load()
+    await load()  // await so state is fresh before UI re-renders
   }
 
   // ── Expiry settlement: options expire worthless (price=0); futures settle at live price ─────
@@ -1641,10 +1678,20 @@ function TradingDashboard({ userId }: { userId: string }) {
               </div>
             ) : (
               <div className="bg-card border border-border rounded-xl overflow-hidden">
+                {positions.some(p => p.instrument === "OPTIONS") && (
+                  <div className="flex items-start gap-2 px-4 py-2.5 bg-warning/5 border-b border-warning/20 text-[10px] text-warning/90">
+                    <span className="mt-0.5">⚠️</span>
+                    <span>
+                      <strong>Options LTP is a Black-Scholes theoretical estimate</strong> — computed from live underlying spot price + 18% IV.
+                      Actual market premium may differ due to real IV, bid-ask spread, and liquidity.
+                      Target exit for options is also checked against the BS-calculated LTP.
+                    </span>
+                  </div>
+                )}
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
                     <thead><tr className="bg-muted">
-                      {["Symbol","Type","B/S","Qty","Entry Avg","LTP","P&L","Action"].map(h => (
+                      {["Symbol","Type","B/S","Qty","Entry Avg","LTP","P&L","Target Exit","Action"].map(h => (
                         <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
                       ))}
                     </tr></thead>
@@ -1705,7 +1752,10 @@ function TradingDashboard({ userId }: { userId: string }) {
                               <div className={`font-mono font-semibold ${hasLive ? "text-foreground" : "text-muted-foreground"}`}>
                                 ₹{fmtN(ltp)}
                               </div>
-                              {!hasLive && <div className="text-[9px] text-muted-foreground">last known</div>}
+                              {pos.instrument === "OPTIONS"
+                                ? <div className="text-[9px] text-warning/80 font-medium">~BS estimate</div>
+                                : !hasLive && <div className="text-[9px] text-muted-foreground">last known</div>
+                              }
                             </td>
                             <td className="px-4 py-3">
                               <div className={`font-mono font-bold ${isProfit ? "text-success" : "text-destructive"}`}>
@@ -1714,6 +1764,47 @@ function TradingDashboard({ userId }: { userId: string }) {
                               <div className={`text-[10px] ${isProfit ? "text-success" : "text-destructive"}`}>
                                 {isProfit ? "▲" : "▼"}{Math.abs(pnlPct).toFixed(2)}%
                               </div>
+                            </td>
+                            {/* Target Exit cell */}
+                            <td className="px-4 py-3">
+                              <div className="flex items-center gap-1">
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="0.5"
+                                  placeholder="₹ target"
+                                  value={targetInputs[pos.id] ?? ""}
+                                  onChange={e => setTargetInputs(prev => ({ ...prev, [pos.id]: e.target.value }))}
+                                  className="w-20 text-xs font-mono border border-border rounded-md px-2 py-1 bg-background text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const v = parseFloat(targetInputs[pos.id] ?? "")
+                                    if (v > 0) {
+                                      setTargetPrices(prev => ({ ...prev, [pos.id]: v }))
+                                    } else {
+                                      setTargetPrices(prev => { const n = {...prev}; delete n[pos.id]; return n })
+                                    }
+                                  }}
+                                  className="text-[10px] font-semibold px-2 py-1 rounded-md bg-primary/10 text-primary hover:bg-primary/20 transition-colors whitespace-nowrap"
+                                >
+                                  Set
+                                </button>
+                              </div>
+                              {targetPrices[pos.id] && (
+                                <div className="text-[9px] mt-0.5 text-primary font-semibold flex items-center gap-1">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse inline-block" />
+                                  Active: ₹{fmtN(targetPrices[pos.id])}
+                                  <button onClick={() => {
+                                    setTargetPrices(prev => { const n = {...prev}; delete n[pos.id]; return n })
+                                    setTargetInputs(prev => { const n = {...prev}; delete n[pos.id]; return n })
+                                  }} className="text-muted-foreground hover:text-destructive ml-1">✕</button>
+                                </div>
+                              )}
+                              {pos.instrument === "OPTIONS" && targetPrices[pos.id] && (
+                                <div className="text-[8px] text-muted-foreground">checked on BS refresh</div>
+                              )}
                             </td>
                             <td className="px-4 py-3">
                               <button
