@@ -14,7 +14,8 @@ const navLinks = [
   { href: "/virtual-trade", label: "Virtual Trade" },
   { href: "/tax-calc", label: "Tax Calc" },
   { href: "/savings", label: "Savings" },
-  { label: "About", href: "/about" }
+  { label: "About", href: "/about" },
+  { label: "contact", href: "/contact" }
 ]
 
 export function Navbar() {
