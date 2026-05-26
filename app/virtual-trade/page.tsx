@@ -24,7 +24,7 @@ import { Footer } from "@/components/footer"
 import {
   Eye, EyeOff, Phone, Lock, User, ArrowRight, Mail,
   TrendingUp, TrendingDown, RefreshCw, LogOut,
-  X, History, BarChart2, ChevronDown, Wallet, KeyRound,
+  X, History, BarChart2, ChevronDown, Wallet, KeyRound, BookOpen,
 } from "lucide-react"
 
 // ─── NSE F&O Lot Sizes — effective 2025-26 ───────────────────────────────────
@@ -1312,7 +1312,7 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [positions,  setPositions]  = useState<any[]>([])
   const [history,    setHistory]    = useState<any[]>([])
   const [profile,    setProfile]    = useState<{ full_name: string; mobile: string } | null>(null)
-  const [tab,        setTab]        = useState<"positions" | "history">("positions")
+  const [tab,        setTab]        = useState<"positions" | "history" | "ledger">("positions")
   const [loading,    setLoading]    = useState(true)
   const [closing,    setClosing]    = useState<string | null>(null)
   // live prices: key = "SYMBOL__INSTRUMENT"
@@ -1325,7 +1325,11 @@ function TradingDashboard({ userId }: { userId: string }) {
     const [w, p, h, pr] = await Promise.all([
       supabase.from("wallets").select("balance").eq("user_id", userId).single(),
       supabase.from("positions").select("*").eq("user_id", userId).eq("status", "OPEN").order("opened_at", { ascending: false }),
-    supabase.from("trade_history").select("*").eq("user_id", userId).order("executed_at", { ascending: false }).limit(200),
+    supabase.from("trade_history")
+      .select("id,symbol,instrument,trade_type,quantity,price,total_value,charges,net_value,realized_pnl,margin_blocked,expiry,strike_price,option_type,executed_at,created_at")
+      .eq("user_id", userId)
+      .order("id", { ascending: false })
+      .limit(500),
       supabase.from("profiles").select("full_name,mobile").eq("id", userId).single(),
     ])
     if (w.data)  setBalance(w.data.balance)
@@ -1336,22 +1340,49 @@ function TradingDashboard({ userId }: { userId: string }) {
   }, [userId])
 
   // ── Fetch live prices for all open positions ────────────────────────────────
+  // For OPTIONS: Yahoo returns spot price, not option premium.
+  // We fetch the underlying EQUITY spot, then recompute Black-Scholes premium live.
   const refreshLivePrices = useCallback(async () => {
     const pos = positionsRef.current
     if (pos.length === 0) return
     setFetching(true)
-    const items = pos.map((p: any) => ({ symbol: p.symbol, instrument: p.instrument as InstrumentType }))
-    const prices = await fetchLivePrices(items)
-    if (Object.keys(prices).length > 0) {
-      setLivePrices(prev => ({ ...prev, ...prices }))
+
+    // Fetch underlying spot prices (EQUITY key) for all symbols
+    const spotItems: { symbol: string; instrument: InstrumentType }[] = []
+    const seen = new Set<string>()
+    for (const p of pos) {
+      const eqKey = `${p.symbol}__EQUITY`
+      if (!seen.has(eqKey)) { seen.add(eqKey); spotItems.push({ symbol: p.symbol, instrument: "EQUITY" }) }
+      if (p.instrument === "FUTURES") {
+        const fKey = `${p.symbol}__FUTURES`
+        if (!seen.has(fKey)) { seen.add(fKey); spotItems.push({ symbol: p.symbol, instrument: "FUTURES" }) }
+      }
+    }
+
+    const spotPrices = await fetchLivePrices(spotItems)
+    const allPrices: Record<string, number> = { ...spotPrices }
+
+    // Recompute live BS premium for each OPTIONS position
+    for (const p of pos) {
+      if (p.instrument === "OPTIONS") {
+        const spot = spotPrices[`${p.symbol}__EQUITY`]
+        if (spot && spot > 0 && p.strike_price && p.expiry && p.option_type) {
+          const livePremium = calcOptionPremium(spot, p.strike_price, p.expiry, p.option_type as OptionType)
+          allPrices[`${p.symbol}__OPTIONS`] = livePremium
+          // Persist so closePos uses latest premium
+          await supabase.from("positions").update({ current_price: livePremium }).eq("id", p.id)
+        }
+      }
+    }
+
+    if (Object.keys(allPrices).length > 0) {
+      setLivePrices(prev => ({ ...prev, ...allPrices }))
       setPriceTs(new Date())
-      // Persist current_price to DB silently so close uses latest price.
-      // IMPORTANT: Skip OPTIONS — Yahoo returns spot price, not option premium.
-      // OPTIONS current_price must stay as the last known premium (set at trade entry or manual update).
+      // Persist EQUITY / FUTURES prices
       await Promise.all(
         pos.map((p: any) => {
-          if (p.instrument === "OPTIONS") return Promise.resolve()  // never overwrite premium with spot
-          const lp = prices[`${p.symbol}__${p.instrument}`]
+          if (p.instrument === "OPTIONS") return Promise.resolve()
+          const lp = allPrices[`${p.symbol}__${p.instrument}`]
           if (lp) return supabase.from("positions").update({ current_price: lp }).eq("id", p.id)
           return Promise.resolve()
         })
@@ -1389,11 +1420,11 @@ function TradingDashboard({ userId }: { userId: string }) {
     const liveKey = `${pos.symbol}__${pos.instrument}`
     // OPTIONS: Yahoo returns spot price, not option premium. Use stored current_price (last known premium).
     // EQUITY/FUTURES: use live Yahoo price.
+    // For OPTIONS, livePrices[key] now holds the live BS-recalculated premium.
+    // Falls back to stored current_price (which refreshLivePrices also keeps updated).
     const lp = forcePrice !== undefined
       ? forcePrice
-      : pos.instrument === "OPTIONS"
-        ? (pos.current_price ?? pos.avg_price ?? pos.entry_price)
-        : (livePrices[liveKey] ?? pos.current_price ?? pos.avg_price ?? pos.entry_price)
+      : (livePrices[liveKey] ?? pos.current_price ?? pos.avg_price ?? pos.entry_price)
     const entryP  = pos.avg_price ?? pos.entry_price
     const qty     = pos.quantity
     const margin  = pos.margin_blocked ?? 0
@@ -1579,7 +1610,7 @@ function TradingDashboard({ userId }: { userId: string }) {
         <TradeForm userId={userId} balance={balance} onDone={load} />
         <div>
           <div className="flex gap-1 bg-card border border-border p-1 rounded-xl mb-4 w-fit">
-            {([["positions","Positions",BarChart2],["history","History",History]] as const).map(([key, label, Icon]) => (
+            {([["positions","Positions",BarChart2],["history","History",History],["ledger","Ledger",BookOpen]] as const).map(([key, label, Icon]) => (
               <button key={key} onClick={() => setTab(key as any)}
                 className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2 rounded-lg transition-colors ${tab === key ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
                 <Icon className="w-3.5 h-3.5" />
@@ -1598,7 +1629,7 @@ function TradingDashboard({ userId }: { userId: string }) {
           {/* Live price status */}
           <div className="flex items-center gap-2 mb-3 text-[10px] text-muted-foreground">
             <span className={`w-1.5 h-1.5 rounded-full ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
-            {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · auto-refresh every 30s` : "Fetching prices…"}
+            {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · Options LTP = live Black-Scholes · auto-refresh every 30s` : "Fetching prices…"}
           </div>
 
           {tab === "positions" ? (
@@ -1623,12 +1654,10 @@ function TradingDashboard({ userId }: { userId: string }) {
                         const liveKey = `${pos.symbol}__${pos.instrument}`
                         // OPTIONS: Yahoo returns spot price, NOT option premium. Use stored current_price (premium).
                         // EQUITY/FUTURES: use live price from Yahoo.
-                        const ltp = pos.instrument === "OPTIONS"
-                          ? (pos.current_price ?? entryP)
-                          : (livePrices[liveKey] ?? pos.current_price ?? entryP)
-                        const hasLive = pos.instrument === "OPTIONS"
-                          ? true   // always show — it's the stored premium
-                          : !!livePrices[liveKey]
+                        // OPTIONS: livePrices[key] is now a live BS-recalculated premium (not spot).
+                        // Falls back to stored current_price (entry premium) if spot fetch failed.
+                        const ltp = livePrices[liveKey] ?? pos.current_price ?? entryP
+                        const hasLive = !!livePrices[liveKey]
                         // P&L: buyers profit when premium rises, sellers profit when premium falls
                         const pnl = pos.trade_type === "BUY"
                           ? (ltp - entryP) * pos.quantity
@@ -1706,11 +1735,12 @@ function TradingDashboard({ userId }: { userId: string }) {
                 </div>
               </div>
             )
-          ) : (
+          ) : tab === "history" ? (
             history.length === 0 ? (
               <div className="bg-card border border-border rounded-xl p-10 text-center">
                 <History className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
-                <p className="text-sm text-muted-foreground">No trade history yet</p>
+                <p className="text-sm text-muted-foreground font-semibold">No trade history yet</p>
+                <p className="text-xs text-muted-foreground mt-1">Your executed trades will appear here</p>
               </div>
             ) : (
               <div className="bg-card border border-border rounded-xl overflow-hidden">
@@ -1792,6 +1822,241 @@ function TradingDashboard({ userId }: { userId: string }) {
                 </div>
               </div>
             )
+          ) : (
+            /* ── LEDGER TAB ── */
+            (() => {
+              // Build ledger entries from trade history
+              // Each entry: date, description, debit, credit, running balance
+              const INITIAL_BALANCE = 1_000_000
+              // Sort ascending for running balance calc
+              const sorted = [...history].sort((a, b) =>
+                new Date(a.executed_at ?? a.created_at).getTime() - new Date(b.executed_at ?? b.created_at).getTime()
+              )
+
+              type LedgerEntry = {
+                id: string
+                date: Date
+                description: string
+                instrument: string
+                tradeType: string
+                debit: number
+                credit: number
+                runningBalance: number
+                pnl: number | null
+                tag: "open" | "close" | "expiry" | "sqoff"
+              }
+
+              let running = INITIAL_BALANCE
+              const entries: LedgerEntry[] = []
+
+              // Opening entry
+              entries.push({
+                id: "opening",
+                date: sorted.length > 0 ? new Date(sorted[0].executed_at ?? sorted[0].created_at) : new Date(),
+                description: "Virtual Wallet — Opening Balance",
+                instrument: "",
+                tradeType: "",
+                debit: 0,
+                credit: INITIAL_BALANCE,
+                runningBalance: INITIAL_BALANCE,
+                pnl: null,
+                tag: "open",
+              })
+
+              for (const t of sorted) {
+                const ts = new Date(t.executed_at ?? t.created_at)
+                const hasPnl = t.realized_pnl !== null && t.realized_pnl !== undefined
+                const sym = t.instrument === "OPTIONS" && t.strike_price
+                  ? `${t.symbol} ${t.strike_price}${t.option_type}${t.expiry ? " " + formatExpiry(t.expiry) : ""}`
+                  : t.instrument === "FUTURES" && t.expiry
+                  ? `${t.symbol} Fut ${formatExpiry(t.expiry)}`
+                  : t.symbol
+
+                // Determine debit / credit from net_value and margin_blocked
+                let debit = 0, credit = 0
+                const nv = t.net_value ?? 0
+                const mb = t.margin_blocked ?? 0
+
+                if (t.instrument === "EQUITY") {
+                  if (t.trade_type === "BUY") {
+                    debit = nv  // total cost
+                  } else {
+                    credit = nv  // proceeds
+                  }
+                } else if (t.instrument === "OPTIONS") {
+                  if (t.trade_type === "BUY" && !hasPnl) {
+                    // Opening buy — premium debited
+                    debit = nv
+                  } else if (t.trade_type === "SELL" && !hasPnl) {
+                    // Opening sell — margin blocked (debit)
+                    debit = mb > 0 ? mb : nv
+                  } else if (hasPnl) {
+                    // Closing / expiry
+                    credit = nv
+                  }
+                } else {
+                  // FUTURES
+                  if (!hasPnl) {
+                    // Opening — margin blocked
+                    debit = mb > 0 ? mb : nv
+                  } else {
+                    credit = nv
+                  }
+                }
+
+                running = running - debit + credit
+
+                const isExpiry = hasPnl && t.price === 0 && t.instrument === "OPTIONS"
+                const isSqOff  = hasPnl && t.realized_pnl !== null && (t.realized_pnl ?? 0) <= -(t.margin_blocked ?? 0) * 0.95 && (t.margin_blocked ?? 0) > 0
+
+                let desc = ""
+                if (hasPnl) {
+                  if (isExpiry) desc = `${sym} — Expired worthless`
+                  else desc = `${sym} — Position closed (${t.trade_type})`
+                } else if (t.instrument === "OPTIONS" && t.trade_type === "SELL") {
+                  desc = `${sym} — Sell (margin blocked)`
+                } else if ((t.instrument === "OPTIONS" || t.instrument === "FUTURES") && !hasPnl) {
+                  desc = `${sym} — ${t.trade_type} (margin blocked)`
+                } else {
+                  desc = `${sym} — ${t.trade_type}`
+                }
+
+                entries.push({
+                  id: t.id,
+                  date: ts,
+                  description: desc,
+                  instrument: t.instrument,
+                  tradeType: t.trade_type,
+                  debit,
+                  credit,
+                  runningBalance: running,
+                  pnl: hasPnl ? (t.realized_pnl ?? 0) : null,
+                  tag: isExpiry ? "expiry" : isSqOff ? "sqoff" : hasPnl ? "close" : "open",
+                })
+              }
+
+              // Summary stats
+              const totalDebits  = entries.slice(1).reduce((s, e) => s + e.debit, 0)
+              const totalCredits = entries.slice(1).reduce((s, e) => s + e.credit, 0)
+              const closedTrades = entries.filter(e => e.tag === "close" || e.tag === "expiry")
+              const totalRealizedPnl = history
+                .filter(t => t.realized_pnl !== null && t.realized_pnl !== undefined)
+                .reduce((s: number, t: any) => s + (t.realized_pnl ?? 0), 0)
+              const wins = history.filter(t => (t.realized_pnl ?? -1) > 0).length
+              const losses = history.filter(t => t.realized_pnl !== null && t.realized_pnl !== undefined && (t.realized_pnl ?? 0) < 0).length
+
+              return (
+                <div className="space-y-4">
+                  {/* Summary cards */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="bg-card border border-border rounded-xl p-3">
+                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Current Balance</p>
+                      <p className="font-mono text-base font-bold text-foreground">{fmt(balance)}</p>
+                      <p className={`text-[10px] font-semibold mt-0.5 ${balance >= INITIAL_BALANCE ? "text-success" : "text-destructive"}`}>
+                        {balance >= INITIAL_BALANCE ? "▲" : "▼"} {fmt(Math.abs(balance - INITIAL_BALANCE))} vs start
+                      </p>
+                    </div>
+                    <div className={`border rounded-xl p-3 ${totalRealizedPnl >= 0 ? "bg-success/5 border-success/20" : "bg-destructive/5 border-destructive/20"}`}>
+                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Realised P&L</p>
+                      <p className={`font-mono text-base font-bold ${totalRealizedPnl >= 0 ? "text-success" : "text-destructive"}`}>
+                        {totalRealizedPnl >= 0 ? "+" : ""}{fmt(totalRealizedPnl)}
+                      </p>
+                      <p className="text-[10px] text-muted-foreground mt-0.5">{closedTrades.length} closed trades</p>
+                    </div>
+                    <div className="bg-card border border-border rounded-xl p-3">
+                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Win / Loss</p>
+                      <p className="text-base font-bold text-foreground">
+                        <span className="text-success">{wins}W</span>
+                        <span className="text-muted-foreground mx-1">/</span>
+                        <span className="text-destructive">{losses}L</span>
+                      </p>
+                      <p className="text-[10px] text-muted-foreground mt-0.5">
+                        {wins + losses > 0 ? `${Math.round(wins / (wins + losses) * 100)}% win rate` : "No closed trades"}
+                      </p>
+                    </div>
+                    <div className="bg-card border border-border rounded-xl p-3">
+                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Total Charges</p>
+                      <p className="font-mono text-base font-bold text-warning">
+                        {fmt(history.reduce((s: number, t: any) => s + (t.charges ?? 0), 0))}
+                      </p>
+                      <p className="text-[10px] text-muted-foreground mt-0.5">Brokerage + STT</p>
+                    </div>
+                  </div>
+
+                  {/* Ledger table */}
+                  {entries.length <= 1 ? (
+                    <div className="bg-card border border-border rounded-xl p-10 text-center">
+                      <BookOpen className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
+                      <p className="text-sm text-muted-foreground font-semibold">No ledger entries yet</p>
+                      <p className="text-xs text-muted-foreground mt-1">Place a trade to see your ledger</p>
+                    </div>
+                  ) : (
+                    <div className="bg-card border border-border rounded-xl overflow-hidden">
+                      <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+                        <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
+                          <BookOpen className="w-4 h-4 text-primary" />
+                          Account Ledger
+                        </h3>
+                        <span className="text-[10px] text-muted-foreground">{entries.length} entries</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="bg-muted">
+                              {["Date","Description","Debit (−)","Credit (+)","P&L","Balance"].map(h => (
+                                <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[...entries].reverse().map((e, i) => (
+                              <tr key={e.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
+                                <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap">
+                                  {e.id === "opening" ? "—" : e.date.toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
+                                </td>
+                                <td className="px-4 py-2.5 max-w-[220px]">
+                                  <div className="font-semibold text-foreground truncate">{e.description}</div>
+                                  {e.instrument && (
+                                    <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${
+                                      e.instrument === "EQUITY"  ? "bg-primary/10 text-primary" :
+                                      e.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+                                      "bg-warning/10 text-warning"}`}>
+                                      {e.instrument}
+                                      {e.tag === "expiry" && " · EXPIRED"}
+                                      {e.tag === "sqoff"  && " · SQ-OFF"}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2.5 font-mono">
+                                  {e.debit > 0
+                                    ? <span className="text-destructive font-semibold">− {fmt(e.debit)}</span>
+                                    : <span className="text-muted-foreground">—</span>}
+                                </td>
+                                <td className="px-4 py-2.5 font-mono">
+                                  {e.credit > 0
+                                    ? <span className="text-success font-semibold">+ {fmt(e.credit)}</span>
+                                    : <span className="text-muted-foreground">—</span>}
+                                </td>
+                                <td className="px-4 py-2.5 font-mono font-semibold">
+                                  {e.pnl !== null ? (
+                                    <span className={e.pnl >= 0 ? "text-success" : "text-destructive"}>
+                                      {e.pnl >= 0 ? "+" : ""}₹{fmtN(Math.abs(e.pnl))}
+                                    </span>
+                                  ) : <span className="text-muted-foreground">—</span>}
+                                </td>
+                                <td className="px-4 py-2.5 font-mono font-bold text-foreground whitespace-nowrap">
+                                  {fmt(e.runningBalance)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            })()
           )}
         </div>
       </div>
