@@ -12,7 +12,7 @@ const navLinks = [
   { href: "/backtest", label: "Backtest" },
   { href: "/ipo", label: "IPO" },
   { href: "/virtual-trade", label: "Virtual Trade" },
-  { href: "/tax-calc", label: "Tax Calc" },
+  { href: "/tax-calc", label: "Financial Calculators" },
   { href: "/savings", label: "Savings" },
   { label: "About", href: "/about" },
   { label: "Contact", href: "/contact" }
