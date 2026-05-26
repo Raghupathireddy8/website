@@ -21,22 +21,23 @@ export default function ContactPage() {
     setFormData({ ...formData, [e.target.name]: e.target.value })
   }
 
-  const handleSubmit = (e: React.MouseEvent<HTMLButtonElement>) => {
-    e.preventDefault()
-    if (!formData.name || !formData.email || !formData.message) return
-    setStatus("sending")
-    try {
-      const mailtoLink = `mailto:support@marketgreeks.com?subject=${encodeURIComponent(
-        formData.subject || "Contact Form Inquiry"
-      )}&body=${encodeURIComponent(
-        `Name: ${formData.name}\nEmail: ${formData.email}\n\n${formData.message}`
-      )}`
-      window.location.href = mailtoLink
-      setStatus("sent")
-    } catch {
-      setStatus("error")
-    }
+const handleSubmit = async (e: React.MouseEvent<HTMLButtonElement>) => {
+  e.preventDefault()
+  if (!formData.name || !formData.email || !formData.message) return
+  setStatus("sending")
+
+  try {
+    const res = await fetch('/api/contact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(formData),
+    })
+    if (res.ok) setStatus("sent")
+    else setStatus("error")
+  } catch {
+    setStatus("error")
   }
+}
 
   const isFormValid = formData.name && formData.email && formData.message
 
