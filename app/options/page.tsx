@@ -1,7 +1,7 @@
 "use client";
 // MarketGreeks — Options Simulator
 // Next.js / React TSX — drop in as app/simulator/page.tsx or components/OptionsSimulator.tsx
-// External deps: chart.js (install: npm i chart.js)
+// No external chart deps — Chart.js loaded from CDN via script tag
 
 import React, {
   useCallback,
@@ -120,120 +120,144 @@ const fmtDisplay = (d: Date) => d.toLocaleDateString("en-IN", { day: "numeric", 
 // ─────────────────────────────────────────────
 interface ChartData { spots: number[]; payoffs: number[]; mtmPayoffs: number[]; bes: number[]; S: number; }
 
-function drawPayoffChart(
-  canvas: HTMLCanvasElement,
-  data: ChartData,
-  view: "expiry" | "mtm"
-): void {
-  // Dynamically import Chart.js to keep SSR-safe
-  import("chart.js/auto").then(({ default: Chart }) => {
-    // Destroy existing
-    const existing = (Chart as any).getChart(canvas);
-    if (existing) existing.destroy();
+// Grab Chart from window (loaded via CDN <script> tag in the effect below)
+declare global { interface Window { Chart: any } }
 
-    const { spots, payoffs, mtmPayoffs, bes, S } = data;
-    const active = view === "expiry" ? payoffs : mtmPayoffs;
+function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" | "mtm"): void {
+  const Chart = window.Chart;
+  if (!Chart) return;
 
-    const zero = { id: "zeroLine", afterDraw(chart: any) {
-      const { ctx, scales: { x, y } } = chart;
-      const yZero = y.getPixelForValue(0);
+  // Destroy any previous instance attached to this canvas
+  const existing = Chart.getChart(canvas);
+  if (existing) existing.destroy();
+
+  const { spots, payoffs, mtmPayoffs, bes, S } = data;
+  const active = view === "expiry" ? payoffs : mtmPayoffs;
+
+  const annotationPlugin = {
+    id: "mgAnnotations",
+    afterDraw(chart: any) {
+      const { ctx, scales: { x, y }, chartArea } = chart;
       ctx.save();
+
+      // Zero line
+      const yZero = y.getPixelForValue(0);
       ctx.beginPath();
-      ctx.strokeStyle = "rgba(255,255,255,0.12)";
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
-      ctx.moveTo(x.left, yZero);
-      ctx.lineTo(x.right, yZero);
+      ctx.moveTo(chartArea.left, yZero);
+      ctx.lineTo(chartArea.right, yZero);
       ctx.stroke();
-      // Spot line
-      const spotIdx = spots.reduce((bi, s, i) => Math.abs(s - S) < Math.abs(spots[bi] - S) ? i : bi, 0);
+
+      // Current spot vertical line
+      const spotIdx = spots.reduce((bi: number, s: number, i: number) =>
+        Math.abs(s - S) < Math.abs(spots[bi] - S) ? i : bi, 0);
       const xSpot = x.getPixelForValue(spotIdx);
       ctx.beginPath();
       ctx.strokeStyle = "#3b82f6";
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 2;
       ctx.setLineDash([6, 3]);
-      ctx.moveTo(xSpot, chart.chartArea.top);
-      ctx.lineTo(xSpot, chart.chartArea.bottom);
+      ctx.moveTo(xSpot, chartArea.top);
+      ctx.lineTo(xSpot, chartArea.bottom);
       ctx.stroke();
-      // Breakeven lines
-      bes.forEach(be => {
-        const beIdx = spots.reduce((bi, s, i) => Math.abs(s - be) < Math.abs(spots[bi] - be) ? i : bi, 0);
+
+      // Spot label
+      ctx.fillStyle = "#3b82f6";
+      ctx.font = "10px 'DM Sans', sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("SPOT", xSpot, chartArea.top + 10);
+
+      // Breakeven verticals
+      bes.forEach((be: number) => {
+        const beIdx = spots.reduce((bi: number, s: number, i: number) =>
+          Math.abs(s - be) < Math.abs(spots[bi] - be) ? i : bi, 0);
         const xBE = x.getPixelForValue(beIdx);
         ctx.beginPath();
         ctx.strokeStyle = "#f59e0b";
-        ctx.lineWidth = 1;
+        ctx.lineWidth = 1.5;
         ctx.setLineDash([3, 3]);
-        ctx.moveTo(xBE, chart.chartArea.top);
-        ctx.lineTo(xBE, chart.chartArea.bottom);
+        ctx.moveTo(xBE, chartArea.top);
+        ctx.lineTo(xBE, chartArea.bottom);
         ctx.stroke();
+        ctx.fillStyle = "#f59e0b";
+        ctx.font = "9px 'DM Sans', sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("BE", xBE, chartArea.top + 10);
       });
-      ctx.restore();
-    }};
 
-    new Chart(canvas, {
-      type: "line",
-      plugins: [zero],
-      data: {
-        labels: spots.map(s => s.toFixed(0)),
-        datasets: [
-          {
-            label: "P&L",
-            data: active,
-            segment: { borderColor: (ctx: any) => active[ctx.p0DataIndex] >= 0 ? "#22c55e" : "#ef4444" },
-            borderWidth: 3,
-            pointRadius: 0,
-            fill: {
-              target: { value: 0 },
-              above: "rgba(34,197,94,0.12)",
-              below: "rgba(239,68,68,0.12)",
-            } as any,
-            tension: 0.2,
+      ctx.restore();
+    },
+  };
+
+  new Chart(canvas, {
+    type: "line",
+    plugins: [annotationPlugin],
+    data: {
+      labels: spots.map((s: number) => s.toFixed(0)),
+      datasets: [
+        {
+          label: "P&L",
+          data: active,
+          segment: {
+            borderColor: (ctx: any) => active[ctx.p0DataIndex] >= 0 ? "#22c55e" : "#ef4444",
           },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: { duration: 250 },
-        plugins: {
-          legend: { display: false },
-          tooltip: {
-            backgroundColor: "#1a1e2a",
-            borderColor: "#1e2333",
-            borderWidth: 1,
-            titleColor: "#6b7494",
-            bodyColor: "#e2e6f0",
-            padding: 10,
-            callbacks: {
-              title: (c) => "Spot ₹" + parseFloat(c[0].label).toLocaleString("en-IN"),
-              label: (c) => {
-                const v = c.raw as number;
-                return `MTM P&L: ${v >= 0 ? "+" : ""}₹${Math.abs(v).toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
-              },
-            },
+          borderWidth: 3,
+          pointRadius: 0,
+          fill: {
+            target: { value: 0 },
+            above: "rgba(34,197,94,0.10)",
+            below: "rgba(239,68,68,0.10)",
           },
+          tension: 0.2,
         },
-        scales: {
-          x: {
-            grid: { color: "rgba(255,255,255,0.04)" },
-            ticks: {
-              color: "#3a4060",
-              font: { size: 10 },
-              maxTicksLimit: 10,
-              callback: (v, i) => i % 20 === 0 ? spots[i].toFixed(0) : null,
-            },
-          },
-          y: {
-            grid: { color: "rgba(255,255,255,0.05)" },
-            ticks: {
-              color: "#3a4060",
-              font: { size: 10 },
-              callback: (v: any) => "₹" + (Math.abs(v) >= 100000 ? (v / 100000).toFixed(1) + "L" : Math.abs(v) >= 1000 ? (v / 1000).toFixed(0) + "K" : v.toFixed(0)),
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 200 },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: "#1a1e2a",
+          borderColor: "#1e2333",
+          borderWidth: 1,
+          titleColor: "#6b7494",
+          bodyColor: "#e2e6f0",
+          padding: 10,
+          callbacks: {
+            title: (c: any) => "Spot ₹" + parseFloat(c[0].label).toLocaleString("en-IN"),
+            label: (c: any) => {
+              const v = c.raw as number;
+              return `MTM P&L: ${v >= 0 ? "+" : ""}₹${Math.abs(v).toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
             },
           },
         },
       },
-    });
+      scales: {
+        x: {
+          grid: { color: "rgba(255,255,255,0.04)" },
+          ticks: {
+            color: "#3a4060",
+            font: { size: 10 },
+            maxTicksLimit: 10,
+            callback: (_v: any, i: number) => i % 20 === 0 ? spots[i]?.toFixed(0) ?? null : null,
+          },
+        },
+        y: {
+          grid: { color: "rgba(255,255,255,0.05)" },
+          ticks: {
+            color: "#3a4060",
+            font: { size: 10 },
+            callback: (v: any) => {
+              const abs = Math.abs(v);
+              return "₹" + (abs >= 100000 ? (v / 100000).toFixed(1) + "L" : abs >= 1000 ? (v / 1000).toFixed(0) + "K" : v.toFixed(0));
+            },
+          },
+        },
+      },
+    },
   });
 }
 
@@ -475,18 +499,30 @@ export default function OptionsSimulator() {
     };
   }, [positions, replaySpot, replayVIX, rhoRate, expiryDate, replayDate, chartView, cfg, getDTE, getIV, calcPremium, legExpiries, exps]);
 
-  // ── Chart effect ──
+  // ── Load Chart.js from CDN once, then render ──
+  const [chartReady, setChartReady] = useState(false);
+
   useEffect(() => {
-    if (!canvasRef.current) return;
+    if (typeof window === "undefined") return;
+    if (window.Chart) { setChartReady(true); return; }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js";
+    script.async = true;
+    script.onload = () => setChartReady(true);
+    document.head.appendChild(script);
+    return () => { /* leave script in DOM — idempotent */ };
+  }, []);
+
+  useEffect(() => {
+    if (!chartReady || !canvasRef.current) return;
     if (!analytics) {
-      import("chart.js/auto").then(({ default: Chart }) => {
-        const ex = (Chart as any).getChart(canvasRef.current!);
-        if (ex) ex.destroy();
-      });
+      // destroy any lingering chart
+      const ex = window.Chart?.getChart(canvasRef.current);
+      if (ex) ex.destroy();
       return;
     }
-    drawPayoffChart(canvasRef.current, analytics, chartView);
-  }, [analytics, chartView]);
+    buildChart(canvasRef.current, analytics, chartView);
+  }, [chartReady, analytics, chartView]);
 
   // ── Index switch ──
   function switchIndex(idx: IndexKey) {
