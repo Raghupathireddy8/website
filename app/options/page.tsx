@@ -1,15 +1,10 @@
 "use client";
-// MarketGreeks — Options Simulator v2
-// Changes:
-// 1. NIFTY lot=65, BANKNIFTY lot=30
-// 2. Show only ±50 strikes from ATM (i.e. 50 strikes ITM and 50 OTM = 101 total)
-// 3. Spot label shows "Spot @ <replay date>" instead of just "Spot"
-// 4. Quick Mode removed; left-click = Buy, right-click = Sell (clean hint bar)
-// 5. Position rows show expiry date label (e.g. "28 Jul 26")
-// 6. Positions close on expiry (positions with expired legExpiry are auto-removed)
-// 7. Non-expiry positions (different expiry) persist when switching base expiry
-// 8. Live spot-price vertical line moves on chart so user sees distance to breakeven
-// 9. Buy/Sell buttons enabled directly on the strike price row
+// MarketGreeks — Options Simulator v3
+// Layout: Left = Option Chain (scrollable), Right = Controls + Positions + Graph (scrollable)
+// Controls (entry date, spot, replay, etc.) moved to top of right panel
+// Load Strategy removed
+// Spot line animates on Next/Prev Day
+// Navigation uses Next.js Link — won't break other pages
 
 import React, {
   useCallback,
@@ -18,10 +13,8 @@ import React, {
   useRef,
   useState,
 } from "react";
+import Link from "next/link";
 
-// ─────────────────────────────────────────────
-// TYPES
-// ─────────────────────────────────────────────
 type IndexKey = "NIFTY" | "BANKNIFTY";
 type OptionType = "C" | "P";
 
@@ -32,32 +25,20 @@ interface Position {
   dir: 1 | -1;
   lots: number;
   entryPrem: number;
-  legExpiryDate: string;   // actual ISO date string — position closes on/after this date
-  legExpiryLabel: string;  // display label e.g. "28 Jul 26"
+  legExpiryDate: string;
+  legExpiryLabel: string;
 }
 
 interface Greeks {
-  delta: number;
-  gamma: number;
-  theta: number;
-  vega: number;
-  rho: number;
+  delta: number; gamma: number; theta: number; vega: number; rho: number;
 }
 
 interface Expiry {
-  label: string;
-  date: string;
-  type: "Weekly" | "Monthly" | "Quarterly";
+  label: string; date: string; type: "Weekly" | "Monthly" | "Quarterly";
 }
 
-interface StratResult {
-  name: string;
-  bias: string;
-}
+interface StratResult { name: string; bias: string; }
 
-// ─────────────────────────────────────────────
-// CONFIG — CORRECTED LOT SIZES
-// ─────────────────────────────────────────────
 const CFG: Record<IndexKey, { lot: number; step: number; pct: number; span: number; label: string }> = {
   NIFTY:     { lot: 65,  step: 50,  pct: 0.15, span: 175000, label: "NIFTY" },
   BANKNIFTY: { lot: 30,  step: 100, pct: 0.15, span: 120000, label: "BANK NIFTY" },
@@ -77,9 +58,6 @@ const EXPIRIES: Record<IndexKey, Expiry[]> = {
   ],
 };
 
-// ─────────────────────────────────────────────
-// MATH UTILITIES
-// ─────────────────────────────────────────────
 function normCDF(x: number): number {
   const a = [0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429];
   const k = 1 / (1 + 0.2316419 * Math.abs(x));
@@ -118,24 +96,16 @@ function smileIV(baseIV: number, S: number, K: number, T: number): number {
   return Math.max(0.05, baseIV + (-0.025 * m) + (0.004 * m * m));
 }
 
-// ─────────────────────────────────────────────
-// FORMATTING
-// ─────────────────────────────────────────────
 const fmtN = (n: number) => n.toLocaleString("en-IN", { maximumFractionDigits: 0 });
 const fmtP = (n: number) => "₹" + Math.abs(n).toLocaleString("en-IN", { maximumFractionDigits: 0 });
 const fmtDate = (d: Date) => d.toISOString().split("T")[0];
 
-// ─────────────────────────────────────────────
-// CHART (imperative, canvas)
-// ─────────────────────────────────────────────
 interface ChartData { spots: number[]; payoffs: number[]; mtmPayoffs: number[]; bes: number[]; S: number; }
-
 declare global { interface Window { Chart: any } }
 
 function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" | "mtm"): void {
   const Chart = window.Chart;
   if (!Chart) return;
-
   const existing = Chart.getChart(canvas);
   if (existing) existing.destroy();
 
@@ -148,26 +118,23 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
       const { ctx, scales: { x, y }, chartArea } = chart;
       ctx.save();
 
-      // Zero line
       const yZero = y.getPixelForValue(0);
       ctx.beginPath();
-      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.strokeStyle = "rgba(255,255,255,0.12)";
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       ctx.moveTo(chartArea.left, yZero);
       ctx.lineTo(chartArea.right, yZero);
       ctx.stroke();
 
-      // Current spot vertical line — animated feel via prominent style
       const spotIdx = spots.reduce((bi: number, s: number, i: number) =>
         Math.abs(s - S) < Math.abs(spots[bi] - S) ? i : bi, 0);
       const xSpot = x.getPixelForValue(spotIdx);
 
-      // Glow effect for spot line
-      ctx.shadowColor = "#3b82f6";
-      ctx.shadowBlur = 8;
+      ctx.shadowColor = "#6366f1";
+      ctx.shadowBlur = 10;
       ctx.beginPath();
-      ctx.strokeStyle = "#3b82f6";
+      ctx.strokeStyle = "#6366f1";
       ctx.lineWidth = 2.5;
       ctx.setLineDash([]);
       ctx.moveTo(xSpot, chartArea.top);
@@ -175,19 +142,17 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      // Spot label box
       const spotPrice = S.toFixed(0);
       const labelW = ctx.measureText("SPOT " + spotPrice).width + 14;
-      ctx.fillStyle = "#3b82f6";
+      ctx.fillStyle = "#6366f1";
       ctx.beginPath();
       ctx.roundRect?.(xSpot - labelW / 2, chartArea.top - 1, labelW, 18, 3);
       ctx.fill();
       ctx.fillStyle = "#fff";
-      ctx.font = "bold 9px 'DM Sans', sans-serif";
+      ctx.font = "bold 9px 'Sora', sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("SPOT " + spotPrice, xSpot, chartArea.top + 12);
 
-      // Breakeven verticals
       bes.forEach((be: number) => {
         const beIdx = spots.reduce((bi: number, s: number, i: number) =>
           Math.abs(s - be) < Math.abs(spots[bi] - be) ? i : bi, 0);
@@ -200,7 +165,6 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
         ctx.lineTo(xBE, chartArea.bottom);
         ctx.stroke();
 
-        // BE label
         const beLabel = "BE " + be.toFixed(0);
         const beLabelW = ctx.measureText(beLabel).width + 10;
         ctx.setLineDash([]);
@@ -209,17 +173,15 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
         ctx.roundRect?.(xBE - beLabelW / 2, chartArea.bottom + 2, beLabelW, 16, 3);
         ctx.fill();
         ctx.fillStyle = "#000";
-        ctx.font = "bold 8.5px 'DM Sans', sans-serif";
+        ctx.font = "bold 8.5px 'Sora', sans-serif";
         ctx.textAlign = "center";
         ctx.fillText(beLabel, xBE, chartArea.bottom + 13);
 
-        // Distance from spot to BE line label
         const distPts = Math.abs(be - S);
         const distPct = ((distPts / S) * 100).toFixed(1);
         const midX = (xSpot + xBE) / 2;
         const midY = y.getPixelForValue(0);
         ctx.setLineDash([]);
-        ctx.fillStyle = "rgba(245,158,11,0.15)";
         ctx.strokeStyle = "rgba(245,158,11,0.4)";
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -227,7 +189,7 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
         ctx.lineTo(xBE, midY);
         ctx.stroke();
         ctx.fillStyle = "#f59e0b";
-        ctx.font = "9px 'DM Sans', sans-serif";
+        ctx.font = "9px 'Sora', sans-serif";
         ctx.textAlign = "center";
         ctx.fillText(`${fmtN(distPts)}pts (${distPct}%)`, midX, midY - 6);
       });
@@ -262,12 +224,12 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 200 },
+      animation: { duration: 300, easing: "easeInOutQuart" },
       plugins: {
         legend: { display: false },
         tooltip: {
-          backgroundColor: "#1a1e2a",
-          borderColor: "#1e2333",
+          backgroundColor: "#13161f",
+          borderColor: "#23283a",
           borderWidth: 1,
           titleColor: "#6b7494",
           bodyColor: "#e2e6f0",
@@ -307,9 +269,6 @@ function buildChart(canvas: HTMLCanvasElement, data: ChartData, view: "expiry" |
   });
 }
 
-// ─────────────────────────────────────────────
-// STRATEGY DETECTION
-// ─────────────────────────────────────────────
 function detectStrat(positions: Position[]): StratResult {
   const n = positions.length;
   if (!n) return { name: "No Strategy", bias: "—" };
@@ -322,7 +281,6 @@ function detectStrat(positions: Position[]): StratResult {
   }
   if (n === 2) {
     const buys = positions.filter(p => p.dir === 1), sells = positions.filter(p => p.dir === -1);
-    // Calendar spread: same type, same strike, different expiries
     if (buys.length === 1 && sells.length === 1) {
       const b = buys[0], s = sells[0];
       if (b.type === s.type && b.K === s.K && b.legExpiryDate !== s.legExpiryDate)
@@ -346,9 +304,6 @@ function detectStrat(positions: Position[]): StratResult {
   return { name: `Custom ${n}-leg Strategy`, bias: "Complex" };
 }
 
-// ─────────────────────────────────────────────
-// MAIN COMPONENT
-// ─────────────────────────────────────────────
 let posIdCounter = 1;
 
 export default function OptionsSimulator() {
@@ -363,6 +318,7 @@ export default function OptionsSimulator() {
   const [rhoRate, setRhoRate] = useState(6.5);
   const [positions, setPositions] = useState<Position[]>([]);
   const [chartView, setChartView] = useState<"expiry" | "mtm">("expiry");
+  const [spotFlash, setSpotFlash] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -382,33 +338,22 @@ export default function OptionsSimulator() {
     return Math.max(0.05, bsPrice(S, K, T, r, getIV(S, K, T), type));
   }, [getIV, rhoRate]);
 
-  // ── STRIKES: ±50 from ATM only ──
   const atm = useMemo(() => Math.round(replaySpot / cfg.step) * cfg.step, [replaySpot, cfg.step]);
 
   const strikes = useMemo(() => {
     const step = cfg.step;
     const arr: number[] = [];
-    // 50 strikes below ATM, ATM itself, 50 strikes above ATM = 101 strikes
-    for (let i = -50; i <= 50; i++) {
-      arr.push(atm + i * step);
-    }
+    for (let i = -50; i <= 50; i++) arr.push(atm + i * step);
     return arr;
   }, [atm, cfg.step]);
 
-  // ── Auto-expire positions when replayDate advances past legExpiryDate ──
   useEffect(() => {
     const rDate = new Date(replayDate);
-    setPositions(prev => prev.filter(p => {
-      const expDate = new Date(p.legExpiryDate);
-      // Keep if not yet expired (expiry is still in future or today)
-      return expDate >= rDate;
-    }));
+    setPositions(prev => prev.filter(p => new Date(p.legExpiryDate) >= rDate));
   }, [replayDate]);
 
-  // ── Position helpers ──
   const addPos = useCallback((K: number, type: OptionType, prem: number, dir: 1 | -1, expLabel: string, expDate: string) => {
     setPositions(prev => {
-      // Check for existing same leg (same strike, type, direction, AND same expiry)
       const idx = prev.findIndex(p => p.K === K && p.type === type && p.dir === dir && p.legExpiryDate === expDate);
       if (idx >= 0) {
         const next = [...prev];
@@ -447,18 +392,15 @@ export default function OptionsSimulator() {
 
   function isHedged(pos: Position, all: Position[]): boolean {
     if (pos.dir !== -1) return false;
-    return all.some(p => p.dir === 1 && p.type === pos.type &&
-      Math.abs(p.K - pos.K) <= cfg.step * 6 && p.lots >= pos.lots);
+    return all.some(p => p.dir === 1 && p.type === pos.type && Math.abs(p.K - pos.K) <= cfg.step * 6 && p.lots >= pos.lots);
   }
 
-  // ── Analytics ──
   const analytics = useMemo(() => {
     const S = replaySpot;
     const dte = getDTE();
     const T = dte / 365;
     const r = rhoRate / 100;
     const lot = cfg.lot;
-
     if (!positions.length) return null;
 
     const range = S * 0.18;
@@ -486,7 +428,6 @@ export default function OptionsSimulator() {
 
     const maxP = Math.max(...payoffs);
     const minP = Math.min(...payoffs);
-
     const onlyBuys = positions.every(p => p.dir === 1);
     const onlySells = positions.every(p => p.dir === -1);
     const singleBuy = positions.length === 1 && positions[0].dir === 1;
@@ -511,15 +452,12 @@ export default function OptionsSimulator() {
     });
 
     const mtmPnl = calcAt(S, false);
-
     const iv0 = replayVIX / 100;
     let popPct = "—";
     if (bes.length === 1) {
       const d = Math.log(bes[0] / S) / (iv0 * Math.sqrt(Math.max(T, 0.001)));
       const profitAbove = calcAt(S * 1.01, chartView === "expiry") > 0;
-      popPct = (profitAbove ? (1 - normCDF(d)) : normCDF(d)) * 100 > 0
-        ? ((profitAbove ? (1 - normCDF(d)) : normCDF(d)) * 100).toFixed(0) + "%"
-        : "—";
+      popPct = ((profitAbove ? (1 - normCDF(d)) : normCDF(d)) * 100).toFixed(0) + "%";
     } else if (bes.length === 2) {
       const d1 = Math.log(bes[0] / S) / (iv0 * Math.sqrt(Math.max(T, 0.001)));
       const d2 = Math.log(bes[1] / S) / (iv0 * Math.sqrt(Math.max(T, 0.001)));
@@ -529,8 +467,7 @@ export default function OptionsSimulator() {
     }
 
     const rr = !isUnlimP && !isUnlimL && maxP > 0 && minP < 0
-      ? "1 : " + (Math.abs(minP) / maxP).toFixed(2)
-      : "—";
+      ? "1 : " + (Math.abs(minP) / maxP).toFixed(2) : "—";
 
     let netPrem = 0, totalMargin = 0;
     positions.forEach(p => {
@@ -541,14 +478,7 @@ export default function OptionsSimulator() {
       totalMargin += m;
     });
 
-    return {
-      spots, payoffs, mtmPayoffs, bes, S,
-      maxP, minP, isUnlimP, isUnlimL,
-      pD, pG, pTh, pV, pR,
-      mtmPnl, popPct, rr,
-      strat: detectStrat(positions),
-      netPrem, totalMargin,
-    };
+    return { spots, payoffs, mtmPayoffs, bes, S, maxP, minP, isUnlimP, isUnlimL, pD, pG, pTh, pV, pR, mtmPnl, popPct, rr, strat: detectStrat(positions), netPrem, totalMargin };
   }, [positions, replaySpot, replayVIX, rhoRate, expiryDate, replayDate, chartView, cfg, getDTE, getIV, calcPremium]);
 
   const [chartReady, setChartReady] = useState(false);
@@ -596,40 +526,16 @@ export default function OptionsSimulator() {
     const move = Math.round((Math.random() - 0.48) * cfg.step * 6);
     setReplaySpot(prev => Math.max(Math.round(prev * 0.9), prev + move));
     setReplayVIX(prev => parseFloat(Math.max(10, Math.min(40, prev + (Math.random() - 0.5) * 0.8)).toFixed(2)));
-  }
-
-  function loadStrat(name: string) {
-    const S = replaySpot;
-    const dte = getDTE();
-    const a = Math.round(S / cfg.step) * cfg.step;
-    const currentExpiry = exps[selectedExp];
-    const p = (K: number, t: OptionType, d: 1 | -1): Position => ({
-      id: posIdCounter++,
-      K, type: t, dir: d, lots: 1,
-      entryPrem: calcPremium(S, K, dte, t),
-      legExpiryDate: currentExpiry.date,
-      legExpiryLabel: currentExpiry.label,
-    });
-    // For calendar, use two different expiries
-    const nextExpiry = exps[Math.min(selectedExp + 1, exps.length - 1)];
-    const map: Record<string, Position[]> = {
-      bull_call: [p(a, "C", 1), p(a + cfg.step * 3, "C", -1)],
-      bear_put: [p(a, "P", 1), p(a - cfg.step * 3, "P", -1)],
-      straddle: [p(a, "C", -1), p(a, "P", -1)],
-      strangle: [p(a + cfg.step * 2, "C", -1), p(a - cfg.step * 2, "P", -1)],
-      condor: [p(a + cfg.step * 3, "C", -1), p(a + cfg.step * 6, "C", 1), p(a - cfg.step * 3, "P", -1), p(a - cfg.step * 6, "P", 1)],
-      calendar: [
-        { ...p(a, "C", 1), legExpiryDate: nextExpiry.date, legExpiryLabel: nextExpiry.label },
-        { ...p(a, "C", -1), legExpiryDate: currentExpiry.date, legExpiryLabel: currentExpiry.label },
-      ],
-    };
-    setPositions(map[name] ?? []);
+    // Flash the spot line
+    setSpotFlash(true);
+    setTimeout(() => setSpotFlash(false), 600);
   }
 
   const dte = getDTE();
   const dteDisplay = Math.max(0, Math.round(dte));
+  const replayDateObj = new Date(replayDate + "T00:00:00");
+  const replayDateDisplay = replayDateObj.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "2-digit" });
 
-  // Chain click — left=buy, right=sell, no quick mode
   function handleChainClick(K: number, type: OptionType, prem: number, e: React.MouseEvent, forceDir?: 1 | -1) {
     e.preventDefault();
     const dir = forceDir ?? (e.type === "contextmenu" ? -1 : 1);
@@ -637,161 +543,394 @@ export default function OptionsSimulator() {
     addPos(K, type, prem, dir, currentExpiry.label, currentExpiry.date);
   }
 
-  // Format replay date for spot label
-  const replayDateObj = new Date(replayDate + "T00:00:00");
-  const replayDateDisplay = replayDateObj.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "2-digit" });
-
   return (
-    <div style={{ background: "#0b0d12", color: "#e2e6f0", fontFamily: "'DM Sans', sans-serif", minHeight: "100vh", fontSize: 13 }}>
+    <div className="mg-root">
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
+
+        :root {
+          --bg: #080b13;
+          --bg1: #0d1017;
+          --bg2: #111520;
+          --bg3: #161b28;
+          --border: #1e2538;
+          --border2: #252d42;
+          --text: #dde3f0;
+          --muted: #5a6380;
+          --muted2: #3a4260;
+          --accent: #6366f1;
+          --accent2: #14b8a6;
+          --green: #22c55e;
+          --red: #ef4444;
+          --amber: #f59e0b;
+          --blue: #3b82f6;
+          --purple: #a78bfa;
+          --call: #60a5fa;
+          --put: #f87171;
+        }
+
         ::-webkit-scrollbar{width:4px;height:4px}
-        ::-webkit-scrollbar-thumb{background:#252c3f;border-radius:2px}
-        input,select{background:#161a24;border:1px solid #252c3f;color:#e2e6f0;padding:5px 9px;border-radius:6px;font-family:'DM Sans',sans-serif;font-size:12px;outline:none;color-scheme:dark}
-        input:focus,select:focus{border-color:#3b82f6}
-        input[type=number]{-moz-appearance:textfield}
-        input[type=number]::-webkit-inner-spin-button{opacity:.3}
-        .chain-row:hover td{background:#1a1f2e !important}
-        .chain-row.atm td{background:#0c1a0c}
-        .chain-row.atm:hover td{background:#112010 !important}
-        .chain-row.has-pos td{background:#0d1520}
-        /* Call side — clickable cells */
-        .cv{color:#60a5fa;cursor:pointer;transition:all .1s;user-select:none;padding:4px 6px !important}
-        .cv:hover{color:#93c5fd;background:rgba(59,130,246,0.18) !important;border-radius:4px}
-        .pv{color:#f87171;cursor:pointer;transition:all .1s;user-select:none;padding:4px 6px !important}
-        .pv:hover{color:#fca5a5;background:rgba(239,68,68,0.18) !important;border-radius:4px}
-        /* B/S inline buttons on strike row */
-        .bs-btn{font-size:9px;padding:1px 5px;border-radius:3px;border:none;cursor:pointer;font-family:'DM Sans',sans-serif;font-weight:600;letter-spacing:.3px;transition:all .15s}
-        .bs-buy{background:#0d2010;color:#22c55e;border:1px solid #1a4020}
-        .bs-buy:hover{background:#22c55e;color:#000}
-        .bs-sell{background:#200d0d;color:#ef4444;border:1px solid #3a1515}
-        .bs-sell:hover{background:#ef4444;color:#fff}
-        .otm td.cv,.otm td.pv{opacity:.65}
-        .vtab{background:transparent;border:1px solid #252c3f;color:#6b7494;font-size:10px;padding:4px 11px;border-radius:100px;cursor:pointer;font-family:'DM Sans',sans-serif;transition:all .15s}
-        .vtab:hover{border-color:#3b82f6;color:#3b82f6}
-        .vtab.active{background:#1a2a4a;border-color:#3b82f6;color:#3b82f6}
-        .strat-btn{background:#10131a;border:1px solid #252c3f;color:#6b7494;font-size:10px;padding:3px 9px;border-radius:100px;cursor:pointer;font-family:'DM Sans',sans-serif;transition:all .15s}
-        .strat-btn:hover{border-color:#14b8a6;color:#14b8a6}
-        .exp-tab{background:transparent;border:1px solid #252c3f;color:#6b7494;font-size:10px;padding:3px 9px;border-radius:100px;cursor:pointer;font-family:'DM Sans',sans-serif;transition:all .15s;white-space:nowrap}
-        .exp-tab:hover{border-color:#3b82f6;color:#3b82f6}
-        .exp-tab.active{background:#1a2a4a;border-color:#3b82f6;color:#3b82f6;font-weight:500}
-        .rnav-btn{background:#161a24;border:1px solid #252c3f;color:#6b7494;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:'DM Sans',sans-serif;transition:all .15s}
-        .rnav-btn:hover{border-color:#a78bfa;color:#a78bfa}
-        .qty-btn{background:#10131a;border:1px solid #252c3f;color:#e2e6f0;width:20px;height:20px;border-radius:4px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center}
-        .qty-btn:hover{background:#1e2333}
-        .pos-rm{color:#2a3045;cursor:pointer;font-size:18px;line-height:1;transition:color .15s;padding:0 2px}
-        .pos-rm:hover{color:#ef4444}
-        .iico{display:inline-flex;width:12px;height:12px;border-radius:50%;background:#2a3045;color:#6b7494;font-size:8px;align-items:center;justify-content:center;cursor:help}
-        .added-x{display:inline-block;background:#200d0d;color:#ef4444;font-size:8px;padding:1px 4px;border-radius:3px;margin-left:3px;cursor:pointer;vertical-align:middle}
-        .added-x:hover{background:#3a1010}
-        table.ct{width:100%;border-collapse:collapse;font-size:11px}
-        table.ct th{padding:5px 6px;color:#6b7494;font-weight:400;font-size:9.5px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid #1e2333;background:#10131a;white-space:nowrap}
-        table.ct th.call-h{text-align:right;color:#60a5fa}
-        table.ct th.put-h{text-align:left;color:#f87171}
-        table.ct th.strike-h{text-align:center;background:#0b0d12;color:#6b7494}
-        table.ct td{padding:4px 6px;border-bottom:1px solid rgba(19,23,32,.3);white-space:nowrap;font-family:'JetBrains Mono',monospace;font-size:11px}
-        .tc{text-align:right}.tp{text-align:left}
-        .td-strike{text-align:center;font-weight:600;font-size:12px;color:#e2e6f0;background:#0b0d12 !important;padding:3px 6px;position:relative}
-        .atm .td-strike{color:#22c55e;background:#091409 !important}
-        .iv-v{color:#f59e0b}.dv{color:#14b8a6}.gv{color:#c084fc}.tv{color:#fb923c}
-        .atm-pill{display:inline-block;background:#0d2010;color:#22c55e;font-size:8px;padding:0 4px;border-radius:3px;margin-right:3px;font-family:'DM Sans',sans-serif;font-weight:500}
-        .sb-sep{width:1px;height:28px;background:#1e2333}
-        .mono{font-family:'JetBrains Mono',monospace}
-        .c-green{color:#22c55e}.c-red{color:#ef4444}.c-amber{color:#f59e0b}.c-blue{color:#3b82f6}.c-purple{color:#a78bfa}.c-muted{color:#6b7494}
-        .sum-card{background:#10131a;border:1px solid #1e2333;border-radius:8px;padding:9px 12px}
-        .sc-label{font-size:9.5px;color:#6b7494;text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px;display:flex;align-items:center;gap:4px}
-        .sc-val{font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:500}
-        .gk{background:#10131a;border:1px solid #1e2333;border-radius:8px;padding:8px 10px}
-        .gk-sym{font-family:Georgia,serif;font-size:13px;color:#a78bfa;margin-right:3px}
-        .gk-name{font-size:9.5px;color:#6b7494;margin-bottom:3px}
-        .gk-val{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:500}
-        .gk-hint{font-size:9px;color:#2a3045;margin-top:3px;line-height:1.3}
-        .sd-item{background:#161a24;border-radius:6px;padding:7px 10px}
-        .sd-ilabel{font-size:9.5px;color:#6b7494;margin-bottom:2px;display:flex;align-items:center;gap:3px}
-        .sd-ival{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:500}
-        /* Strike BS buttons layout */
-        .strike-cell-inner{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:90px}
-        .strike-bs-row{display:flex;gap:3px;margin-top:1px}
+        ::-webkit-scrollbar-track{background:transparent}
+        ::-webkit-scrollbar-thumb{background:#252d42;border-radius:2px}
+        ::-webkit-scrollbar-thumb:hover{background:#3a4460}
+
+        .mg-root {
+          background: var(--bg);
+          color: var(--text);
+          font-family: 'Sora', sans-serif;
+          min-height: 100vh;
+          font-size: 13px;
+          display: flex;
+          flex-direction: column;
+          height: 100vh;
+          overflow: hidden;
+        }
+
+        /* ── TOP NAV ── */
+        .mg-nav {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 0 20px;
+          height: 52px;
+          border-bottom: 1px solid var(--border);
+          background: var(--bg1);
+          flex-shrink: 0;
+          flex-wrap: wrap;
+        }
+        .mg-logo {
+          font-size: 18px;
+          font-weight: 700;
+          letter-spacing: -0.5px;
+          margin-right: 4px;
+          text-decoration: none;
+          display: flex;
+          align-items: center;
+          gap: 0;
+        }
+        .mg-logo span:first-child { color: var(--accent); }
+        .mg-logo span:last-child { color: var(--accent2); }
+        .mg-badge {
+          background: rgba(99,102,241,0.15);
+          color: var(--accent);
+          font-size: 9px;
+          padding: 3px 9px;
+          border-radius: 100px;
+          font-weight: 600;
+          letter-spacing: 0.5px;
+          border: 1px solid rgba(99,102,241,0.25);
+        }
+        .idx-btn {
+          background: var(--bg2);
+          border: 1px solid var(--border2);
+          color: var(--muted);
+          font-size: 12px;
+          padding: 5px 14px;
+          border-radius: 100px;
+          cursor: pointer;
+          font-family: 'Sora', sans-serif;
+          font-weight: 400;
+          transition: all .15s;
+        }
+        .idx-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .idx-btn.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 500; }
+        .vix-pill {
+          margin-left: auto;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          background: var(--bg2);
+          border: 1px solid var(--border);
+          padding: 5px 14px;
+          border-radius: 8px;
+          font-size: 11px;
+        }
+
+        /* ── SPLIT LAYOUT ── */
+        .mg-split {
+          display: grid;
+          grid-template-columns: 1fr 480px;
+          flex: 1;
+          overflow: hidden;
+          min-height: 0;
+        }
+
+        /* ── LEFT PANEL (Option Chain) ── */
+        .mg-left {
+          display: flex;
+          flex-direction: column;
+          border-right: 1px solid var(--border);
+          overflow: hidden;
+          min-height: 0;
+        }
+        .mg-left-header {
+          padding: 8px 16px;
+          border-bottom: 1px solid var(--border);
+          background: var(--bg1);
+          flex-shrink: 0;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .chain-scroll {
+          flex: 1;
+          overflow-y: auto;
+          min-height: 0;
+        }
+        .exp-tab {
+          background: transparent;
+          border: 1px solid var(--border2);
+          color: var(--muted);
+          font-size: 10px;
+          padding: 3px 9px;
+          border-radius: 100px;
+          cursor: pointer;
+          font-family: 'Sora', sans-serif;
+          transition: all .15s;
+          white-space: nowrap;
+        }
+        .exp-tab:hover { border-color: var(--accent); color: var(--accent); }
+        .exp-tab.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 500; }
+
+        /* chain hint */
+        .chain-hint {
+          display: flex;
+          justify-content: space-between;
+          font-size: 10px;
+          color: var(--muted);
+          padding: 4px 14px;
+          background: var(--bg1);
+          border-bottom: 1px solid var(--border);
+          flex-shrink: 0;
+        }
+
+        /* chain table */
+        table.ct { width: 100%; border-collapse: collapse; font-size: 11px; }
+        table.ct th {
+          padding: 5px 6px;
+          color: var(--muted);
+          font-weight: 400;
+          font-size: 9.5px;
+          text-transform: uppercase;
+          letter-spacing: .4px;
+          border-bottom: 1px solid var(--border);
+          background: var(--bg1);
+          white-space: nowrap;
+          position: sticky;
+          top: 0;
+          z-index: 2;
+        }
+        table.ct th.call-h { text-align: right; color: var(--call); }
+        table.ct th.put-h  { text-align: left;  color: var(--put);  }
+        table.ct th.strike-h { text-align: center; background: var(--bg); color: var(--muted); }
+        table.ct td { padding: 4px 6px; border-bottom: 1px solid rgba(19,23,32,.3); white-space: nowrap; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+        .tc { text-align: right; } .tp { text-align: left; }
+        .td-strike { text-align: center; font-weight: 600; font-size: 12px; color: var(--text); background: var(--bg) !important; padding: 3px 6px; position: relative; }
+        .chain-row:hover td { background: #131720 !important; }
+        .chain-row.atm td { background: #091610; }
+        .chain-row.atm:hover td { background: #0e1e14 !important; }
+        .chain-row.atm .td-strike { color: var(--green); background: #07110a !important; }
+        .chain-row.has-pos td { background: #0d1420; }
+        .chain-row.otm td.cv, .chain-row.otm td.pv { opacity: .6; }
+        .cv { color: var(--call); cursor: pointer; transition: all .1s; user-select: none; padding: 4px 6px !important; }
+        .cv:hover { color: #93c5fd; background: rgba(59,130,246,0.18) !important; border-radius: 4px; }
+        .pv { color: var(--put); cursor: pointer; transition: all .1s; user-select: none; padding: 4px 6px !important; }
+        .pv:hover { color: #fca5a5; background: rgba(239,68,68,0.18) !important; border-radius: 4px; }
+        .atm-pill { display: inline-block; background: #0d1f10; color: var(--green); font-size: 8px; padding: 0 4px; border-radius: 3px; margin-right: 3px; font-family: 'Sora', sans-serif; font-weight: 500; }
+        .bs-btn { font-size: 9px; padding: 1px 5px; border-radius: 3px; border: none; cursor: pointer; font-family: 'Sora', sans-serif; font-weight: 600; letter-spacing: .3px; transition: all .15s; }
+        .bs-buy { background: #0d2010; color: var(--green); border: 1px solid #1a4020; }
+        .bs-buy:hover { background: var(--green); color: #000; }
+        .bs-sell { background: #200d0d; color: var(--red); border: 1px solid #3a1515; }
+        .bs-sell:hover { background: var(--red); color: #fff; }
+        .strike-cell-inner { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 90px; }
+        .strike-bs-row { display: flex; gap: 3px; margin-top: 1px; }
+        .added-x { display: inline-block; background: #200d0d; color: var(--red); font-size: 8px; padding: 1px 4px; border-radius: 3px; margin-left: 3px; cursor: pointer; vertical-align: middle; }
+        .added-x:hover { background: #3a1010; }
+        .iv-v { color: var(--amber); } .dv { color: var(--accent2); } .gv { color: var(--purple); } .tv { color: #fb923c; }
+
+        /* ── RIGHT PANEL ── */
+        .mg-right {
+          display: flex;
+          flex-direction: column;
+          overflow-y: auto;
+          background: var(--bg1);
+          min-height: 0;
+        }
+
+        /* controls panel */
+        .ctrl-panel {
+          padding: 14px 16px;
+          border-bottom: 1px solid var(--border);
+          background: var(--bg1);
+          flex-shrink: 0;
+        }
+        .ctrl-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
+          margin-bottom: 10px;
+        }
+        .ctrl-field {
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+        }
+        .ctrl-label {
+          font-size: 9.5px;
+          color: var(--muted);
+          text-transform: uppercase;
+          letter-spacing: .5px;
+        }
+        input, select {
+          background: var(--bg2);
+          border: 1px solid var(--border2);
+          color: var(--text);
+          padding: 5px 9px;
+          border-radius: 6px;
+          font-family: 'Sora', sans-serif;
+          font-size: 12px;
+          outline: none;
+          color-scheme: dark;
+          width: 100%;
+        }
+        input:focus, select:focus { border-color: var(--accent); }
+        input[type=number] { -moz-appearance: textfield; }
+        input[type=number]::-webkit-inner-spin-button { opacity: .3; }
+
+        /* replay nav */
+        .replay-nav {
+          display: flex;
+          gap: 6px;
+          align-items: center;
+        }
+        .rnav-btn {
+          flex: 1;
+          background: var(--bg2);
+          border: 1px solid var(--border2);
+          color: var(--muted);
+          padding: 7px 12px;
+          border-radius: 7px;
+          cursor: pointer;
+          font-size: 12px;
+          font-family: 'Sora', sans-serif;
+          transition: all .15s;
+          text-align: center;
+          font-weight: 500;
+        }
+        .rnav-btn:hover { border-color: var(--purple); color: var(--purple); }
+        .rnav-btn.accent { background: rgba(99,102,241,0.1); border-color: rgba(99,102,241,0.3); color: var(--accent); }
+        .clear-btn {
+          background: #200d0d;
+          color: var(--red);
+          border: 1px solid #3a1515;
+          padding: 7px 12px;
+          border-radius: 7px;
+          cursor: pointer;
+          font-size: 12px;
+          font-family: 'Sora', sans-serif;
+          transition: all .15s;
+        }
+        .clear-btn:hover { background: var(--red); color: #fff; }
+
+        /* status row */
+        .status-row {
+          display: flex;
+          gap: 10px;
+          align-items: center;
+          padding: 8px 16px;
+          background: var(--bg2);
+          border-bottom: 1px solid var(--border);
+          flex-wrap: wrap;
+          font-size: 11px;
+          flex-shrink: 0;
+        }
+        .sb-sep { width: 1px; height: 24px; background: var(--border); }
+        .sb-item { display: flex; flex-direction: column; gap: 1px; }
+        .sb-lbl { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .4px; }
+
+        /* spot flash */
+        @keyframes spotFlash {
+          0% { background: rgba(99,102,241,0.2); }
+          100% { background: transparent; }
+        }
+        .spot-flash { animation: spotFlash 0.6s ease-out; }
+
+        /* right content */
+        .right-content { padding: 12px 16px; display: flex; flex-direction: column; gap: 12px; }
+
+        /* positions */
+        .panel { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+        .panel-hdr { padding: 9px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .panel-hdr-title { font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+
+        .pos-item { display: flex; align-items: flex-start; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; }
+        .qty-btn { background: var(--bg); border: 1px solid var(--border2); color: var(--text); width: 20px; height: 20px; border-radius: 4px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; }
+        .qty-btn:hover { background: var(--bg3); }
+        .pos-rm { color: var(--muted2); cursor: pointer; font-size: 18px; line-height: 1; transition: color .15s; padding: 0 2px; }
+        .pos-rm:hover { color: var(--red); }
+
+        /* summary cards */
+        .sum-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .sum-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; }
+        .sc-label { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 3px; }
+        .sc-val { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; }
+
+        /* strategy detect */
+        .sd-item { background: var(--bg1); border-radius: 6px; padding: 7px 10px; }
+        .sd-ilabel { font-size: 9.5px; color: var(--muted); margin-bottom: 2px; }
+        .sd-ival { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; }
+
+        /* greeks */
+        .gk { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+        .gk-sym { font-family: Georgia, serif; font-size: 13px; color: var(--purple); margin-right: 3px; }
+        .gk-name { font-size: 9.5px; color: var(--muted); margin-bottom: 3px; }
+        .gk-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; }
+        .gk-hint { font-size: 9px; color: var(--muted2); margin-top: 3px; line-height: 1.3; }
+
+        /* chart tabs */
+        .vtab { background: transparent; border: 1px solid var(--border2); color: var(--muted); font-size: 10px; padding: 4px 11px; border-radius: 100px; cursor: pointer; font-family: 'Sora', sans-serif; transition: all .15s; }
+        .vtab:hover { border-color: var(--accent); color: var(--accent); }
+        .vtab.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); }
+
+        /* misc */
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .c-green { color: var(--green); } .c-red { color: var(--red); } .c-amber { color: var(--amber); }
+        .c-blue { color: var(--blue); } .c-purple { color: var(--purple); } .c-muted { color: var(--muted); }
+
+        /* spot flash on chart when stepping */
+        .chart-wrap { position: relative; height: 300px; transition: box-shadow .3s; }
+        .chart-wrap.flashing { box-shadow: 0 0 0 2px rgba(99,102,241,0.4); border-radius: 8px; }
       `}</style>
 
-      <div style={{ maxWidth: 1640, margin: "0 auto", padding: "0 14px 40px" }}>
-
-        {/* ── NAV ── */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: "1px solid #1e2333", marginBottom: 12, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 19, fontWeight: 600, letterSpacing: -0.5, marginRight: 6 }}>
-            <span style={{ color: "#3b82f6" }}>market</span><span style={{ color: "#14b8a6" }}>greeks</span>
-          </div>
-          <div style={{ background: "#1a2a4a", color: "#3b82f6", fontSize: 10, padding: "3px 9px", borderRadius: 100, fontWeight: 500, letterSpacing: .3 }}>OPTIONS SIMULATOR</div>
-          {(["NIFTY", "BANKNIFTY"] as IndexKey[]).map(idx => (
-            <button key={idx} onClick={() => switchIndex(idx)}
-              style={{ background: currentIndex === idx ? "#1a2a4a" : "#161a24", border: `1px solid ${currentIndex === idx ? "#3b82f6" : "#252c3f"}`, color: currentIndex === idx ? "#3b82f6" : "#6b7494", fontSize: 12, padding: "5px 14px", borderRadius: 100, cursor: "pointer", fontFamily: "'DM Sans',sans-serif", fontWeight: currentIndex === idx ? 500 : 400 }}>
-              {CFG[idx].label} <span style={{ fontSize: 9, opacity: .6 }}>Lot {CFG[idx].lot}</span>
-            </button>
-          ))}
-          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10, background: "#161a24", border: "1px solid #1e2333", padding: "5px 14px", borderRadius: 8 }}>
-            <span style={{ fontSize: 10, color: "#6b7494", textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
-            <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "#f59e0b" }}>{replayVIX.toFixed(2)}</span>
-          </div>
+      {/* ── NAV ── */}
+      <nav className="mg-nav">
+        <Link href="/" className="mg-logo">
+          <span>market</span><span>greeks</span>
+        </Link>
+        <div className="mg-badge">OPTIONS SIMULATOR</div>
+        {(["NIFTY", "BANKNIFTY"] as IndexKey[]).map(idx => (
+          <button key={idx} onClick={() => switchIndex(idx)} className={`idx-btn ${currentIndex === idx ? "active" : ""}`}>
+            {CFG[idx].label} <span style={{ fontSize: 9, opacity: .6 }}>Lot {CFG[idx].lot}</span>
+          </button>
+        ))}
+        <div className="vix-pill">
+          <span style={{ color: "var(--muted)", fontSize: 9, textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
+          <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
         </div>
+      </nav>
 
-        {/* ── DATE ROW ── */}
-        <div style={{ display: "flex", gap: 10, alignItems: "flex-end", marginBottom: 10, flexWrap: "wrap", background: "#10131a", border: "1px solid #1e2333", borderRadius: 8, padding: "10px 14px" }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <span style={{ fontSize: 10, color: "#6b7494", textTransform: "uppercase", letterSpacing: .5 }}>Entry Date</span>
-            <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} style={{ width: 140 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <span style={{ fontSize: 10, color: "#6b7494" }}>Entry Spot</span>
-            <input type="number" value={entrySpot} onChange={e => setEntrySpot(+e.target.value)} style={{ width: 95 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3, borderLeft: "1px solid #1e2333", paddingLeft: 12 }}>
-            <span style={{ fontSize: 10, color: "#6b7494", textTransform: "uppercase", letterSpacing: .5 }}>Replay Date</span>
-            <input type="date" value={replayDate} onChange={e => setReplayDate(e.target.value)} style={{ width: 140 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <span style={{ fontSize: 10, color: "#6b7494" }}>Spot @ {replayDateDisplay}</span>
-            <input type="number" value={replaySpot} onChange={e => setReplaySpot(+e.target.value)} style={{ width: 95 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <span style={{ fontSize: 10, color: "#6b7494" }}>VIX / IV%</span>
-            <input type="number" value={replayVIX} step={0.1} onChange={e => setReplayVIX(+e.target.value)} style={{ width: 80 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3, borderLeft: "1px solid #1e2333", paddingLeft: 12 }}>
-            <span style={{ fontSize: 10, color: "#6b7494", textTransform: "uppercase", letterSpacing: .5 }}>Expiry</span>
-            <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} style={{ width: 140 }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <span style={{ fontSize: 10, color: "#6b7494" }}>Rate % (ρ)</span>
-            <input type="number" value={rhoRate} step={0.1} min={0} max={20} onChange={e => setRhoRate(+e.target.value)} style={{ width: 70 }} />
-          </div>
-          <div style={{ display: "flex", gap: 6, alignItems: "center", paddingLeft: 6 }}>
-            <button className="rnav-btn" onClick={() => stepReplay(-1)}>← Prev Day</button>
-            <button className="rnav-btn" onClick={() => stepReplay(1)}>Next Day →</button>
-            <button onClick={() => setPositions([])} style={{ background: "#200d0d", color: "#ef4444", border: "1px solid #3a1515", padding: "6px 12px", borderRadius: 6, cursor: "pointer", fontSize: 12, fontFamily: "'DM Sans',sans-serif", marginLeft: 4 }}>✕ Clear All</button>
-          </div>
-        </div>
+      {/* ── SPLIT ── */}
+      <div className="mg-split">
 
-        {/* ── STATUS BAR ── */}
-        <div style={{ display: "flex", gap: 14, alignItems: "center", padding: "7px 14px", background: "#161a24", border: "1px solid #1e2333", borderRadius: 8, marginBottom: 10, flexWrap: "wrap", fontSize: 11 }}>
-          {[
-            { label: "Index", val: cfg.label, cls: "" },
-            { label: "Entry Spot", val: fmtN(entrySpot), cls: "" },
-            { label: `Spot @ ${replayDateDisplay}`, val: fmtN(replaySpot), cls: "" },
-            { label: "DTE", val: dteDisplay + "d", cls: "c-amber" },
-            { label: "Lot Size", val: cfg.lot + " units", cls: "" },
-          ].map(({ label, val, cls }, i) => (
-            <React.Fragment key={label}>
-              {i > 0 && <div className="sb-sep" />}
-              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                <div style={{ color: "#6b7494", fontSize: 9, textTransform: "uppercase", letterSpacing: .4 }}>{label}</div>
-                <div className={`mono ${cls}`} style={{ fontSize: 13, fontWeight: 500 }}>{val}</div>
-              </div>
-            </React.Fragment>
-          ))}
-          <div className="sb-sep" />
-          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <div style={{ color: "#6b7494", fontSize: 9, textTransform: "uppercase", letterSpacing: .4 }}>Selected Expiry</div>
+        {/* ════ LEFT: OPTION CHAIN ════ */}
+        <div className="mg-left">
+          <div className="mg-left-header">
+            <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Option Chain</span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg2)", border: "1px solid var(--border)", padding: "2px 8px", borderRadius: 100, fontSize: 10, color: "var(--muted)" }}>
+              FUT: <b className="mono" style={{ color: "var(--text)", marginLeft: 3 }}>{fmtN(Math.round(replaySpot * (1 + rhoRate / 100 * dte / 365) * 0.5 + replaySpot * 0.5))}</b>
+            </span>
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
               {exps.map((e, i) => (
                 <button key={e.date} className={`exp-tab ${i === selectedExp ? "active" : ""}`} onClick={() => selectExp(i)}>
@@ -799,175 +938,189 @@ export default function OptionsSimulator() {
                 </button>
               ))}
             </div>
+            <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted)", fontStyle: "italic" }}>±50 strikes from ATM</span>
           </div>
-          <div style={{ marginLeft: "auto", fontSize: 10, color: "#6b7494", fontStyle: "italic", maxWidth: 340, lineHeight: 1.4, textAlign: "right" }}>
-            ⚠ Synthetic premiums via Black-Scholes + VIX smile/skew.
+
+          {/* Spot bar */}
+          <div style={{ display: "flex", gap: 14, alignItems: "center", padding: "6px 14px", background: "var(--bg)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+            <span style={{ fontSize: 10, color: "var(--muted)" }}>Spot @ {replayDateDisplay}</span>
+            <span className="mono" style={{ fontSize: 16, fontWeight: 500 }}>{fmtN(replaySpot)}</span>
+            <span style={{ fontSize: 12 }} className={replaySpot >= entrySpot ? "c-green" : "c-red"}>
+              {(replaySpot >= entrySpot ? "+" : "") + fmtN(replaySpot - entrySpot)} ({((replaySpot - entrySpot) / entrySpot * 100).toFixed(2)}%)
+            </span>
+            <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted2)" }}>DTE: <span style={{ color: "var(--amber)" }}>{dteDisplay}d</span></span>
+          </div>
+
+          <div className="chain-hint">
+            <span>Left-click CALL = Buy &nbsp;|&nbsp; Right-click = Sell</span>
+            <span>Left-click PUT = Buy &nbsp;|&nbsp; Right-click = Sell</span>
+          </div>
+
+          <div className="chain-scroll">
+            <table className="ct">
+              <thead>
+                <tr>
+                  <th className="call-h tc">Θ</th>
+                  <th className="call-h tc">Γ</th>
+                  <th className="call-h tc">Δ</th>
+                  <th className="call-h tc">IV%</th>
+                  <th className="call-h tc" style={{ minWidth: 70 }}>Call LTP</th>
+                  <th className="strike-h" style={{ minWidth: 110 }}>Strike</th>
+                  <th className="put-h tp" style={{ minWidth: 70 }}>Put LTP</th>
+                  <th className="put-h tp">IV%</th>
+                  <th className="put-h tp">Δ</th>
+                  <th className="put-h tp">Γ</th>
+                  <th className="put-h tp">Θ</th>
+                </tr>
+              </thead>
+              <tbody>
+                {strikes.map(K => {
+                  const isATM = K === atm;
+                  const isOTM = K > atm;
+                  const dte_ = getDTE();
+                  const T_ = dte_ / 365;
+                  const r_ = rhoRate / 100;
+                  const iv_ = getIV(replaySpot, K, T_);
+                  const cp = calcPremium(replaySpot, K, dte_, "C");
+                  const pp = calcPremium(replaySpot, K, dte_, "P");
+                  const cIV = (iv_ * 100).toFixed(1);
+                  const cg = bsGreeks(replaySpot, K, T_, r_, iv_, "C");
+                  const pg = bsGreeks(replaySpot, K, T_, r_, iv_, "P");
+                  const hasBuyC = positions.some(p => p.K === K && p.type === "C" && p.dir === 1);
+                  const hasSellC = positions.some(p => p.K === K && p.type === "C" && p.dir === -1);
+                  const hasBuyP = positions.some(p => p.K === K && p.type === "P" && p.dir === 1);
+                  const hasSellP = positions.some(p => p.K === K && p.type === "P" && p.dir === -1);
+                  const hasAny = hasBuyC || hasSellC || hasBuyP || hasSellP;
+                  const currentExpiry = exps[selectedExp];
+                  return (
+                    <tr key={K} className={`chain-row ${isATM ? "atm" : ""} ${hasAny ? "has-pos" : ""} ${isOTM && !isATM ? "otm" : ""}`}>
+                      <td className="tc tv">{cg.theta.toFixed(2)}</td>
+                      <td className="tc gv">{cg.gamma.toFixed(4)}</td>
+                      <td className="tc dv">{cg.delta.toFixed(2)}</td>
+                      <td className="tc iv-v">{cIV}</td>
+                      <td className="tc cv"
+                        onClick={e => handleChainClick(K, "C", cp, e, 1)}
+                        onContextMenu={e => handleChainClick(K, "C", cp, e, -1)}>
+                        <b>{cp.toFixed(2)}</b>
+                        {(hasBuyC || hasSellC) && (
+                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "C"); }}>✕</span>
+                        )}
+                      </td>
+                      <td className="td-strike">
+                        <div className="strike-cell-inner">
+                          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                            {isATM && <span className="atm-pill">ATM</span>}
+                            <b>{K}</b>
+                          </div>
+                          <div className="strike-bs-row">
+                            <button className="bs-btn bs-buy" onClick={() => addPos(K, "C", cp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Call">BC</button>
+                            <button className="bs-btn bs-sell" onClick={() => addPos(K, "C", cp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Call">SC</button>
+                            <button className="bs-btn bs-buy" style={{ background: "#0d1020", color: "var(--call)", borderColor: "#1a2540" }} onClick={() => addPos(K, "P", pp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Put">BP</button>
+                            <button className="bs-btn bs-sell" style={{ background: "#1a0d20", color: "var(--purple)", borderColor: "#2a1540" }} onClick={() => addPos(K, "P", pp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Put">SP</button>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="tp pv"
+                        onClick={e => handleChainClick(K, "P", pp, e, 1)}
+                        onContextMenu={e => handleChainClick(K, "P", pp, e, -1)}>
+                        <b>{pp.toFixed(2)}</b>
+                        {(hasBuyP || hasSellP) && (
+                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "P"); }}>✕</span>
+                        )}
+                      </td>
+                      <td className="tp iv-v">{cIV}</td>
+                      <td className="tp dv">{pg.delta.toFixed(2)}</td>
+                      <td className="tp gv">{pg.gamma.toFixed(4)}</td>
+                      <td className="tp tv">{pg.theta.toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div style={{ padding: "5px 14px", background: "var(--bg1)", borderTop: "1px solid var(--border)", fontSize: 9.5, color: "var(--muted)", fontStyle: "italic" }}>
+              ◉ ATM &nbsp;|&nbsp; Premiums are <b style={{ color: "var(--amber)" }}>synthetic</b> — Black-Scholes + VIX smile/skew
+            </div>
           </div>
         </div>
 
-        {/* ── STRATEGY PRESETS (moved here, no Quick Mode) ── */}
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10, padding: "8px 14px", background: "#161a24", border: "1px solid #1e2333", borderRadius: 8, flexWrap: "wrap" }}>
-          <span style={{ fontSize: 10, color: "#6b7494", textTransform: "uppercase", letterSpacing: .5 }}>Load Strategy</span>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {["bull_call", "bear_put", "straddle", "strangle", "condor", "calendar"].map(s => (
-              <button key={s} className="strat-btn" onClick={() => loadStrat(s)}>
-                {s === "bull_call" ? "Bull Call" : s === "bear_put" ? "Bear Put" : s === "calendar" ? "📅 Calendar" : s.charAt(0).toUpperCase() + s.slice(1)}
-              </button>
+        {/* ════ RIGHT: CONTROLS + POSITIONS + CHART ════ */}
+        <div className="mg-right">
+
+          {/* ── CONTROLS (top of right panel) ── */}
+          <div className="ctrl-panel">
+            <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .5, marginBottom: 10 }}>Simulation Controls</div>
+            <div className="ctrl-grid">
+              <div className="ctrl-field">
+                <span className="ctrl-label">Entry Date</span>
+                <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Entry Spot</span>
+                <input type="number" value={entrySpot} onChange={e => setEntrySpot(+e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Replay Date</span>
+                <input type="date" value={replayDate} onChange={e => setReplayDate(e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Spot @ {replayDateDisplay}</span>
+                <input type="number" value={replaySpot} onChange={e => setReplaySpot(+e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">VIX / IV%</span>
+                <input type="number" value={replayVIX} step={0.1} onChange={e => setReplayVIX(+e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Expiry Date</span>
+                <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Rate % (ρ)</span>
+                <input type="number" value={rhoRate} step={0.1} min={0} max={20} onChange={e => setRhoRate(+e.target.value)} />
+              </div>
+            </div>
+            <div className="replay-nav">
+              <button className="rnav-btn" onClick={() => stepReplay(-1)}>← Prev Day</button>
+              <button className="rnav-btn accent" onClick={() => stepReplay(1)}>Next Day →</button>
+              <button className="clear-btn" onClick={() => setPositions([])}>✕ Clear All</button>
+            </div>
+          </div>
+
+          {/* ── STATUS BAR ── */}
+          <div className={`status-row ${spotFlash ? "spot-flash" : ""}`}>
+            {[
+              { label: "Index", val: CFG[currentIndex].label, cls: "" },
+              { label: "Entry Spot", val: fmtN(entrySpot), cls: "" },
+              { label: `Spot @ ${replayDateDisplay}`, val: fmtN(replaySpot), cls: "" },
+              { label: "DTE", val: dteDisplay + "d", cls: "c-amber" },
+              { label: "Lot Size", val: CFG[currentIndex].lot + " units", cls: "" },
+            ].map(({ label, val, cls }, i) => (
+              <React.Fragment key={label}>
+                {i > 0 && <div className="sb-sep" />}
+                <div className="sb-item">
+                  <div className="sb-lbl">{label}</div>
+                  <div className={`mono ${cls}`} style={{ fontSize: 13, fontWeight: 500 }}>{val}</div>
+                </div>
+              </React.Fragment>
             ))}
           </div>
-          <span style={{ fontSize: 10, color: "#6b7494", marginLeft: 8 }}>
-            Left-click = <span style={{ color: "#22c55e" }}>Buy</span> &nbsp;|&nbsp; Right-click = <span style={{ color: "#ef4444" }}>Sell</span> &nbsp;|&nbsp; Or use B/S buttons on the strike row
-          </span>
-        </div>
 
-        {/* ── MAIN GRID ── */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 460px", gap: 12 }}>
+          {/* ── RIGHT CONTENT ── */}
+          <div className="right-content">
 
-          {/* ── OPTION CHAIN ── */}
-          <div style={{ background: "#161a24", border: "1px solid #1e2333", borderRadius: 10, overflow: "hidden" }}>
-            <div style={{ padding: "9px 14px", borderBottom: "1px solid #1e2333", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 11, fontWeight: 500, color: "#6b7494", textTransform: "uppercase", letterSpacing: .4 }}>Option Chain</span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "#161a24", border: "1px solid #1e2333", padding: "2px 8px", borderRadius: 100, fontSize: 10, color: "#6b7494" }}>
-                FUT: <b className="mono" style={{ color: "#e2e6f0", marginLeft: 3 }}>{fmtN(Math.round(replaySpot * (1 + rhoRate / 100 * dte / 365) * 0.5 + replaySpot * 0.5))}</b>
-              </span>
-              <span style={{ fontSize: 10, color: "#6b7494" }}>Showing ±50 strikes from ATM ({strikes.length} total)</span>
-            </div>
-            {/* Spot bar — shows "Spot @ <date>" */}
-            <div style={{ display: "flex", gap: 14, alignItems: "center", padding: "7px 14px", background: "#10131a", borderBottom: "1px solid #1e2333" }}>
-              <span style={{ fontSize: 10, color: "#6b7494" }}>Spot @ {replayDateDisplay}</span>
-              <span className="mono" style={{ fontSize: 16, fontWeight: 500 }}>{fmtN(replaySpot)}</span>
-              <span style={{ fontSize: 12 }} className={replaySpot >= entrySpot ? "c-green" : "c-red"}>
-                {(replaySpot >= entrySpot ? "+" : "") + fmtN(replaySpot - entrySpot)} ({((replaySpot - entrySpot) / entrySpot * 100).toFixed(2)}%)
-              </span>
-              <span style={{ marginLeft: "auto", fontSize: 10, color: "#6b7494" }}>
-                Range: <span style={{ color: "#14b8a6" }}>{fmtN(strikes[0])} – {fmtN(strikes[strikes.length - 1])}</span>
-              </span>
-            </div>
-            {/* Hint bar */}
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#6b7494", padding: "4px 14px", background: "#10131a", borderBottom: "1px solid #1e2333" }}>
-              <span>← Left-click CALL premium = Buy Call &nbsp;|&nbsp; Right-click = Sell Call</span>
-              <span>Left-click PUT premium = Buy Put &nbsp;|&nbsp; Right-click = Sell Put →</span>
-            </div>
-            {/* Chain table */}
-            <div style={{ maxHeight: 560, overflowY: "auto" }}>
-              <table className="ct">
-                <thead>
-                  <tr>
-                    <th className="call-h tc">Θ</th>
-                    <th className="call-h tc">Γ</th>
-                    <th className="call-h tc">Δ</th>
-                    <th className="call-h tc">IV%</th>
-                    <th className="call-h tc" style={{ minWidth: 70 }}>Call LTP</th>
-                    {/* Strike column: wider to fit B/S buttons */}
-                    <th className="strike-h" style={{ minWidth: 110 }}>Strike</th>
-                    <th className="put-h tp" style={{ minWidth: 70 }}>Put LTP</th>
-                    <th className="put-h tp">IV%</th>
-                    <th className="put-h tp">Δ</th>
-                    <th className="put-h tp">Γ</th>
-                    <th className="put-h tp">Θ</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {strikes.map(K => {
-                    const isATM = K === atm;
-                    const isOTM = K > atm;
-                    const dte_ = getDTE();
-                    const T_ = dte_ / 365;
-                    const r_ = rhoRate / 100;
-                    const iv_ = getIV(replaySpot, K, T_);
-                    const cp = calcPremium(replaySpot, K, dte_, "C");
-                    const pp = calcPremium(replaySpot, K, dte_, "P");
-                    const cIV = (iv_ * 100).toFixed(1);
-                    const cg = bsGreeks(replaySpot, K, T_, r_, iv_, "C");
-                    const pg = bsGreeks(replaySpot, K, T_, r_, iv_, "P");
-                    const hasBuyC = positions.some(p => p.K === K && p.type === "C" && p.dir === 1);
-                    const hasSellC = positions.some(p => p.K === K && p.type === "C" && p.dir === -1);
-                    const hasBuyP = positions.some(p => p.K === K && p.type === "P" && p.dir === 1);
-                    const hasSellP = positions.some(p => p.K === K && p.type === "P" && p.dir === -1);
-                    const hasAny = hasBuyC || hasSellC || hasBuyP || hasSellP;
-                    const currentExpiry = exps[selectedExp];
-                    return (
-                      <tr key={K} className={`chain-row ${isATM ? "atm" : ""} ${hasAny ? "has-pos" : ""} ${isOTM && !isATM ? "otm" : ""}`}>
-                        <td className="tc tv">{cg.theta.toFixed(2)}</td>
-                        <td className="tc gv">{cg.gamma.toFixed(4)}</td>
-                        <td className="tc dv">{cg.delta.toFixed(2)}</td>
-                        <td className="tc iv-v">{cIV}</td>
-                        {/* Call LTP — left click buy, right click sell */}
-                        <td className={`tc cv`}
-                          onClick={e => handleChainClick(K, "C", cp, e, 1)}
-                          onContextMenu={e => handleChainClick(K, "C", cp, e, -1)}>
-                          <b>{cp.toFixed(2)}</b>
-                          {(hasBuyC || hasSellC) && (
-                            <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "C"); }}>✕</span>
-                          )}
-                        </td>
-                        {/* Strike cell with B/S buttons */}
-                        <td className="td-strike">
-                          <div className="strike-cell-inner">
-                            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                              {isATM && <span className="atm-pill">ATM</span>}
-                              <b>{K}</b>
-                            </div>
-                            {/* Buy/Sell buttons below the strike */}
-                            <div className="strike-bs-row">
-                              <button className="bs-btn bs-buy"
-                                onClick={() => addPos(K, "C", cp, 1, currentExpiry.label, currentExpiry.date)}
-                                title="Buy Call">BC</button>
-                              <button className="bs-btn bs-sell"
-                                onClick={() => addPos(K, "C", cp, -1, currentExpiry.label, currentExpiry.date)}
-                                title="Sell Call">SC</button>
-                              <button className="bs-btn bs-buy" style={{ background: "#0d1020", color: "#60a5fa", borderColor: "#1a2540" }}
-                                onClick={() => addPos(K, "P", pp, 1, currentExpiry.label, currentExpiry.date)}
-                                title="Buy Put">BP</button>
-                              <button className="bs-btn bs-sell" style={{ background: "#1a0d20", color: "#c084fc", borderColor: "#2a1540" }}
-                                onClick={() => addPos(K, "P", pp, -1, currentExpiry.label, currentExpiry.date)}
-                                title="Sell Put">SP</button>
-                            </div>
-                          </div>
-                        </td>
-                        {/* Put LTP — left click buy, right click sell */}
-                        <td className={`tp pv`}
-                          onClick={e => handleChainClick(K, "P", pp, e, 1)}
-                          onContextMenu={e => handleChainClick(K, "P", pp, e, -1)}>
-                          <b>{pp.toFixed(2)}</b>
-                          {(hasBuyP || hasSellP) && (
-                            <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "P"); }}>✕</span>
-                          )}
-                        </td>
-                        <td className="tp iv-v">{cIV}</td>
-                        <td className="tp dv">{pg.delta.toFixed(2)}</td>
-                        <td className="tp gv">{pg.gamma.toFixed(4)}</td>
-                        <td className="tp tv">{pg.theta.toFixed(2)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <div style={{ padding: "5px 14px", background: "#10131a", borderTop: "1px solid #1e2333", fontSize: 9.5, color: "#6b7494", fontStyle: "italic" }}>
-              ◉ ATM &nbsp;|&nbsp; Premiums are <b style={{ color: "#f59e0b" }}>synthetic</b> — Black-Scholes with VIX-based IV + smile/skew. &nbsp;|&nbsp; BC/SC/BP/SP buttons on strike = quick Buy/Sell
-            </div>
-          </div>
-
-          {/* ── RIGHT PANEL ── */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-
-            {/* POSITIONS — with expiry date on each leg */}
-            <div style={{ background: "#161a24", border: "1px solid #1e2333", borderRadius: 10, overflow: "hidden" }}>
-              <div style={{ padding: "9px 14px", borderBottom: "1px solid #1e2333", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, fontWeight: 500, color: "#6b7494", textTransform: "uppercase", letterSpacing: .4 }}>
-                  Positions <span style={{ color: "#3b82f6", fontSize: 10 }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span>
+            {/* POSITIONS */}
+            <div className="panel">
+              <div className="panel-hdr">
+                <span className="panel-hdr-title">
+                  Positions <span style={{ color: "var(--accent)", fontSize: 10 }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span>
                 </span>
                 {positions.length > 0 && (
-                  <span style={{ fontSize: 9, color: "#6b7494", marginLeft: "auto" }}>
-                    Positions auto-expire on expiry date
-                  </span>
+                  <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: "auto" }}>Auto-expire on expiry date</span>
                 )}
               </div>
-
               {positions.length === 0 ? (
-                <div style={{ padding: 18, textAlign: "center", color: "#6b7494", fontSize: 11, fontStyle: "italic" }}>
-                  No positions yet. Click Call/Put premiums or use BC/SC/BP/SP buttons to add legs.
+                <div style={{ padding: 18, textAlign: "center", color: "var(--muted)", fontSize: 11, fontStyle: "italic" }}>
+                  No positions. Click Call/Put premiums or use BC/SC/BP/SP buttons.
                 </div>
               ) : (
                 positions.map((p) => {
@@ -976,51 +1129,45 @@ export default function OptionsSimulator() {
                   const lot = cfg.lot;
                   const mtm = (curPrem - p.entryPrem) * lot * p.lots * p.dir;
                   const hedged = isHedged(p, positions);
-                  // Days to expiry for this specific leg
                   const legDTE = Math.max(0, Math.round(getDTE(p.legExpiryDate)));
                   return (
-                    <div key={p.id} style={{ display: "flex", alignItems: "flex-start", gap: 6, padding: "8px 12px", borderBottom: "1px solid #1e2333", fontSize: 11, flexWrap: "wrap" }}>
+                    <div key={p.id} className="pos-item">
                       <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
-                          {/* Buy/Sell badge */}
-                          <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3, fontWeight: 600, letterSpacing: .3, background: isBuy ? "#0d2010" : "#200d0d", color: isBuy ? "#22c55e" : "#ef4444", border: `1px solid ${isBuy ? "#1a3a20" : "#3a1a1a"}` }}>
+                          <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3, fontWeight: 600, letterSpacing: .3, background: isBuy ? "#0d2010" : "#200d0d", color: isBuy ? "var(--green)" : "var(--red)", border: `1px solid ${isBuy ? "#1a3a20" : "#3a1a1a"}` }}>
                             {isBuy ? "BUY" : "SELL"}
                           </span>
                           <span className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{p.K}</span>
-                          <span style={{ color: p.type === "C" ? "#60a5fa" : "#f87171", fontSize: 11, fontWeight: 500 }}>{p.type === "C" ? "CE" : "PE"}</span>
-                          {/* Lot control */}
+                          <span style={{ color: p.type === "C" ? "var(--call)" : "var(--put)", fontSize: 11, fontWeight: 500 }}>{p.type === "C" ? "CE" : "PE"}</span>
                           <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
                             <button className="qty-btn" onClick={() => changeLots(p.id, -1)}>−</button>
-                            <span className="mono" style={{ fontSize: 11, minWidth: 46, textAlign: "center" }}>
-                              {p.lots} lot{p.lots !== 1 ? "s" : ""}
-                            </span>
+                            <span className="mono" style={{ fontSize: 11, minWidth: 46, textAlign: "center" }}>{p.lots} lot{p.lots !== 1 ? "s" : ""}</span>
                             <button className="qty-btn" onClick={() => changeLots(p.id, 1)}>+</button>
                           </div>
-                          <span className="mono" style={{ color: "#f59e0b" }}>@{p.entryPrem.toFixed(2)}</span>
+                          <span className="mono" style={{ color: "var(--amber)" }}>@{p.entryPrem.toFixed(2)}</span>
                           <span className={`mono ${mtm >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 11 }}>
                             {mtm >= 0 ? "+" : ""}{fmtP(mtm)}
                           </span>
                           {hedged && !isBuy && (
-                            <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "#0d1a30", color: "#60a5fa", border: "1px solid #1a2a4a" }}>Hedged</span>
+                            <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "#0d1a30", color: "var(--call)", border: "1px solid #1a2a4a" }}>Hedged</span>
                           )}
                           <button className="pos-rm" style={{ marginLeft: "auto" }} onClick={() => removePosIdx(p.id)}>×</button>
                         </div>
-                        {/* Expiry info row — shows the date prominently for calendar strategy clarity */}
                         <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
-                          <span style={{ fontSize: 9, color: "#6b7494" }}>Expiry:</span>
+                          <span style={{ fontSize: 9, color: "var(--muted)" }}>Expiry:</span>
                           {exps.map((e) => (
                             <button key={e.date}
                               onClick={() => changeExpiryForPos(p.id, e)}
                               style={{
                                 fontSize: 8.5, padding: "1px 6px", borderRadius: 3, cursor: "pointer",
-                                background: p.legExpiryDate === e.date ? "#1a2a4a" : "#10131a",
-                                border: `1px solid ${p.legExpiryDate === e.date ? "#3b82f6" : "#252c3f"}`,
-                                color: p.legExpiryDate === e.date ? "#3b82f6" : "#6b7494",
-                                fontFamily: "'DM Sans',sans-serif",
+                                background: p.legExpiryDate === e.date ? "rgba(99,102,241,0.12)" : "var(--bg)",
+                                border: `1px solid ${p.legExpiryDate === e.date ? "var(--accent)" : "var(--border2)"}`,
+                                color: p.legExpiryDate === e.date ? "var(--accent)" : "var(--muted)",
+                                fontFamily: "'Sora', sans-serif",
                                 fontWeight: p.legExpiryDate === e.date ? 600 : 400,
                               }}>{e.label}</button>
                           ))}
-                          <span style={{ fontSize: 9, color: legDTE <= 3 ? "#ef4444" : legDTE <= 7 ? "#f59e0b" : "#6b7494" }}>
+                          <span style={{ fontSize: 9, color: legDTE <= 3 ? "var(--red)" : legDTE <= 7 ? "var(--amber)" : "var(--muted)" }}>
                             {legDTE}d left
                           </span>
                         </div>
@@ -1029,7 +1176,6 @@ export default function OptionsSimulator() {
                   );
                 })
               )}
-
               {positions.length > 0 && (() => {
                 let netPrem = 0, totalMargin = 0;
                 positions.forEach(p => {
@@ -1040,17 +1186,17 @@ export default function OptionsSimulator() {
                   totalMargin += m;
                 });
                 return (
-                  <div style={{ background: "#10131a", borderTop: "1px solid #1e2333", padding: "8px 12px", fontSize: 11 }}>
+                  <div style={{ background: "var(--bg1)", borderTop: "1px solid var(--border)", padding: "8px 12px", fontSize: 11 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
-                      <span style={{ color: "#6b7494" }}>Premium {netPrem >= 0 ? "Collected" : "Paid"}</span>
+                      <span style={{ color: "var(--muted)" }}>Premium {netPrem >= 0 ? "Collected" : "Paid"}</span>
                       <span className="mono">{fmtP(netPrem)}</span>
                     </div>
                     <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
-                      <span style={{ color: "#6b7494" }}>Approx Margin Required</span>
-                      <span className="mono" style={{ color: "#f59e0b", fontWeight: 500 }}>{fmtP(totalMargin)}</span>
+                      <span style={{ color: "var(--muted)" }}>Approx Margin Required</span>
+                      <span className="mono" style={{ color: "var(--amber)", fontWeight: 500 }}>{fmtP(totalMargin)}</span>
                     </div>
-                    <div style={{ fontSize: 9.5, color: "#6b7494", marginTop: 3 }}>
-                      Buy = premium × lot × qty | Sell = SPAN ~₹{fmtN(cfg.span)}/lot | Hedged sell ≈ 25% margin
+                    <div style={{ fontSize: 9.5, color: "var(--muted)", marginTop: 3 }}>
+                      Buy = premium × lot × qty | Sell = SPAN ~₹{fmtN(cfg.span)}/lot | Hedged ≈ 25% margin
                     </div>
                   </div>
                 );
@@ -1058,12 +1204,12 @@ export default function OptionsSimulator() {
             </div>
 
             {/* SUMMARY CARDS */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <div className="sum-grid">
               {[
                 { label: "Max Profit", val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
                 { label: "Max Loss", val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
                 { label: "Breakeven(s)", val: analytics?.bes.length ? analytics.bes.join(" / ") : "—", cls: "" },
-                { label: "POP (Prob. of Profit)", val: analytics?.popPct ?? "—", cls: "c-blue" },
+                { label: "POP", val: analytics?.popPct ?? "—", cls: "c-blue" },
               ].map(({ label, val, cls }) => (
                 <div key={label} className="sum-card">
                   <div className="sc-label">{label}</div>
@@ -1073,10 +1219,10 @@ export default function OptionsSimulator() {
             </div>
 
             {/* STRATEGY DETECT */}
-            <div style={{ background: "#10131a", border: "1px solid #1e2333", borderRadius: 8, padding: "10px 14px" }}>
+            <div className="panel" style={{ padding: "10px 14px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                 <span style={{ fontSize: 13, fontWeight: 500 }}>{analytics?.strat.name ?? "No Strategy"}</span>
-                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, background: "#1a1030", color: "#a78bfa", border: "1px solid #3a2060" }}>{analytics?.strat.bias ?? "—"}</span>
+                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, background: "rgba(167,139,250,0.1)", color: "var(--purple)", border: "1px solid rgba(167,139,250,0.2)" }}>{analytics?.strat.bias ?? "—"}</span>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                 {[
@@ -1096,18 +1242,18 @@ export default function OptionsSimulator() {
             </div>
 
             {/* GREEKS */}
-            <div style={{ background: "#161a24", border: "1px solid #1e2333", borderRadius: 10, overflow: "hidden" }}>
-              <div style={{ padding: "9px 14px", borderBottom: "1px solid #1e2333", display: "flex", alignItems: "center" }}>
-                <span style={{ fontSize: 11, fontWeight: 500, color: "#6b7494", textTransform: "uppercase", letterSpacing: .4 }}>Portfolio Greeks</span>
-                <span style={{ fontSize: 9.5, color: "#6b7494", marginLeft: "auto" }}>BS + VIX smile model</span>
+            <div className="panel">
+              <div style={{ padding: "9px 14px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center" }}>
+                <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Portfolio Greeks</span>
+                <span style={{ fontSize: 9.5, color: "var(--muted)", marginLeft: "auto" }}>BS + VIX smile model</span>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 7, padding: "10px 12px" }}>
                 {[
                   { sym: "Δ", name: "Delta", val: analytics?.pD.toFixed(2) ?? "—", hint: "₹/+1pt spot" },
                   { sym: "Γ", name: "Gamma", val: analytics?.pG.toFixed(4) ?? "—", hint: "Delta/+1pt" },
                   { sym: "Θ", name: "Theta", val: analytics?.pTh.toFixed(2) ?? "—", hint: "₹ decay/day", cls: "c-red" },
-                  { sym: "V", name: "Vega", val: analytics?.pV.toFixed(2) ?? "—", hint: "₹/1% IV" },
-                  { sym: "ρ", name: "Rho", val: analytics?.pR.toFixed(2) ?? "—", hint: "₹/1% rate" },
+                  { sym: "V", name: "Vega",  val: analytics?.pV.toFixed(2) ?? "—", hint: "₹/1% IV" },
+                  { sym: "ρ", name: "Rho",   val: analytics?.pR.toFixed(2) ?? "—", hint: "₹/1% rate" },
                 ].map(({ sym, name, val, hint, cls }) => (
                   <div key={name} className="gk">
                     <div className="gk-name"><span className="gk-sym">{sym}</span>{name}</div>
@@ -1119,10 +1265,10 @@ export default function OptionsSimulator() {
             </div>
 
             {/* PAYOFF CHART */}
-            <div style={{ background: "#161a24", border: "1px solid #1e2333", borderRadius: 10, padding: "12px 14px" }}>
+            <div className="panel" style={{ padding: "12px 14px" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
                 <div>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: "#e2e6f0" }}>Payoff Chart</span>
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>Payoff Chart</span>
                   {analytics && (
                     <span className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 14, fontWeight: 600, marginLeft: 12 }}>
                       MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
@@ -1134,10 +1280,9 @@ export default function OptionsSimulator() {
                   <button className={`vtab ${chartView === "mtm" ? "active" : ""}`} onClick={() => setChartView("mtm")}>MTM Now</button>
                 </div>
               </div>
-              <div style={{ position: "relative", height: 340 }}>
+              <div className={`chart-wrap ${spotFlash ? "flashing" : ""}`}>
                 <canvas ref={canvasRef} role="img" aria-label="Options payoff P&L chart" />
               </div>
-              {/* Breakeven callout with distance from spot */}
               {analytics && analytics.bes.length > 0 && (
                 <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {analytics.bes.map(be => {
@@ -1145,51 +1290,24 @@ export default function OptionsSimulator() {
                     const distPct = ((dist / replaySpot) * 100).toFixed(1);
                     const above = be > replaySpot;
                     return (
-                      <span key={be} style={{ fontSize: 10, background: "#1a150a", color: "#f59e0b", border: "1px solid #3a2a0a", borderRadius: 4, padding: "2px 8px" }}>
+                      <span key={be} style={{ fontSize: 10, background: "#1a150a", color: "var(--amber)", border: "1px solid #3a2a0a", borderRadius: 4, padding: "2px 8px" }}>
                         BE: {fmtN(be)} &nbsp;
-                        <span style={{ color: "#6b7494" }}>{distPct}% {above ? "above" : "below"} spot &nbsp; ({fmtN(dist)} pts away)</span>
+                        <span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot &nbsp; ({fmtN(dist)} pts away)</span>
                       </span>
                     );
                   })}
                 </div>
               )}
-              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 10, color: "#6b7494", flexWrap: "wrap" }}>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "#22c55e", display: "inline-block", borderRadius: 1 }} />Profit</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "#ef4444", display: "inline-block", borderRadius: 1 }} />Loss</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 1, background: "#f59e0b", display: "inline-block" }} />Breakeven</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "#3b82f6", display: "inline-block" }} />Spot @ {replayDateDisplay}</span>
+              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 10, color: "var(--muted)", flexWrap: "wrap" }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--green)", display: "inline-block", borderRadius: 1 }} />Profit</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--red)", display: "inline-block", borderRadius: 1 }} />Loss</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 1, background: "var(--amber)", display: "inline-block" }} />Breakeven</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--accent)", display: "inline-block" }} />Spot @ {replayDateDisplay}</span>
               </div>
             </div>
 
           </div>
         </div>
-
-        {/* ── UPLOAD GUIDANCE ── */}
-        <div style={{ marginTop: 16, background: "#10131a", border: "1px solid #1e2333", borderRadius: 10, padding: "14px 18px", fontSize: 12, color: "#6b7494", lineHeight: 1.7 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: "#e2e6f0", marginBottom: 6 }}>📂 Historical Data Upload — OHLCV + VIX (Replay Engine)</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <div>
-              <div style={{ color: "#a78bfa", fontWeight: 500, marginBottom: 4 }}>Where to upload your data files:</div>
-              <ol style={{ paddingLeft: 16, display: "flex", flexDirection: "column", gap: 4 }}>
-                <li>Place CSV files in <code style={{ background: "#161a24", padding: "1px 5px", borderRadius: 3, color: "#f59e0b" }}>public/data/</code> in your Next.js project root.</li>
-                <li>Name them: <code style={{ background: "#161a24", padding: "1px 5px", borderRadius: 3, color: "#f59e0b" }}>nifty_ohlcv.csv</code>, <code style={{ background: "#161a24", padding: "1px 5px", borderRadius: 3, color: "#f59e0b" }}>banknifty_ohlcv.csv</code>, <code style={{ background: "#161a24", padding: "1px 5px", borderRadius: 3, color: "#f59e0b" }}>vix_history.csv</code></li>
-                <li>Push to GitHub → Vercel auto-deploys and serves them from <code style={{ background: "#161a24", padding: "1px 5px", borderRadius: 3, color: "#f59e0b" }}>/data/</code></li>
-                <li>For Supabase: Upload to a <b>Storage bucket</b> named <code style={{ background: "#161a24", padding: "1px 5px", borderRadius: 3, color: "#f59e0b" }}>market-data</code></li>
-              </ol>
-            </div>
-            <div>
-              <div style={{ color: "#14b8a6", fontWeight: 500, marginBottom: 4 }}>Required CSV columns:</div>
-              <div style={{ background: "#161a24", borderRadius: 6, padding: "8px 12px", fontSize: 11 }}>
-                <div style={{ color: "#f59e0b" }}>nifty_ohlcv.csv / banknifty_ohlcv.csv</div>
-                <div style={{ color: "#3a4060", marginTop: 2 }}>date, open, high, low, close, volume</div>
-                <div style={{ color: "#f59e0b", marginTop: 6 }}>vix_history.csv</div>
-                <div style={{ color: "#3a4060", marginTop: 2 }}>date, vix_open, vix_high, vix_low, vix_close</div>
-                <div style={{ color: "#6b7494", marginTop: 6, fontSize: 10 }}>Date format: YYYY-MM-DD | 5 years of daily data recommended</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
       </div>
     </div>
   );
