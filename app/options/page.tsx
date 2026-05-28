@@ -591,11 +591,13 @@ export default function OptionsSimulator() {
           display: flex;
           align-items: center;
           gap: 0;
-          padding: 0 24px;
+          padding: 0 16px;
           height: 52px;
           border-bottom: 1px solid var(--border);
           background: #ffffff;
           flex-shrink: 0;
+          overflow-x: auto;
+          overflow-y: hidden;
         }
         .mg-logo {
           font-size: 18px;
@@ -604,7 +606,8 @@ export default function OptionsSimulator() {
           text-decoration: none;
           display: flex;
           align-items: center;
-          margin-right: 24px;
+          margin-right: 16px;
+          flex-shrink: 0;
         }
         .mg-logo span:first-child { color: var(--accent); }
         .mg-logo span:last-child { color: var(--accent2); }
@@ -613,13 +616,14 @@ export default function OptionsSimulator() {
           align-items: center;
           height: 100%;
           gap: 0;
+          flex-shrink: 0;
         }
         .nav-link {
-          font-size: 13px;
+          font-size: 12.5px;
           font-weight: 400;
           color: var(--muted);
           text-decoration: none;
-          padding: 0 16px;
+          padding: 0 11px;
           height: 52px;
           display: flex;
           align-items: center;
@@ -634,8 +638,28 @@ export default function OptionsSimulator() {
           margin-left: auto;
           display: flex;
           align-items: center;
-          gap: 10px;
+          gap: 8px;
+          flex-shrink: 0;
+          padding-left: 8px;
         }
+        .get-alerts-btn {
+          background: var(--accent);
+          color: #fff;
+          border: none;
+          padding: 7px 16px;
+          border-radius: 8px;
+          font-size: 12px;
+          font-family: 'Sora', sans-serif;
+          font-weight: 600;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          transition: all .15s;
+          white-space: nowrap;
+          text-decoration: none;
+        }
+        .get-alerts-btn:hover { background: #4f46e5; }
         .mg-badge {
           background: rgba(99,102,241,0.10);
           color: var(--accent);
@@ -934,9 +958,15 @@ export default function OptionsSimulator() {
         </Link>
         <div className="nav-links">
           <Link href="/" className="nav-link">Home</Link>
-          <Link href="/screener" className="nav-link">Screener</Link>
           <Link href="/options" className="nav-link active">Options</Link>
+          <Link href="/screener" className="nav-link">Screener</Link>
+          <Link href="/backtest" className="nav-link">Backtest</Link>
+          <Link href="/ipo" className="nav-link">IPO</Link>
+          <Link href="/virtual-trade" className="nav-link">Virtual Trade</Link>
+          <Link href="/financial-calculators" className="nav-link">Financial Calculators</Link>
+          <Link href="/savings" className="nav-link">Savings</Link>
           <Link href="/about" className="nav-link">About</Link>
+          <Link href="/contact" className="nav-link">Contact</Link>
         </div>
         <div className="nav-right">
           <div className="mg-badge">OPTIONS SIMULATOR</div>
@@ -949,6 +979,7 @@ export default function OptionsSimulator() {
             <span style={{ color: "var(--muted)", fontSize: 9, textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
             <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
           </div>
+          <Link href="/alerts" className="get-alerts-btn">✈ Get Alerts</Link>
         </div>
       </nav>
 
