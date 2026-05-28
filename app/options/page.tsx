@@ -546,7 +546,7 @@ export default function OptionsSimulator() {
   return (
     <div className="mg-root">
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
 
         :root {
@@ -575,12 +575,10 @@ export default function OptionsSimulator() {
         ::-webkit-scrollbar-thumb{background:#d4d8e8;border-radius:2px}
         ::-webkit-scrollbar-thumb:hover{background:#b0b8d0}
 
-        html, body { height: 100%; }
-
         .mg-root {
           background: var(--bg);
           color: var(--text);
-          font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          font-family: 'Sora', sans-serif;
           font-size: 13px;
           display: flex;
           flex-direction: column;
@@ -588,146 +586,204 @@ export default function OptionsSimulator() {
           overflow: hidden;
         }
 
-        /* ════════════════════════════════
-           TOP NAV — matches homepage exactly
-           ════════════════════════════════ */
+        /* ── TOP NAV ── */
         .mg-nav {
           display: flex;
           align-items: center;
-          padding: 0 20px;
-          height: 60px;
+          gap: 0;
+          padding: 0 24px;
+          height: 52px;
           border-bottom: 1px solid var(--border);
           background: #ffffff;
           flex-shrink: 0;
-          position: sticky;
-          top: 0;
-          z-index: 100;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.06);
         }
         .mg-logo {
-          font-size: 20px;
+          font-size: 18px;
           font-weight: 700;
           letter-spacing: -0.5px;
           text-decoration: none;
           display: flex;
           align-items: center;
-          gap: 0;
-          margin-right: 8px;
-          flex-shrink: 0;
+          margin-right: 24px;
         }
         .mg-logo span:first-child { color: var(--accent); }
-        .mg-logo span:last-child { color: var(--text); }
+        .mg-logo span:last-child { color: var(--accent2); }
         .nav-links {
           display: flex;
           align-items: center;
           height: 100%;
           gap: 0;
-          flex: 1;
-          overflow-x: auto;
-          overflow-y: hidden;
-          scrollbar-width: none;
         }
-        .nav-links::-webkit-scrollbar { display: none; }
         .nav-link {
           font-size: 13px;
           font-weight: 400;
           color: var(--muted);
           text-decoration: none;
-          padding: 0 13px;
-          height: 60px;
+          padding: 0 16px;
+          height: 52px;
           display: flex;
           align-items: center;
           border-bottom: 2px solid transparent;
-          transition: color .15s, border-color .15s;
+          transition: all .15s;
+          font-family: 'Sora', sans-serif;
           white-space: nowrap;
-          flex-shrink: 0;
         }
-        .nav-link:hover { color: var(--text); border-bottom-color: rgba(99,102,241,0.3); }
+        .nav-link:hover { color: var(--accent); border-bottom-color: rgba(99,102,241,0.3); }
         .nav-link.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
         .nav-right {
+          margin-left: auto;
           display: flex;
           align-items: center;
-          gap: 8px;
-          flex-shrink: 0;
-          margin-left: 8px;
+          gap: 10px;
         }
-        .get-alerts-btn {
-          background: var(--accent);
-          color: #fff;
-          border: none;
-          padding: 8px 18px;
-          border-radius: 8px;
-          font-size: 13px;
+        .mg-badge {
+          background: rgba(99,102,241,0.10);
+          color: var(--accent);
+          font-size: 9px;
+          padding: 3px 9px;
+          border-radius: 100px;
           font-weight: 600;
-          cursor: pointer;
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          transition: background .15s;
-          white-space: nowrap;
-          text-decoration: none;
-          font-family: inherit;
+          letter-spacing: 0.5px;
+          border: 1px solid rgba(99,102,241,0.25);
         }
-        .get-alerts-btn:hover { background: #4f46e5; }
-
-        /* Index switcher pills in nav */
         .idx-btn {
           background: var(--bg2);
           border: 1px solid var(--border2);
           color: var(--muted);
           font-size: 12px;
-          padding: 5px 12px;
+          padding: 5px 14px;
           border-radius: 100px;
           cursor: pointer;
-          font-family: inherit;
+          font-family: 'Sora', sans-serif;
           font-weight: 400;
           transition: all .15s;
-          white-space: nowrap;
         }
         .idx-btn:hover { border-color: var(--accent); color: var(--accent); }
-        .idx-btn.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 600; }
-
-        /* VIX pill */
+        .idx-btn.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 500; }
         .vix-pill {
           display: flex;
           align-items: center;
-          gap: 6px;
+          gap: 8px;
           background: #fffbeb;
           border: 1px solid #fde68a;
-          padding: 5px 12px;
+          padding: 5px 14px;
           border-radius: 8px;
           font-size: 11px;
-          white-space: nowrap;
         }
 
-        /* ════════════════════════════════
-           MAIN SPLIT — Left chain, Right panel
-           ════════════════════════════════ */
+        /* ── SPLIT LAYOUT ── */
         .mg-split {
           display: grid;
-          grid-template-columns: 1fr 400px;
+          grid-template-columns: 1fr 420px;
           flex: 1;
           overflow: hidden;
           min-height: 0;
         }
 
-        /* ── LEFT: Option Chain — takes all remaining height ── */
+        /* ── LEFT: Sim Controls (top, compact) + Option Chain (fills rest) ── */
         .mg-left {
           display: flex;
           flex-direction: column;
-          border-right: 1px solid var(--border);
+          border-right: 2px solid var(--border);
           overflow: hidden;
           min-height: 0;
-          background: var(--bg);
         }
+
+        /* Sim controls — compact horizontal strip */
+        .ctrl-section {
+          background: #f8f9fb;
+          border-bottom: 1px solid var(--border);
+          flex-shrink: 0;
+        }
+        .ctrl-section-hdr {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 5px 14px;
+          cursor: pointer;
+          user-select: none;
+          font-size: 10px;
+          font-weight: 600;
+          color: var(--muted);
+          text-transform: uppercase;
+          letter-spacing: .5px;
+          border-bottom: 1px solid var(--border);
+        }
+        .ctrl-section-hdr:hover { background: #f0f2f7; }
+        /* When open: lay out fields in one horizontal row */
+        .ctrl-grid {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px 10px;
+          padding: 7px 14px 6px;
+          align-items: flex-end;
+        }
+        .ctrl-field {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          min-width: 100px;
+          flex: 1;
+        }
+        .ctrl-label { font-size: 8.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+        input, select {
+          background: #fff;
+          border: 1px solid var(--border2);
+          color: var(--text);
+          padding: 4px 7px;
+          border-radius: 5px;
+          font-family: 'Sora', sans-serif;
+          font-size: 11px;
+          outline: none;
+          width: 100%;
+        }
+        input:focus, select:focus { border-color: var(--accent); }
+        input[type=number] { -moz-appearance: textfield; }
+        input[type=number]::-webkit-inner-spin-button { opacity: .3; }
+        .clear-btn {
+          align-self: flex-end;
+          background: #fef2f2; color: var(--red); border: 1px solid #fecaca;
+          padding: 4px 10px; border-radius: 5px; cursor: pointer;
+          font-size: 10px; font-family: 'Sora', sans-serif; transition: all .15s;
+          white-space: nowrap; flex-shrink: 0;
+        }
+        .clear-btn:hover { background: var(--red); color: #fff; }
+
+        /* Prev/Next — below controls, above chain */
+        .replay-nav-bar {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 14px;
+          background: rgba(99,102,241,0.04);
+          border-bottom: 2px solid var(--accent);
+          flex-shrink: 0;
+        }
+        .rnav-btn {
+          background: var(--bg2);
+          border: 1px solid var(--border2);
+          color: var(--muted);
+          padding: 5px 14px;
+          border-radius: 7px;
+          cursor: pointer;
+          font-size: 12px;
+          font-family: 'Sora', sans-serif;
+          transition: all .15s;
+          font-weight: 600;
+          white-space: nowrap;
+        }
+        .rnav-btn:hover { border-color: var(--purple); color: var(--purple); background: #f3f0ff; }
+        .rnav-btn.accent { background: rgba(99,102,241,0.08); border-color: rgba(99,102,241,0.4); color: var(--accent); }
+        .rnav-btn.accent:hover { background: var(--accent); color: #fff; }
+
         .mg-left-header {
-          padding: 7px 14px;
+          padding: 8px 16px;
           border-bottom: 1px solid var(--border);
           background: var(--bg1);
           flex-shrink: 0;
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 10px;
           flex-wrap: wrap;
         }
         .chain-scroll {
@@ -743,12 +799,12 @@ export default function OptionsSimulator() {
           padding: 3px 9px;
           border-radius: 100px;
           cursor: pointer;
-          font-family: inherit;
+          font-family: 'Sora', sans-serif;
           transition: all .15s;
           white-space: nowrap;
         }
         .exp-tab:hover { border-color: var(--accent); color: var(--accent); }
-        .exp-tab.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+        .exp-tab.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 500; }
 
         /* chain hint */
         .chain-hint {
@@ -795,8 +851,8 @@ export default function OptionsSimulator() {
         .cv:hover { color: #1d4ed8; background: rgba(37,99,235,0.10) !important; border-radius: 4px; }
         .pv { color: var(--put); cursor: pointer; transition: all .1s; user-select: none; padding: 4px 6px !important; }
         .pv:hover { color: #b91c1c; background: rgba(220,38,38,0.10) !important; border-radius: 4px; }
-        .atm-pill { display: inline-block; background: #dcfce7; color: var(--green); font-size: 8px; padding: 0 4px; border-radius: 3px; margin-right: 3px; font-family: inherit; font-weight: 500; }
-        .bs-btn { font-size: 9px; padding: 1px 5px; border-radius: 3px; border: none; cursor: pointer; font-family: inherit; font-weight: 600; letter-spacing: .3px; transition: all .15s; }
+        .atm-pill { display: inline-block; background: #dcfce7; color: var(--green); font-size: 8px; padding: 0 4px; border-radius: 3px; margin-right: 3px; font-family: 'Sora', sans-serif; font-weight: 500; }
+        .bs-btn { font-size: 9px; padding: 1px 5px; border-radius: 3px; border: none; cursor: pointer; font-family: 'Sora', sans-serif; font-weight: 600; letter-spacing: .3px; transition: all .15s; }
         .bs-buy-call { background: #f0fdf4; color: var(--green); border: 1px solid #bbf7d0; }
         .bs-buy-call:hover { background: var(--green); color: #fff; }
         .bs-sell-call { background: #fef2f2; color: var(--red); border: 1px solid #fecaca; }
@@ -811,164 +867,66 @@ export default function OptionsSimulator() {
         .added-x:hover { background: var(--red); color: #fff; }
         .iv-v { color: #b45309; } .dv { color: var(--accent2); } .tv { color: #c2410c; }
 
-        /* ════════════════════════════════
-           RIGHT PANEL — fixed top controls, scrollable analytics below
-           ════════════════════════════════ */
+        /* ── RIGHT: Scrollable payoff + analytics only ── */
         .mg-right {
           display: flex;
           flex-direction: column;
-          overflow: hidden;
-          background: var(--bg1);
-          min-height: 0;
-        }
-
-        /* Fixed top zone: sim controls + prev/next — does NOT scroll */
-        .right-fixed-top {
-          flex-shrink: 0;
-          background: var(--bg);
-          border-bottom: 2px solid var(--accent);
-        }
-
-        /* ── Sim Controls: ultra-compact grid ── */
-        .ctrl-section {
-          border-bottom: 1px solid var(--border);
-        }
-        .ctrl-section-hdr {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 6px 12px;
-          cursor: pointer;
-          user-select: none;
-          font-size: 10px;
-          font-weight: 600;
-          color: var(--muted);
-          text-transform: uppercase;
-          letter-spacing: .5px;
-          background: var(--bg1);
-          border-bottom: 1px solid var(--border);
-        }
-        .ctrl-section-hdr:hover { background: var(--bg2); }
-        .ctrl-grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 5px;
-          padding: 8px 12px 6px;
-        }
-        .ctrl-field { display: flex; flex-direction: column; gap: 2px; }
-        .ctrl-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
-        input, select {
-          background: var(--bg2);
-          border: 1px solid var(--border2);
-          color: var(--text);
-          padding: 4px 7px;
-          border-radius: 5px;
-          font-family: inherit;
-          font-size: 11.5px;
-          outline: none;
-          width: 100%;
-        }
-        input:focus, select:focus { border-color: var(--accent); }
-        input[type=number] { -moz-appearance: textfield; }
-        input[type=number]::-webkit-inner-spin-button { opacity: .3; }
-        .clear-btn {
-          background: #fef2f2; color: var(--red); border: 1px solid #fecaca;
-          padding: 4px 12px; border-radius: 6px; cursor: pointer;
-          font-size: 11px; font-family: inherit; transition: all .15s;
-          width: calc(100% - 24px); margin: 0 12px 8px;
-          display: block;
-        }
-        .clear-btn:hover { background: var(--red); color: #fff; }
-
-        /* ── Prev/Next — compact single row ── */
-        .replay-nav-bar {
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          padding: 6px 12px;
-          background: rgba(99,102,241,0.04);
-        }
-        .rnav-btn {
-          flex: 1;
-          background: var(--bg2);
-          border: 1px solid var(--border2);
-          color: var(--muted);
-          padding: 6px 8px;
-          border-radius: 7px;
-          cursor: pointer;
-          font-size: 12px;
-          font-family: inherit;
-          transition: all .15s;
-          text-align: center;
-          font-weight: 600;
-          white-space: nowrap;
-        }
-        .rnav-btn:hover { border-color: var(--purple); color: var(--purple); background: #f3f0ff; }
-        .rnav-btn.accent { background: rgba(99,102,241,0.08); border-color: rgba(99,102,241,0.4); color: var(--accent); }
-        .rnav-btn.accent:hover { background: var(--accent); color: #fff; }
-        .rnav-date-mtm {
-          flex: 1;
-          text-align: center;
-          line-height: 1.3;
-          min-width: 0;
-        }
-        .rnav-date { font-size: 9px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .4px; }
-        .rnav-mtm { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 700; margin-top: 1px; }
-
-        /* ── Status row — compact ── */
-        .status-row {
-          display: flex; gap: 8px; align-items: center; padding: 5px 12px;
-          background: var(--bg1); border-bottom: 1px solid var(--border);
-          flex-wrap: nowrap; font-size: 11px; flex-shrink: 0; overflow-x: auto;
-        }
-        .sb-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
-        .sb-item { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
-        .sb-lbl { color: var(--muted); font-size: 8.5px; text-transform: uppercase; letter-spacing: .4px; }
-
-        /* spot flash */
-        @keyframes spotFlash { 0%{background:rgba(99,102,241,0.18)} 100%{background:transparent} }
-        .spot-flash { animation: spotFlash 0.6s ease-out; }
-
-        /* ── Scrollable analytics section ── */
-        .right-scroll {
-          flex: 1;
           overflow-y: auto;
           overflow-x: hidden;
+          background: var(--bg1);
           min-height: 0;
         }
-        .right-content { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+
+        /* Positions summary pill bar at top of right */
+        .pos-summary-bar {
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          padding: 7px 14px;
+          background: var(--bg);
+          border-bottom: 1px solid var(--border);
+          flex-wrap: wrap;
+          flex-shrink: 0;
+        }
+
+        /* status row — REMOVED (moved to left) */
+        @keyframes spotFlash { 0%{background:rgba(99,102,241,0.2)} 100%{background:transparent} }
+        .spot-flash { animation: spotFlash 0.6s ease-out; }
+
+        /* right scrollable content */
+        .right-content { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
 
         /* panels */
-        .panel { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-        .panel-hdr { padding: 7px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        .panel-hdr-title { font-size: 10.5px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+        .panel { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+        .panel-hdr { padding: 9px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .panel-hdr-title { font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
 
-        .pos-item { display: flex; align-items: flex-start; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; }
-        .qty-btn { background: var(--bg1); border: 1px solid var(--border2); color: var(--text); width: 18px; height: 18px; border-radius: 3px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; }
+        .pos-item { display: flex; align-items: flex-start; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; }
+        .qty-btn { background: var(--bg1); border: 1px solid var(--border2); color: var(--text); width: 20px; height: 20px; border-radius: 4px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; }
         .qty-btn:hover { background: var(--bg3); }
-        .pos-rm { color: var(--muted2); cursor: pointer; font-size: 17px; line-height: 1; transition: color .15s; padding: 0 2px; background: none; border: none; }
+        .pos-rm { color: var(--muted2); cursor: pointer; font-size: 18px; line-height: 1; transition: color .15s; padding: 0 2px; background: none; border: none; }
         .pos-rm:hover { color: var(--red); }
 
         /* summary cards */
-        .sum-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-        .sum-card { background: var(--bg1); border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px; }
-        .sc-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 2px; }
-        .sc-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; }
+        .sum-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .sum-card { background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; }
+        .sc-label { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 3px; }
+        .sc-val { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; }
 
         /* strategy detect */
-        .sd-item { background: var(--bg1); border-radius: 5px; padding: 6px 8px; border: 1px solid var(--border); }
-        .sd-ilabel { font-size: 9px; color: var(--muted); margin-bottom: 2px; }
-        .sd-ival { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-weight: 500; }
+        .sd-item { background: var(--bg1); border-radius: 6px; padding: 7px 10px; border: 1px solid var(--border); }
+        .sd-ilabel { font-size: 9.5px; color: var(--muted); margin-bottom: 2px; }
+        .sd-ival { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; }
 
         /* greeks */
-        .gk { background: var(--bg1); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; }
-        .gk-sym { font-family: Georgia, serif; font-size: 12px; color: var(--purple); margin-right: 2px; }
-        .gk-name { font-size: 9px; color: var(--muted); margin-bottom: 2px; }
-        .gk-val { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 500; }
-        .gk-hint { font-size: 8.5px; color: var(--muted2); margin-top: 2px; line-height: 1.3; }
+        .gk { background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+        .gk-sym { font-family: Georgia, serif; font-size: 13px; color: var(--purple); margin-right: 3px; }
+        .gk-name { font-size: 9.5px; color: var(--muted); margin-bottom: 3px; }
+        .gk-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; }
+        .gk-hint { font-size: 9px; color: var(--muted2); margin-top: 3px; line-height: 1.3; }
 
         /* chart tabs */
-        .vtab { background: transparent; border: 1px solid var(--border2); color: var(--muted); font-size: 10px; padding: 3px 10px; border-radius: 100px; cursor: pointer; font-family: inherit; transition: all .15s; }
+        .vtab { background: transparent; border: 1px solid var(--border2); color: var(--muted); font-size: 10px; padding: 4px 11px; border-radius: 100px; cursor: pointer; font-family: 'Sora', sans-serif; transition: all .15s; }
         .vtab:hover { border-color: var(--accent); color: var(--accent); }
         .vtab.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); }
 
@@ -977,28 +935,23 @@ export default function OptionsSimulator() {
         .c-green { color: var(--green); } .c-red { color: var(--red); } .c-amber { color: var(--amber); }
         .c-blue { color: var(--blue); } .c-purple { color: var(--purple); } .c-muted { color: var(--muted); }
 
-        .chart-wrap { position: relative; height: 220px; transition: box-shadow .3s; }
-        .chart-wrap.flashing { box-shadow: 0 0 0 2px rgba(99,102,241,0.4); border-radius: 6px; }
+        .chart-wrap { position: relative; height: 280px; transition: box-shadow .3s; }
+        .chart-wrap.flashing { box-shadow: 0 0 0 2px rgba(99,102,241,0.4); border-radius: 8px; }
       `}</style>
 
-      {/* ══════ NAV — matches homepage exactly ══════ */}
+      {/* ══════ NAV — shared site navigation ══════ */}
       <nav className="mg-nav">
         <Link href="/" className="mg-logo">
-          <span>Market</span><span>Greeks</span>
+          <span>market</span><span>greeks</span>
         </Link>
         <div className="nav-links">
           <Link href="/" className="nav-link">Home</Link>
-          <Link href="/options" className="nav-link active">Options</Link>
           <Link href="/screener" className="nav-link">Screener</Link>
-          <Link href="/backtest" className="nav-link">Backtest</Link>
-          <Link href="/ipo" className="nav-link">IPO</Link>
-          <Link href="/virtual-trade" className="nav-link">Virtual Trade</Link>
-          <Link href="/financial-calculators" className="nav-link">Financial Calculators</Link>
-          <Link href="/savings" className="nav-link">Savings</Link>
+          <Link href="/options" className="nav-link active">Options</Link>
           <Link href="/about" className="nav-link">About</Link>
-          <Link href="/contact" className="nav-link">Contact</Link>
         </div>
         <div className="nav-right">
+          <div className="mg-badge">OPTIONS SIMULATOR</div>
           {(["NIFTY", "BANKNIFTY"] as IndexKey[]).map(idx => (
             <button key={idx} onClick={() => switchIndex(idx)} className={`idx-btn ${currentIndex === idx ? "active" : ""}`}>
               {CFG[idx].label} <span style={{ fontSize: 9, opacity: .6 }}>Lot {CFG[idx].lot}</span>
@@ -1008,15 +961,40 @@ export default function OptionsSimulator() {
             <span style={{ color: "var(--muted)", fontSize: 9, textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
             <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
           </div>
-          <Link href="/alerts" className="get-alerts-btn">✈ Get Alerts</Link>
         </div>
       </nav>
 
       {/* ══════ MAIN SPLIT ══════ */}
       <div className="mg-split">
 
-        {/* ════ LEFT: Option Chain only ════ */}
+        {/* ════ LEFT: Sim Controls (compact top) + Option Chain (fills rest) ════ */}
         <div className="mg-left">
+
+          {/* ── SIMULATION CONTROLS — compact strip at top of left panel ── */}
+          <SimCtrlPanel
+            replayDate={replayDate} setReplayDate={setReplayDate}
+            entryDate={entryDate} setEntryDate={setEntryDate}
+            replaySpot={replaySpot} setReplaySpot={setReplaySpot}
+            entrySpot={entrySpot} setEntrySpot={setEntrySpot}
+            replayVIX={replayVIX} setReplayVIX={setReplayVIX}
+            expiryDate={expiryDate} setExpiryDate={setExpiryDate}
+            rhoRate={rhoRate} setRhoRate={setRhoRate}
+            replayDateDisplay={replayDateDisplay}
+            onClear={() => setPositions([])}
+          />
+
+          {/* ── PREV / NEXT DAY ── */}
+          <div className="replay-nav-bar">
+            <button className="rnav-btn" onClick={() => stepReplay(-1)}>← Prev Day</button>
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>{replayDateDisplay}</div>
+              {analytics
+                ? <div className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 15, fontWeight: 700 }}>MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}</div>
+                : <div style={{ fontSize: 10, color: "var(--muted2)" }}>Add positions to simulate</div>}
+            </div>
+            <button className="rnav-btn accent" onClick={() => stepReplay(1)}>Next Day →</button>
+          </div>
+
           {/* Chain header + expiry tabs */}
           <div className="mg-left-header">
             <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Option Chain</span>
@@ -1128,161 +1106,71 @@ export default function OptionsSimulator() {
           </div>
         </div>
 
-        {/* ════ RIGHT: Fixed top (controls + prev/next) + Scrollable analytics below ════ */}
+        {/* ════ RIGHT: Payoff Chart + Analytics only ════ */}
         <div className="mg-right">
-
-          {/* ── FIXED TOP ZONE: never scrolls ── */}
-          <div className="right-fixed-top">
-
-            {/* 1. SIMULATION CONTROLS — collapsible */}
-            <SimCtrlPanel
-              replayDate={replayDate} setReplayDate={setReplayDate}
-              entryDate={entryDate} setEntryDate={setEntryDate}
-              replaySpot={replaySpot} setReplaySpot={setReplaySpot}
-              entrySpot={entrySpot} setEntrySpot={setEntrySpot}
-              replayVIX={replayVIX} setReplayVIX={setReplayVIX}
-              expiryDate={expiryDate} setExpiryDate={setExpiryDate}
-              rhoRate={rhoRate} setRhoRate={setRhoRate}
-              replayDateDisplay={replayDateDisplay}
-              onClear={() => setPositions([])}
-            />
-
-            {/* 2. PREV / NEXT DAY — always visible */}
-            <div className="replay-nav-bar">
-              <button className="rnav-btn" onClick={() => stepReplay(-1)}>← Prev</button>
-              <div className="rnav-date-mtm">
-                <div className="rnav-date">{replayDateDisplay}</div>
-                {analytics ? (
-                  <div className={`rnav-mtm ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`}>
-                    MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
-                  </div>
-                ) : (
-                  <div style={{ fontSize: 10, color: "var(--muted2)" }}>Add positions</div>
-                )}
-              </div>
-              <button className="rnav-btn accent" onClick={() => stepReplay(1)}>Next →</button>
-            </div>
-
-            {/* 3. STATUS BAR */}
-            <div className={`status-row ${spotFlash ? "spot-flash" : ""}`}>
-              {[
-                { label: "Index", val: CFG[currentIndex].label },
-                { label: "Entry", val: fmtN(entrySpot) },
-                { label: "Spot", val: fmtN(replaySpot), cls: replaySpot >= entrySpot ? "c-green" : "c-red" },
-                { label: "DTE", val: dteDisplay + "d", cls: "c-amber" },
-                { label: "Lot", val: CFG[currentIndex].lot + "u" },
-              ].map(({ label, val, cls }, i) => (
-                <React.Fragment key={label}>
-                  {i > 0 && <div className="sb-sep" />}
-                  <div className="sb-item">
-                    <div className="sb-lbl">{label}</div>
-                    <div className={`mono ${cls ?? ""}`} style={{ fontSize: 11.5, fontWeight: 600 }}>{val}</div>
-                  </div>
-                </React.Fragment>
-              ))}
-            </div>
-
-          </div>{/* end right-fixed-top */}
-
-          {/* ── SCROLLABLE ANALYTICS ZONE ── */}
-          <div className="right-scroll">
           <div className="right-content">
 
-            {/* POSITIONS */}
-            <div className="panel">
-              <div className="panel-hdr">
-                <span className="panel-hdr-title">Positions <span style={{ color: "var(--accent)", fontSize: 10 }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span></span>
-                {positions.length > 0 && <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: "auto" }}>Auto-expire on expiry date</span>}
+            {/* POSITIONS SUMMARY BAR */}
+            {positions.length > 0 && (
+              <div className="pos-summary-bar">
+                <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text)" }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span>
+                {positions.map(p => (
+                  <span key={p.id} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: p.dir === 1 ? "#f0fdf4" : "#fef2f2", color: p.dir === 1 ? "var(--green)" : "var(--red)", border: `1px solid ${p.dir === 1 ? "#bbf7d0" : "#fecaca"}` }}>
+                    {p.dir === 1 ? "B" : "S"} {p.K}{p.type} ×{p.lots}
+                  </span>
+                ))}
+                <button onClick={() => setPositions([])} style={{ marginLeft: "auto", fontSize: 10, background: "#fef2f2", color: "var(--red)", border: "1px solid #fecaca", borderRadius: 4, padding: "2px 8px", cursor: "pointer" }}>✕ Clear</button>
               </div>
-              {positions.length === 0 ? (
-                <div style={{ padding: 18, textAlign: "center", color: "var(--muted)", fontSize: 11, fontStyle: "italic" }}>
-                  No positions. Click Call/Put premiums or use BC/SC/BP/SP buttons on the left.
+            )}
+
+            {/* PAYOFF CHART */}
+            <div className="panel" style={{ padding: "12px 14px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
+                <div>
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>Payoff Chart</span>
+                  {analytics && (
+                    <span className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 14, fontWeight: 600, marginLeft: 12 }}>
+                      MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
+                    </span>
+                  )}
                 </div>
-              ) : (
-                positions.map((p) => {
-                  const isBuy = p.dir === 1;
-                  const curPrem = calcPremium(replaySpot, p.K, getDTE(p.legExpiryDate), p.type);
-                  const lot = cfg.lot;
-                  const mtm = (curPrem - p.entryPrem) * lot * p.lots * p.dir;
-                  const hedged = isHedged(p, positions);
-                  const legDTE = Math.max(0, Math.round(getDTE(p.legExpiryDate)));
-                  return (
-                    <div key={p.id} className="pos-item">
-                      <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1, minWidth: 0 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
-                          <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3, fontWeight: 600, letterSpacing: .3, background: isBuy ? "#f0fdf4" : "#fef2f2", color: isBuy ? "var(--green)" : "var(--red)", border: `1px solid ${isBuy ? "#bbf7d0" : "#fecaca"}` }}>
-                            {isBuy ? "BUY" : "SELL"}
-                          </span>
-                          <span className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{p.K}</span>
-                          <span style={{ color: p.type === "C" ? "var(--call)" : "var(--put)", fontSize: 11, fontWeight: 500 }}>{p.type === "C" ? "CE" : "PE"}</span>
-                          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                            <button className="qty-btn" onClick={() => changeLots(p.id, -1)}>−</button>
-                            <span className="mono" style={{ fontSize: 11, minWidth: 46, textAlign: "center" }}>{p.lots} lot{p.lots !== 1 ? "s" : ""}</span>
-                            <button className="qty-btn" onClick={() => changeLots(p.id, 1)}>+</button>
-                          </div>
-                          <span className="mono" style={{ color: "var(--amber)" }}>@{p.entryPrem.toFixed(2)}</span>
-                          <span className={`mono ${mtm >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 11 }}>
-                            {mtm >= 0 ? "+" : ""}{fmtP(mtm)}
-                          </span>
-                          {hedged && !isBuy && (
-                            <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "#eff6ff", color: "var(--blue)", border: "1px solid #bfdbfe" }}>Hedged</span>
-                          )}
-                          <button className="pos-rm" style={{ marginLeft: "auto" }} onClick={() => removePosIdx(p.id)}>×</button>
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
-                          <span style={{ fontSize: 9, color: "var(--muted)" }}>Expiry:</span>
-                          {exps.map((e) => (
-                            <button key={e.date}
-                              onClick={() => changeExpiryForPos(p.id, e)}
-                              style={{
-                                fontSize: 8.5, padding: "1px 6px", borderRadius: 3, cursor: "pointer",
-                                background: p.legExpiryDate === e.date ? "rgba(99,102,241,0.12)" : "var(--bg1)",
-                                border: `1px solid ${p.legExpiryDate === e.date ? "var(--accent)" : "var(--border2)"}`,
-                                color: p.legExpiryDate === e.date ? "var(--accent)" : "var(--muted)",
-                                fontFamily: "'Sora', sans-serif",
-                                fontWeight: p.legExpiryDate === e.date ? 600 : 400,
-                              }}>{e.label}</button>
-                          ))}
-                          <span style={{ fontSize: 9, color: legDTE <= 3 ? "var(--red)" : legDTE <= 7 ? "var(--amber)" : "var(--muted)" }}>
-                            {legDTE}d left
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })
+                <div style={{ display: "flex", gap: 5 }}>
+                  <button className={`vtab ${chartView === "expiry" ? "active" : ""}`} onClick={() => setChartView("expiry")}>At Expiry</button>
+                  <button className={`vtab ${chartView === "mtm" ? "active" : ""}`} onClick={() => setChartView("mtm")}>MTM Now</button>
+                </div>
+              </div>
+              <div className={`chart-wrap ${spotFlash ? "flashing" : ""}`}>
+                <canvas ref={canvasRef} role="img" aria-label="Options payoff P&L chart" />
+              </div>
+              {analytics && analytics.bes.length > 0 && (
+                <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {analytics.bes.map(be => {
+                    const dist = Math.abs(be - replaySpot);
+                    const distPct = ((dist / replaySpot) * 100).toFixed(1);
+                    const above = be > replaySpot;
+                    return (
+                      <span key={be} style={{ fontSize: 10, background: "#fffbeb", color: "var(--amber)", border: "1px solid #fde68a", borderRadius: 4, padding: "2px 8px" }}>
+                        BE: {fmtN(be)} &nbsp;<span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot</span>
+                      </span>
+                    );
+                  })}
+                </div>
               )}
-              {positions.length > 0 && (() => {
-                let netPrem = 0, totalMargin = 0;
-                positions.forEach(p => {
-                  const notional = p.entryPrem * cfg.lot * p.lots;
-                  const hedged = isHedged(p, positions);
-                  const m = p.dir === 1 ? notional : hedged ? cfg.span * p.lots * 0.25 : cfg.span * p.lots;
-                  netPrem += p.dir === 1 ? -notional : notional;
-                  totalMargin += m;
-                });
-                return (
-                  <div style={{ background: "var(--bg1)", borderTop: "1px solid var(--border)", padding: "8px 12px", fontSize: 11 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
-                      <span style={{ color: "var(--muted)" }}>Premium {netPrem >= 0 ? "Collected" : "Paid"}</span>
-                      <span className="mono">{fmtP(netPrem)}</span>
-                    </div>
-                    <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
-                      <span style={{ color: "var(--muted)" }}>Approx Margin Required</span>
-                      <span className="mono" style={{ color: "var(--amber)", fontWeight: 500 }}>{fmtP(totalMargin)}</span>
-                    </div>
-                  </div>
-                );
-              })()}
+              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 10, color: "var(--muted)", flexWrap: "wrap" }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--green)", display: "inline-block", borderRadius: 1 }} />Profit</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--red)", display: "inline-block", borderRadius: 1 }} />Loss</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 1, background: "var(--amber)", display: "inline-block" }} />Breakeven</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--accent)", display: "inline-block" }} />Spot</span>
+              </div>
             </div>
 
             {/* ANALYTICS CARDS */}
             <div className="sum-grid">
               {[
                 { label: "Max Profit", val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
-                { label: "Max Loss", val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
+                { label: "Max Loss",   val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
                 { label: "Breakeven(s)", val: analytics?.bes.length ? analytics.bes.join(" / ") : "—", cls: "" },
-                { label: "POP", val: analytics?.popPct ?? "—", cls: "c-blue" },
+                { label: "POP",        val: analytics?.popPct ?? "—", cls: "c-blue" },
               ].map(({ label, val, cls }) => (
                 <div key={label} className="sum-card">
                   <div className="sc-label">{label}</div>
@@ -1299,12 +1187,12 @@ export default function OptionsSimulator() {
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                 {[
-                  { label: "Max Profit", val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
-                  { label: "Max Loss", val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
-                  { label: "Risk : Reward", val: analytics?.rr ?? "—", cls: "" },
-                  { label: "MTM P&L Now", val: analytics ? (analytics.mtmPnl >= 0 ? "+" : "") + fmtP(analytics.mtmPnl) : "—", cls: analytics ? (analytics.mtmPnl >= 0 ? "c-green" : "c-red") : "" },
+                  { label: "Max Profit",   val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
+                  { label: "Max Loss",     val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
+                  { label: "Risk:Reward",  val: analytics?.rr ?? "—", cls: "" },
+                  { label: "MTM P&L Now",  val: analytics ? (analytics.mtmPnl >= 0 ? "+" : "") + fmtP(analytics.mtmPnl) : "—", cls: analytics ? (analytics.mtmPnl >= 0 ? "c-green" : "c-red") : "" },
                   { label: "Breakeven(s)", val: analytics?.bes.length ? analytics.bes.join(" / ") : "No crossover", cls: "" },
-                  { label: "POP", val: analytics?.popPct ?? "—", cls: "c-blue" },
+                  { label: "POP",          val: analytics?.popPct ?? "—", cls: "c-blue" },
                 ].map(({ label, val, cls }) => (
                   <div key={label} className="sd-item">
                     <div className="sd-ilabel">{label}</div>
@@ -1337,50 +1225,7 @@ export default function OptionsSimulator() {
               </div>
             </div>
 
-            {/* PAYOFF CHART */}
-            <div className="panel" style={{ padding: "12px 14px" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
-                <div>
-                  <span style={{ fontSize: 12, fontWeight: 600 }}>Payoff Chart</span>
-                  {analytics && (
-                    <span className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 14, fontWeight: 600, marginLeft: 12 }}>
-                      MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
-                    </span>
-                  )}
-                </div>
-                <div style={{ display: "flex", gap: 5 }}>
-                  <button className={`vtab ${chartView === "expiry" ? "active" : ""}`} onClick={() => setChartView("expiry")}>At Expiry</button>
-                  <button className={`vtab ${chartView === "mtm" ? "active" : ""}`} onClick={() => setChartView("mtm")}>MTM Now</button>
-                </div>
-              </div>
-              <div className={`chart-wrap ${spotFlash ? "flashing" : ""}`}>
-                <canvas ref={canvasRef} role="img" aria-label="Options payoff P&L chart" />
-              </div>
-              {analytics && analytics.bes.length > 0 && (
-                <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  {analytics.bes.map(be => {
-                    const dist = Math.abs(be - replaySpot);
-                    const distPct = ((dist / replaySpot) * 100).toFixed(1);
-                    const above = be > replaySpot;
-                    return (
-                      <span key={be} style={{ fontSize: 10, background: "#fffbeb", color: "var(--amber)", border: "1px solid #fde68a", borderRadius: 4, padding: "2px 8px" }}>
-                        BE: {fmtN(be)} &nbsp;
-                        <span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot &nbsp;({fmtN(dist)} pts away)</span>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
-              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 10, color: "var(--muted)", flexWrap: "wrap" }}>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--green)", display: "inline-block", borderRadius: 1 }} />Profit</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--red)", display: "inline-block", borderRadius: 1 }} />Loss</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 1, background: "var(--amber)", display: "inline-block" }} />Breakeven</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--accent)", display: "inline-block" }} />Spot @ {replayDateDisplay}</span>
-              </div>
-            </div>
-
           </div>{/* end right-content */}
-          </div>{/* end right-scroll */}
         </div>{/* end mg-right */}
 
       </div>{/* end mg-split */}
