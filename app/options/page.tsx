@@ -306,67 +306,6 @@ function detectStrat(positions: Position[]): StratResult {
 
 let posIdCounter = 1;
 
-// ── Simulation Controls sub-component (lives in left panel) ──
-interface SimControlsProps {
-  replayDate: string; setReplayDate: (v: string) => void;
-  entryDate: string; setEntryDate: (v: string) => void;
-  replaySpot: number; setReplaySpot: (v: number) => void;
-  entrySpot: number; setEntrySpot: (v: number) => void;
-  replayVIX: number; setReplayVIX: (v: number) => void;
-  expiryDate: string; setExpiryDate: (v: string) => void;
-  rhoRate: number; setRhoRate: (v: number) => void;
-  replayDateDisplay: string;
-  onClear: () => void;
-}
-function SimControls({ replayDate, setReplayDate, entryDate, setEntryDate, replaySpot, setReplaySpot, entrySpot, setEntrySpot, replayVIX, setReplayVIX, expiryDate, setExpiryDate, rhoRate, setRhoRate, replayDateDisplay, onClear }: SimControlsProps) {
-  const [open, setOpen] = React.useState(true);
-  return (
-    <div className="sim-ctrl-section">
-      <div className="sim-ctrl-toggle" onClick={() => setOpen(o => !o)}>
-        <span>⚙ Simulation Controls</span>
-        <span style={{ fontSize: 13 }}>{open ? "▲" : "▼"}</span>
-      </div>
-      {open && (
-        <div className="sim-ctrl-body">
-          <div className="sim-ctrl-grid">
-            <div className="ctrl-field">
-              <span className="ctrl-label">Replay Date</span>
-              <input type="date" value={replayDate} onChange={e => setReplayDate(e.target.value)} />
-            </div>
-            <div className="ctrl-field">
-              <span className="ctrl-label">Entry Date</span>
-              <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} />
-            </div>
-            <div className="ctrl-field">
-              <span className="ctrl-label">Spot @ {replayDateDisplay}</span>
-              <input type="number" value={replaySpot} onChange={e => setReplaySpot(+e.target.value)} />
-            </div>
-            <div className="ctrl-field">
-              <span className="ctrl-label">Entry Spot</span>
-              <input type="number" value={entrySpot} onChange={e => setEntrySpot(+e.target.value)} />
-            </div>
-            <div className="ctrl-field">
-              <span className="ctrl-label">VIX / IV%</span>
-              <input type="number" value={replayVIX} step={0.1} onChange={e => setReplayVIX(+e.target.value)} />
-            </div>
-            <div className="ctrl-field">
-              <span className="ctrl-label">Expiry Date</span>
-              <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} />
-            </div>
-            <div className="ctrl-field">
-              <span className="ctrl-label">Rate % (ρ)</span>
-              <input type="number" value={rhoRate} step={0.1} min={0} max={20} onChange={e => setRhoRate(+e.target.value)} />
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-            <button className="clear-btn" onClick={onClear}>✕ Clear All</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 export default function OptionsSimulator() {
   const [currentIndex, setCurrentIndex] = useState<IndexKey>("NIFTY");
   const [selectedExp, setSelectedExp] = useState(0);
@@ -640,7 +579,6 @@ export default function OptionsSimulator() {
           background: var(--bg);
           color: var(--text);
           font-family: 'Sora', sans-serif;
-          min-height: 100vh;
           font-size: 13px;
           display: flex;
           flex-direction: column;
@@ -652,49 +590,52 @@ export default function OptionsSimulator() {
         .mg-nav {
           display: flex;
           align-items: center;
-          gap: 10px;
-          padding: 0 20px;
+          gap: 0;
+          padding: 0 24px;
           height: 52px;
           border-bottom: 1px solid var(--border);
           background: #ffffff;
           flex-shrink: 0;
-          flex-wrap: nowrap;
-          overflow-x: auto;
         }
         .mg-logo {
           font-size: 18px;
           font-weight: 700;
           letter-spacing: -0.5px;
-          margin-right: 4px;
           text-decoration: none;
           display: flex;
           align-items: center;
-          gap: 0;
-          flex-shrink: 0;
+          margin-right: 24px;
         }
         .mg-logo span:first-child { color: var(--accent); }
         .mg-logo span:last-child { color: var(--accent2); }
         .nav-links {
           display: flex;
           align-items: center;
-          gap: 2px;
-          margin-left: 8px;
-          flex-shrink: 0;
+          height: 100%;
+          gap: 0;
         }
         .nav-link {
-          font-size: 12px;
+          font-size: 13px;
           font-weight: 400;
           color: var(--muted);
           text-decoration: none;
-          padding: 5px 12px;
-          border-radius: 6px;
+          padding: 0 16px;
+          height: 52px;
+          display: flex;
+          align-items: center;
+          border-bottom: 2px solid transparent;
           transition: all .15s;
           font-family: 'Sora', sans-serif;
           white-space: nowrap;
         }
-        .nav-link:hover { color: var(--accent); background: rgba(99,102,241,0.06); }
-        .nav-link.active { color: var(--accent); background: rgba(99,102,241,0.10); font-weight: 500; }
-        .nav-divider { width: 1px; height: 20px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
+        .nav-link:hover { color: var(--accent); border-bottom-color: rgba(99,102,241,0.3); }
+        .nav-link.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+        .nav-right {
+          margin-left: auto;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
         .mg-badge {
           background: rgba(99,102,241,0.10);
           color: var(--accent);
@@ -720,7 +661,6 @@ export default function OptionsSimulator() {
         .idx-btn:hover { border-color: var(--accent); color: var(--accent); }
         .idx-btn.active { background: rgba(99,102,241,0.12); border-color: var(--accent); color: var(--accent); font-weight: 500; }
         .vix-pill {
-          margin-left: auto;
           display: flex;
           align-items: center;
           gap: 8px;
@@ -734,17 +674,17 @@ export default function OptionsSimulator() {
         /* ── SPLIT LAYOUT ── */
         .mg-split {
           display: grid;
-          grid-template-columns: 1fr 420px;
+          grid-template-columns: 1fr 460px;
           flex: 1;
           overflow: hidden;
           min-height: 0;
         }
 
-        /* ── LEFT PANEL (Option Chain) ── */
+        /* ── LEFT: Option Chain only ── */
         .mg-left {
           display: flex;
           flex-direction: column;
-          border-right: 1px solid var(--border);
+          border-right: 2px solid var(--border);
           overflow: hidden;
           min-height: 0;
         }
@@ -825,159 +765,149 @@ export default function OptionsSimulator() {
         .pv:hover { color: #b91c1c; background: rgba(220,38,38,0.10) !important; border-radius: 4px; }
         .atm-pill { display: inline-block; background: #dcfce7; color: var(--green); font-size: 8px; padding: 0 4px; border-radius: 3px; margin-right: 3px; font-family: 'Sora', sans-serif; font-weight: 500; }
         .bs-btn { font-size: 9px; padding: 1px 5px; border-radius: 3px; border: none; cursor: pointer; font-family: 'Sora', sans-serif; font-weight: 600; letter-spacing: .3px; transition: all .15s; }
-        .bs-buy { background: #f0fdf4; color: var(--green); border: 1px solid #bbf7d0; }
-        .bs-buy:hover { background: var(--green); color: #fff; }
-        .bs-sell { background: #fef2f2; color: var(--red); border: 1px solid #fecaca; }
-        .bs-sell:hover { background: var(--red); color: #fff; }
         .bs-buy-call { background: #f0fdf4; color: var(--green); border: 1px solid #bbf7d0; }
-        .bs-buy-call:hover { background: var(--green); color: #fff; box-shadow: 0 0 0 2px rgba(22,163,74,0.3); }
+        .bs-buy-call:hover { background: var(--green); color: #fff; }
         .bs-sell-call { background: #fef2f2; color: var(--red); border: 1px solid #fecaca; }
-        .bs-sell-call:hover { background: var(--red); color: #fff; box-shadow: 0 0 0 2px rgba(220,38,38,0.3); }
+        .bs-sell-call:hover { background: var(--red); color: #fff; }
         .bs-buy-put { background: #eff6ff; color: var(--blue); border: 1px solid #bfdbfe; }
-        .bs-buy-put:hover { background: var(--blue); color: #fff; box-shadow: 0 0 0 2px rgba(37,99,235,0.3); }
+        .bs-buy-put:hover { background: var(--blue); color: #fff; }
         .bs-sell-put { background: #faf5ff; color: var(--purple); border: 1px solid #ddd6fe; }
-        .bs-sell-put:hover { background: var(--purple); color: #fff; box-shadow: 0 0 0 2px rgba(124,58,237,0.3); }
+        .bs-sell-put:hover { background: var(--purple); color: #fff; }
         .strike-cell-inner { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 90px; }
         .strike-bs-row { display: flex; gap: 3px; margin-top: 1px; }
         .added-x { display: inline-block; background: #fef2f2; color: var(--red); font-size: 8px; padding: 1px 4px; border-radius: 3px; margin-left: 3px; cursor: pointer; vertical-align: middle; border: 1px solid #fecaca; }
         .added-x:hover { background: var(--red); color: #fff; }
-        .iv-v { color: #b45309; } .dv { color: var(--accent2); } .gv { color: var(--purple); } .tv { color: #c2410c; }
+        .iv-v { color: #b45309; } .dv { color: var(--accent2); } .tv { color: #c2410c; }
 
-        /* ── RIGHT PANEL ── */
+        /* ── RIGHT: Scrollable panel with controls + payoff ── */
         .mg-right {
           display: flex;
           flex-direction: column;
           overflow-y: auto;
+          overflow-x: hidden;
           background: var(--bg1);
           min-height: 0;
         }
 
-        /* controls panel */
-        .ctrl-panel {
-          padding: 14px 16px;
+        /* Sim controls section */
+        .ctrl-section {
+          background: var(--bg);
           border-bottom: 1px solid var(--border);
-          background: var(--bg1);
           flex-shrink: 0;
         }
+        .ctrl-section-hdr {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 8px 16px;
+          cursor: pointer;
+          user-select: none;
+          font-size: 10px;
+          font-weight: 600;
+          color: var(--muted);
+          text-transform: uppercase;
+          letter-spacing: .5px;
+          border-bottom: 1px solid var(--border);
+        }
+        .ctrl-section-hdr:hover { background: var(--bg1); }
         .ctrl-grid {
           display: grid;
           grid-template-columns: 1fr 1fr;
           gap: 8px;
-          margin-bottom: 10px;
+          padding: 12px 16px 8px;
         }
-        .ctrl-field {
-          display: flex;
-          flex-direction: column;
-          gap: 3px;
-        }
-        .ctrl-label {
-          font-size: 9.5px;
-          color: var(--muted);
-          text-transform: uppercase;
-          letter-spacing: .5px;
-        }
+        .ctrl-field { display: flex; flex-direction: column; gap: 3px; }
+        .ctrl-label { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
         input, select {
           background: var(--bg2);
           border: 1px solid var(--border2);
           color: var(--text);
-          padding: 5px 9px;
+          padding: 6px 9px;
           border-radius: 6px;
           font-family: 'Sora', sans-serif;
           font-size: 12px;
           outline: none;
-          color-scheme: dark;
           width: 100%;
         }
         input:focus, select:focus { border-color: var(--accent); }
         input[type=number] { -moz-appearance: textfield; }
         input[type=number]::-webkit-inner-spin-button { opacity: .3; }
 
-        /* replay nav */
-        .replay-nav {
+        /* Replay nav — lives in right panel */
+        .replay-nav-bar {
           display: flex;
-          gap: 6px;
           align-items: center;
+          gap: 8px;
+          padding: 10px 16px;
+          background: rgba(99,102,241,0.04);
+          border-bottom: 2px solid var(--accent);
+          flex-shrink: 0;
         }
         .rnav-btn {
           flex: 1;
           background: var(--bg2);
           border: 1px solid var(--border2);
           color: var(--muted);
-          padding: 7px 12px;
-          border-radius: 7px;
+          padding: 8px 12px;
+          border-radius: 8px;
           cursor: pointer;
-          font-size: 12px;
+          font-size: 13px;
           font-family: 'Sora', sans-serif;
           transition: all .15s;
           text-align: center;
-          font-weight: 500;
+          font-weight: 600;
         }
         .rnav-btn:hover { border-color: var(--purple); color: var(--purple); background: #f3f0ff; }
         .rnav-btn.accent { background: rgba(99,102,241,0.08); border-color: rgba(99,102,241,0.4); color: var(--accent); }
         .rnav-btn.accent:hover { background: var(--accent); color: #fff; }
         .clear-btn {
-          background: #fef2f2;
-          color: var(--red);
-          border: 1px solid #fecaca;
-          padding: 7px 12px;
-          border-radius: 7px;
-          cursor: pointer;
-          font-size: 12px;
-          font-family: 'Sora', sans-serif;
-          transition: all .15s;
+          background: #fef2f2; color: var(--red); border: 1px solid #fecaca;
+          padding: 6px 14px; border-radius: 7px; cursor: pointer;
+          font-size: 12px; font-family: 'Sora', sans-serif; transition: all .15s; width: 100%; margin: 0 16px 12px; width: calc(100% - 32px);
         }
         .clear-btn:hover { background: var(--red); color: #fff; }
 
         /* status row */
         .status-row {
-          display: flex;
-          gap: 10px;
-          align-items: center;
-          padding: 8px 16px;
-          background: #f0f2f7;
-          border-bottom: 1px solid var(--border);
-          flex-wrap: wrap;
-          font-size: 11px;
-          flex-shrink: 0;
+          display: flex; gap: 10px; align-items: center; padding: 8px 16px;
+          background: #f0f2f7; border-bottom: 1px solid var(--border);
+          flex-wrap: wrap; font-size: 11px; flex-shrink: 0;
         }
         .sb-sep { width: 1px; height: 24px; background: var(--border); }
         .sb-item { display: flex; flex-direction: column; gap: 1px; }
         .sb-lbl { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .4px; }
 
         /* spot flash */
-        @keyframes spotFlash {
-          0% { background: rgba(99,102,241,0.2); }
-          100% { background: transparent; }
-        }
+        @keyframes spotFlash { 0%{background:rgba(99,102,241,0.2)} 100%{background:transparent} }
         .spot-flash { animation: spotFlash 0.6s ease-out; }
 
-        /* right content */
-        .right-content { padding: 12px 16px; display: flex; flex-direction: column; gap: 12px; }
+        /* right scrollable content */
+        .right-content { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
 
-        /* positions */
-        .panel { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+        /* panels */
+        .panel { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
         .panel-hdr { padding: 9px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         .panel-hdr-title { font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
 
         .pos-item { display: flex; align-items: flex-start; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; }
-        .qty-btn { background: var(--bg); border: 1px solid var(--border2); color: var(--text); width: 20px; height: 20px; border-radius: 4px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; }
+        .qty-btn { background: var(--bg1); border: 1px solid var(--border2); color: var(--text); width: 20px; height: 20px; border-radius: 4px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; }
         .qty-btn:hover { background: var(--bg3); }
-        .pos-rm { color: var(--muted2); cursor: pointer; font-size: 18px; line-height: 1; transition: color .15s; padding: 0 2px; }
+        .pos-rm { color: var(--muted2); cursor: pointer; font-size: 18px; line-height: 1; transition: color .15s; padding: 0 2px; background: none; border: none; }
         .pos-rm:hover { color: var(--red); }
 
         /* summary cards */
         .sum-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        .sum-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; }
+        .sum-card { background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; }
         .sc-label { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 3px; }
         .sc-val { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; }
 
         /* strategy detect */
-        .sd-item { background: var(--bg2); border-radius: 6px; padding: 7px 10px; border: 1px solid var(--border); }
+        .sd-item { background: var(--bg1); border-radius: 6px; padding: 7px 10px; border: 1px solid var(--border); }
         .sd-ilabel { font-size: 9.5px; color: var(--muted); margin-bottom: 2px; }
         .sd-ival { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; }
 
         /* greeks */
-        .gk { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+        .gk { background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
         .gk-sym { font-family: Georgia, serif; font-size: 13px; color: var(--purple); margin-right: 3px; }
         .gk-name { font-size: 9.5px; color: var(--muted); margin-bottom: 3px; }
         .gk-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; }
@@ -993,53 +923,11 @@ export default function OptionsSimulator() {
         .c-green { color: var(--green); } .c-red { color: var(--red); } .c-amber { color: var(--amber); }
         .c-blue { color: var(--blue); } .c-purple { color: var(--purple); } .c-muted { color: var(--muted); }
 
-        /* spot flash on chart when stepping */
-        .chart-wrap { position: relative; height: 300px; transition: box-shadow .3s; }
+        .chart-wrap { position: relative; height: 280px; transition: box-shadow .3s; }
         .chart-wrap.flashing { box-shadow: 0 0 0 2px rgba(99,102,241,0.4); border-radius: 8px; }
-
-        /* sim controls in left panel */
-        .sim-ctrl-section {
-          background: var(--bg1);
-          border-bottom: 1px solid var(--border);
-          flex-shrink: 0;
-        }
-        .sim-ctrl-toggle {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 7px 14px;
-          cursor: pointer;
-          user-select: none;
-          border-bottom: 1px solid var(--border);
-          font-size: 10px;
-          font-weight: 600;
-          color: var(--muted);
-          text-transform: uppercase;
-          letter-spacing: .5px;
-        }
-        .sim-ctrl-toggle:hover { background: var(--bg2); }
-        .sim-ctrl-body {
-          padding: 10px 14px;
-        }
-        .sim-ctrl-grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 7px;
-          margin-bottom: 8px;
-        }
-
-        /* right panel — only payoff/analytics */
-        .right-payoff-panel {
-          display: flex;
-          flex-direction: column;
-          overflow-y: auto;
-          background: var(--bg1);
-          min-height: 0;
-        }
-        .payoff-content { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
       `}</style>
 
-      {/* ── NAV ── */}
+      {/* ══════ NAV — shared site navigation ══════ */}
       <nav className="mg-nav">
         <Link href="/" className="mg-logo">
           <span>market</span><span>greeks</span>
@@ -1050,24 +938,26 @@ export default function OptionsSimulator() {
           <Link href="/options" className="nav-link active">Options</Link>
           <Link href="/about" className="nav-link">About</Link>
         </div>
-        <div className="nav-divider" />
-        <div className="mg-badge">OPTIONS SIMULATOR</div>
-        {(["NIFTY", "BANKNIFTY"] as IndexKey[]).map(idx => (
-          <button key={idx} onClick={() => switchIndex(idx)} className={`idx-btn ${currentIndex === idx ? "active" : ""}`}>
-            {CFG[idx].label} <span style={{ fontSize: 9, opacity: .6 }}>Lot {CFG[idx].lot}</span>
-          </button>
-        ))}
-        <div className="vix-pill" style={{ marginLeft: "auto" }}>
-          <span style={{ color: "var(--muted)", fontSize: 9, textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
-          <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
+        <div className="nav-right">
+          <div className="mg-badge">OPTIONS SIMULATOR</div>
+          {(["NIFTY", "BANKNIFTY"] as IndexKey[]).map(idx => (
+            <button key={idx} onClick={() => switchIndex(idx)} className={`idx-btn ${currentIndex === idx ? "active" : ""}`}>
+              {CFG[idx].label} <span style={{ fontSize: 9, opacity: .6 }}>Lot {CFG[idx].lot}</span>
+            </button>
+          ))}
+          <div className="vix-pill">
+            <span style={{ color: "var(--muted)", fontSize: 9, textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
+            <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
+          </div>
         </div>
       </nav>
 
-      {/* ── SPLIT ── */}
+      {/* ══════ MAIN SPLIT ══════ */}
       <div className="mg-split">
 
-        {/* ════ LEFT: OPTION CHAIN + SIMULATION CONTROLS ════ */}
+        {/* ════ LEFT: Option Chain only ════ */}
         <div className="mg-left">
+          {/* Chain header + expiry tabs */}
           <div className="mg-left-header">
             <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Option Chain</span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg2)", border: "1px solid var(--border)", padding: "2px 8px", borderRadius: 100, fontSize: 10, color: "var(--muted)" }}>
@@ -1083,20 +973,7 @@ export default function OptionsSimulator() {
             <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted)", fontStyle: "italic" }}>±50 strikes from ATM</span>
           </div>
 
-          {/* ── SIMULATION CONTROLS (collapsible) ── */}
-          <SimControls
-            replayDate={replayDate} setReplayDate={setReplayDate}
-            entryDate={entryDate} setEntryDate={setEntryDate}
-            replaySpot={replaySpot} setReplaySpot={setReplaySpot}
-            entrySpot={entrySpot} setEntrySpot={setEntrySpot}
-            replayVIX={replayVIX} setReplayVIX={setReplayVIX}
-            expiryDate={expiryDate} setExpiryDate={setExpiryDate}
-            rhoRate={rhoRate} setRhoRate={setRhoRate}
-            replayDateDisplay={replayDateDisplay}
-            onClear={() => setPositions([])}
-          />
-
-          {/* Spot bar */}
+          {/* Live spot bar */}
           <div style={{ display: "flex", gap: 14, alignItems: "center", padding: "6px 14px", background: "var(--bg)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
             <span style={{ fontSize: 10, color: "var(--muted)" }}>Spot @ {replayDateDisplay}</span>
             <span className="mono" style={{ fontSize: 16, fontWeight: 500 }}>{fmtN(replaySpot)}</span>
@@ -1111,11 +988,12 @@ export default function OptionsSimulator() {
             <span>Left-click PUT = Buy &nbsp;|&nbsp; Right-click = Sell</span>
           </div>
 
+          {/* Scrollable chain table */}
           <div className="chain-scroll">
             <table className="ct">
               <thead>
                 <tr>
-                  <th className="call-h tc">Θ Theta</th>
+                  <th className="call-h tc">Θ</th>
                   <th className="call-h tc">Δ Delta</th>
                   <th className="call-h tc">IV%</th>
                   <th className="call-h tc" style={{ minWidth: 70 }}>Call LTP</th>
@@ -1123,7 +1001,7 @@ export default function OptionsSimulator() {
                   <th className="put-h tp" style={{ minWidth: 70 }}>Put LTP</th>
                   <th className="put-h tp">IV%</th>
                   <th className="put-h tp">Δ Delta</th>
-                  <th className="put-h tp">Θ Theta</th>
+                  <th className="put-h tp">Θ</th>
                 </tr>
               </thead>
               <tbody>
@@ -1154,9 +1032,7 @@ export default function OptionsSimulator() {
                         onClick={e => handleChainClick(K, "C", cp, e, 1)}
                         onContextMenu={e => handleChainClick(K, "C", cp, e, -1)}>
                         <b>{cp.toFixed(2)}</b>
-                        {(hasBuyC || hasSellC) && (
-                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "C"); }}>✕</span>
-                        )}
+                        {(hasBuyC || hasSellC) && <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "C"); }}>✕</span>}
                       </td>
                       <td className="td-strike">
                         <div className="strike-cell-inner">
@@ -1165,10 +1041,10 @@ export default function OptionsSimulator() {
                             <b>{K}</b>
                           </div>
                           <div className="strike-bs-row">
-                            <button className="bs-btn bs-buy bs-buy-call" onClick={() => addPos(K, "C", cp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Call">BC</button>
-                            <button className="bs-btn bs-sell bs-sell-call" onClick={() => addPos(K, "C", cp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Call">SC</button>
-                            <button className="bs-btn bs-buy-put" onClick={() => addPos(K, "P", pp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Put">BP</button>
-                            <button className="bs-btn bs-sell-put" onClick={() => addPos(K, "P", pp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Put">SP</button>
+                            <button className="bs-btn bs-buy-call" onClick={() => addPos(K, "C", cp, 1, currentExpiry.label, currentExpiry.date)}>BC</button>
+                            <button className="bs-btn bs-sell-call" onClick={() => addPos(K, "C", cp, -1, currentExpiry.label, currentExpiry.date)}>SC</button>
+                            <button className="bs-btn bs-buy-put" onClick={() => addPos(K, "P", pp, 1, currentExpiry.label, currentExpiry.date)}>BP</button>
+                            <button className="bs-btn bs-sell-put" onClick={() => addPos(K, "P", pp, -1, currentExpiry.label, currentExpiry.date)}>SP</button>
                           </div>
                         </div>
                       </td>
@@ -1176,9 +1052,7 @@ export default function OptionsSimulator() {
                         onClick={e => handleChainClick(K, "P", pp, e, 1)}
                         onContextMenu={e => handleChainClick(K, "P", pp, e, -1)}>
                         <b>{pp.toFixed(2)}</b>
-                        {(hasBuyP || hasSellP) && (
-                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "P"); }}>✕</span>
-                        )}
+                        {(hasBuyP || hasSellP) && <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "P"); }}>✕</span>}
                       </td>
                       <td className="tp iv-v">{cIV}</td>
                       <td className="tp dv">{pg.delta.toFixed(2)}</td>
@@ -1194,58 +1068,70 @@ export default function OptionsSimulator() {
           </div>
         </div>
 
-        {/* ════ RIGHT: REPLAY NAV + PAYOFF / MTM / ANALYTICS ════ */}
-        <div className="right-payoff-panel">
+        {/* ════ RIGHT: Simulation Controls + Prev/Next + Payoff + Analytics ════
+              This entire panel scrolls. Controls at top, Prev/Next visible, then charts below. */}
+        <div className="mg-right">
 
-          {/* ── REPLAY DAY NAV (sticky top) ── */}
-          <div style={{ padding: "10px 16px", borderBottom: "2px solid var(--accent)", background: "rgba(99,102,241,0.04)", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }}>
-            <button className="rnav-btn" style={{ flex: "0 0 auto", padding: "8px 18px", fontWeight: 600, fontSize: 13 }} onClick={() => stepReplay(-1)}>← Prev Day</button>
-            <div style={{ flex: 1, textAlign: "center" }}>
-              <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 500 }}>{replayDateDisplay}</div>
-              {analytics && (
-                <div className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 16, fontWeight: 700 }}>
+          {/* 1. SIMULATION CONTROLS — collapsible, at very top */}
+          <SimCtrlPanel
+            replayDate={replayDate} setReplayDate={setReplayDate}
+            entryDate={entryDate} setEntryDate={setEntryDate}
+            replaySpot={replaySpot} setReplaySpot={setReplaySpot}
+            entrySpot={entrySpot} setEntrySpot={setEntrySpot}
+            replayVIX={replayVIX} setReplayVIX={setReplayVIX}
+            expiryDate={expiryDate} setExpiryDate={setExpiryDate}
+            rhoRate={rhoRate} setRhoRate={setRhoRate}
+            replayDateDisplay={replayDateDisplay}
+            onClear={() => setPositions([])}
+          />
+
+          {/* 2. PREV / NEXT DAY — always visible below controls */}
+          <div className="replay-nav-bar">
+            <button className="rnav-btn" onClick={() => stepReplay(-1)}>← Prev Day</button>
+            <div style={{ flex: 1, textAlign: "center", lineHeight: 1.3 }}>
+              <div style={{ fontSize: 10, color: "var(--muted)", fontWeight: 500, textTransform: "uppercase", letterSpacing: .4 }}>{replayDateDisplay}</div>
+              {analytics ? (
+                <div className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 18, fontWeight: 700, marginTop: 1 }}>
                   MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
                 </div>
+              ) : (
+                <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 1 }}>Add positions to simulate</div>
               )}
             </div>
-            <button className="rnav-btn accent" style={{ flex: "0 0 auto", padding: "8px 18px", fontWeight: 600, fontSize: 13 }} onClick={() => stepReplay(1)}>Next Day →</button>
+            <button className="rnav-btn accent" onClick={() => stepReplay(1)}>Next Day →</button>
           </div>
 
-          {/* ── STATUS BAR ── */}
+          {/* 3. STATUS BAR */}
           <div className={`status-row ${spotFlash ? "spot-flash" : ""}`}>
             {[
-              { label: "Index", val: CFG[currentIndex].label, cls: "" },
-              { label: "Entry Spot", val: fmtN(entrySpot), cls: "" },
-              { label: `Spot @ ${replayDateDisplay}`, val: fmtN(replaySpot), cls: "" },
+              { label: "Index", val: CFG[currentIndex].label },
+              { label: "Entry Spot", val: fmtN(entrySpot) },
+              { label: `Spot Now`, val: fmtN(replaySpot), cls: replaySpot >= entrySpot ? "c-green" : "c-red" },
               { label: "DTE", val: dteDisplay + "d", cls: "c-amber" },
-              { label: "Lot Size", val: CFG[currentIndex].lot + " units", cls: "" },
+              { label: "Lot", val: CFG[currentIndex].lot + "u" },
             ].map(({ label, val, cls }, i) => (
               <React.Fragment key={label}>
                 {i > 0 && <div className="sb-sep" />}
                 <div className="sb-item">
                   <div className="sb-lbl">{label}</div>
-                  <div className={`mono ${cls}`} style={{ fontSize: 13, fontWeight: 500 }}>{val}</div>
+                  <div className={`mono ${cls ?? ""}`} style={{ fontSize: 12, fontWeight: 500 }}>{val}</div>
                 </div>
               </React.Fragment>
             ))}
           </div>
 
-          {/* ── RIGHT PAYOFF CONTENT ── */}
-          <div className="payoff-content">
+          {/* 4. SCROLLABLE PAYOFF + ANALYTICS CONTENT */}
+          <div className="right-content">
 
             {/* POSITIONS */}
             <div className="panel">
               <div className="panel-hdr">
-                <span className="panel-hdr-title">
-                  Positions <span style={{ color: "var(--accent)", fontSize: 10 }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span>
-                </span>
-                {positions.length > 0 && (
-                  <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: "auto" }}>Auto-expire on expiry date</span>
-                )}
+                <span className="panel-hdr-title">Positions <span style={{ color: "var(--accent)", fontSize: 10 }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span></span>
+                {positions.length > 0 && <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: "auto" }}>Auto-expire on expiry date</span>}
               </div>
               {positions.length === 0 ? (
                 <div style={{ padding: 18, textAlign: "center", color: "var(--muted)", fontSize: 11, fontStyle: "italic" }}>
-                  No positions. Click Call/Put premiums or use BC/SC/BP/SP buttons.
+                  No positions. Click Call/Put premiums or use BC/SC/BP/SP buttons on the left.
                 </div>
               ) : (
                 positions.map((p) => {
@@ -1285,7 +1171,7 @@ export default function OptionsSimulator() {
                               onClick={() => changeExpiryForPos(p.id, e)}
                               style={{
                                 fontSize: 8.5, padding: "1px 6px", borderRadius: 3, cursor: "pointer",
-                                background: p.legExpiryDate === e.date ? "rgba(99,102,241,0.12)" : "var(--bg)",
+                                background: p.legExpiryDate === e.date ? "rgba(99,102,241,0.12)" : "var(--bg1)",
                                 border: `1px solid ${p.legExpiryDate === e.date ? "var(--accent)" : "var(--border2)"}`,
                                 color: p.legExpiryDate === e.date ? "var(--accent)" : "var(--muted)",
                                 fontFamily: "'Sora', sans-serif",
@@ -1320,15 +1206,12 @@ export default function OptionsSimulator() {
                       <span style={{ color: "var(--muted)" }}>Approx Margin Required</span>
                       <span className="mono" style={{ color: "var(--amber)", fontWeight: 500 }}>{fmtP(totalMargin)}</span>
                     </div>
-                    <div style={{ fontSize: 9.5, color: "var(--muted)", marginTop: 3 }}>
-                      Buy = premium × lot × qty | Sell = SPAN ~₹{fmtN(cfg.span)}/lot | Hedged ≈ 25% margin
-                    </div>
                   </div>
                 );
               })()}
             </div>
 
-            {/* SUMMARY CARDS */}
+            {/* ANALYTICS CARDS */}
             <div className="sum-grid">
               {[
                 { label: "Max Profit", val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
@@ -1338,12 +1221,12 @@ export default function OptionsSimulator() {
               ].map(({ label, val, cls }) => (
                 <div key={label} className="sum-card">
                   <div className="sc-label">{label}</div>
-                  <div className={`sc-val ${cls}`} style={{ fontSize: 14 }}>{val}</div>
+                  <div className={`sc-val ${cls}`}>{val}</div>
                 </div>
               ))}
             </div>
 
-            {/* STRATEGY DETECT */}
+            {/* STRATEGY + MTM DETAIL */}
             <div className="panel" style={{ padding: "10px 14px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                 <span style={{ fontSize: 13, fontWeight: 500 }}>{analytics?.strat.name ?? "No Strategy"}</span>
@@ -1374,11 +1257,11 @@ export default function OptionsSimulator() {
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 7, padding: "10px 12px" }}>
                 {[
-                  { sym: "Δ", name: "Delta", val: analytics?.pD.toFixed(2) ?? "—", hint: "₹/+1pt spot" },
-                  { sym: "Γ", name: "Gamma", val: analytics?.pG.toFixed(4) ?? "—", hint: "Delta/+1pt" },
-                  { sym: "Θ", name: "Theta", val: analytics?.pTh.toFixed(2) ?? "—", hint: "₹ decay/day", cls: "c-red" },
-                  { sym: "V", name: "Vega",  val: analytics?.pV.toFixed(2) ?? "—", hint: "₹/1% IV" },
-                  { sym: "ρ", name: "Rho",   val: analytics?.pR.toFixed(2) ?? "—", hint: "₹/1% rate" },
+                  { sym: "Δ", name: "Delta", val: analytics?.pD.toFixed(2) ?? "—", hint: "₹/+1pt" },
+                  { sym: "Γ", name: "Gamma", val: analytics?.pG.toFixed(4) ?? "—", hint: "Δ/+1pt" },
+                  { sym: "Θ", name: "Theta", val: analytics?.pTh.toFixed(2) ?? "—", hint: "₹/day", cls: "c-red" },
+                  { sym: "V", name: "Vega",  val: analytics?.pV.toFixed(2) ?? "—", hint: "₹/1%IV" },
+                  { sym: "ρ", name: "Rho",   val: analytics?.pR.toFixed(2) ?? "—", hint: "₹/1%r" },
                 ].map(({ sym, name, val, hint, cls }) => (
                   <div key={name} className="gk">
                     <div className="gk-name"><span className="gk-sym">{sym}</span>{name}</div>
@@ -1417,7 +1300,7 @@ export default function OptionsSimulator() {
                     return (
                       <span key={be} style={{ fontSize: 10, background: "#fffbeb", color: "var(--amber)", border: "1px solid #fde68a", borderRadius: 4, padding: "2px 8px" }}>
                         BE: {fmtN(be)} &nbsp;
-                        <span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot &nbsp; ({fmtN(dist)} pts away)</span>
+                        <span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot &nbsp;({fmtN(dist)} pts away)</span>
                       </span>
                     );
                   })}
@@ -1431,9 +1314,69 @@ export default function OptionsSimulator() {
               </div>
             </div>
 
-          </div>
-        </div>
+          </div>{/* end right-content */}
+        </div>{/* end mg-right */}
+
+      </div>{/* end mg-split */}
+    </div>
+  );
+}
+
+// ── Simulation Controls panel (right side, top) ──
+interface SimCtrlPanelProps {
+  replayDate: string; setReplayDate: (v: string) => void;
+  entryDate: string; setEntryDate: (v: string) => void;
+  replaySpot: number; setReplaySpot: (v: number) => void;
+  entrySpot: number; setEntrySpot: (v: number) => void;
+  replayVIX: number; setReplayVIX: (v: number) => void;
+  expiryDate: string; setExpiryDate: (v: string) => void;
+  rhoRate: number; setRhoRate: (v: number) => void;
+  replayDateDisplay: string;
+  onClear: () => void;
+}
+function SimCtrlPanel({ replayDate, setReplayDate, entryDate, setEntryDate, replaySpot, setReplaySpot, entrySpot, setEntrySpot, replayVIX, setReplayVIX, expiryDate, setExpiryDate, rhoRate, setRhoRate, replayDateDisplay, onClear }: SimCtrlPanelProps) {
+  const [open, setOpen] = React.useState(true);
+  return (
+    <div className="ctrl-section">
+      <div className="ctrl-section-hdr" onClick={() => setOpen(o => !o)}>
+        <span>⚙ Simulation Controls</span>
+        <span>{open ? "▲" : "▼"}</span>
       </div>
+      {open && (
+        <>
+          <div className="ctrl-grid">
+            <div className="ctrl-field">
+              <span className="ctrl-label">Replay Date</span>
+              <input type="date" value={replayDate} onChange={e => setReplayDate(e.target.value)} />
+            </div>
+            <div className="ctrl-field">
+              <span className="ctrl-label">Entry Date</span>
+              <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} />
+            </div>
+            <div className="ctrl-field">
+              <span className="ctrl-label">Spot @ {replayDateDisplay}</span>
+              <input type="number" value={replaySpot} onChange={e => setReplaySpot(+e.target.value)} />
+            </div>
+            <div className="ctrl-field">
+              <span className="ctrl-label">Entry Spot</span>
+              <input type="number" value={entrySpot} onChange={e => setEntrySpot(+e.target.value)} />
+            </div>
+            <div className="ctrl-field">
+              <span className="ctrl-label">VIX / IV%</span>
+              <input type="number" value={replayVIX} step={0.1} onChange={e => setReplayVIX(+e.target.value)} />
+            </div>
+            <div className="ctrl-field">
+              <span className="ctrl-label">Expiry Date</span>
+              <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} />
+            </div>
+            <div className="ctrl-field">
+              <span className="ctrl-label">Rate % (ρ)</span>
+              <input type="number" value={rhoRate} step={0.1} min={0} max={20} onChange={e => setRhoRate(+e.target.value)} />
+            </div>
+          </div>
+          <button className="clear-btn" onClick={onClear}>✕ Clear All Positions</button>
+        </>
+      )}
     </div>
   );
 }
