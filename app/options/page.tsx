@@ -547,7 +547,7 @@ export default function OptionsSimulator() {
     <div className="mg-root">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-        *{box-sizing:border-box;margin:0;padding:0}
+        .mg-root *, .mg-root *::before, .mg-root *::after { box-sizing: border-box; }
 
         :root {
           --bg: #ffffff;
@@ -579,12 +579,12 @@ export default function OptionsSimulator() {
           background: var(--bg);
           color: var(--text);
           font-family: 'Sora', sans-serif;
-          min-height: 100vh;
           font-size: 13px;
           display: flex;
           flex-direction: column;
-          height: 100vh;
+          height: calc(100vh - 64px);
           overflow: hidden;
+          position: relative;
         }
 
         /* ── TOP NAV ── */
@@ -650,19 +650,29 @@ export default function OptionsSimulator() {
         /* ── SPLIT LAYOUT ── */
         .mg-split {
           display: grid;
-          grid-template-columns: 1fr 480px;
+          grid-template-columns: 420px 1fr;
           flex: 1;
           overflow: hidden;
           min-height: 0;
         }
 
-        /* ── LEFT PANEL (Option Chain) ── */
+        /* ── LEFT PANEL (Analytics + Chart) ── */
         .mg-left {
           display: flex;
           flex-direction: column;
           border-right: 1px solid var(--border);
+          overflow-y: auto;
+          min-height: 0;
+          background: var(--bg1);
+        }
+
+        /* ── RIGHT PANEL (Option Chain) ── */
+        .mg-right-chain {
+          display: flex;
+          flex-direction: column;
           overflow: hidden;
           min-height: 0;
+          background: var(--bg);
         }
         .mg-left-header {
           padding: 8px 16px;
@@ -760,19 +770,19 @@ export default function OptionsSimulator() {
         .iv-v { color: #b45309; } .dv { color: var(--accent2); } .gv { color: var(--purple); } .tv { color: #c2410c; }
 
         /* ── RIGHT PANEL ── */
-        .mg-right {
+        /* analytics left panel inner content */
+        .analytics-content {
+          padding: 12px 14px;
           display: flex;
           flex-direction: column;
-          overflow-y: auto;
-          background: var(--bg1);
-          min-height: 0;
+          gap: 12px;
         }
 
         /* controls panel */
         .ctrl-panel {
           padding: 14px 16px;
           border-bottom: 1px solid var(--border);
-          background: var(--bg1);
+          background: var(--bg2);
           flex-shrink: 0;
         }
         .ctrl-grid {
@@ -914,217 +924,145 @@ export default function OptionsSimulator() {
         .chart-wrap.flashing { box-shadow: 0 0 0 2px rgba(99,102,241,0.4); border-radius: 8px; }
       `}</style>
 
-      {/* ── NAV ── */}
-      <nav className="mg-nav">
-        <Link href="/" className="mg-logo">
-          <span>market</span><span>greeks</span>
-        </Link>
-        <div className="mg-badge">OPTIONS SIMULATOR</div>
+      {/* ── NO INLINE NAV: uses site's existing navigation ── */}
+
+      {/* ── SUB-TOOLBAR ── */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 16px", borderBottom: "1px solid var(--border)", background: "#fff", flexShrink: 0, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: "var(--accent)", letterSpacing: .3 }}>Options Simulator</span>
+        <div style={{ width: 1, height: 18, background: "var(--border)" }} />
         {(["NIFTY", "BANKNIFTY"] as IndexKey[]).map(idx => (
           <button key={idx} onClick={() => switchIndex(idx)} className={`idx-btn ${currentIndex === idx ? "active" : ""}`}>
             {CFG[idx].label} <span style={{ fontSize: 9, opacity: .6 }}>Lot {CFG[idx].lot}</span>
           </button>
         ))}
-        <div className="vix-pill">
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, background: "#fffbeb", border: "1px solid #fde68a", padding: "4px 12px", borderRadius: 8, fontSize: 11 }}>
           <span style={{ color: "var(--muted)", fontSize: 9, textTransform: "uppercase", letterSpacing: .5 }}>India VIX</span>
-          <span className="mono" style={{ fontSize: 15, fontWeight: 500, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
+          <span className="mono" style={{ fontSize: 14, fontWeight: 600, color: "var(--amber)" }}>{replayVIX.toFixed(2)}</span>
         </div>
-      </nav>
+      </div>
 
       {/* ── SPLIT ── */}
       <div className="mg-split">
 
-        {/* ════ LEFT: OPTION CHAIN ════ */}
+        {/* ════ LEFT: DAY NAV + ANALYTICS + CHART + POSITIONS ════ */}
         <div className="mg-left">
-          <div className="mg-left-header">
-            <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Option Chain</span>
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg2)", border: "1px solid var(--border)", padding: "2px 8px", borderRadius: 100, fontSize: 10, color: "var(--muted)" }}>
-              FUT: <b className="mono" style={{ color: "var(--text)", marginLeft: 3 }}>{fmtN(Math.round(replaySpot * (1 + rhoRate / 100 * dte / 365) * 0.5 + replaySpot * 0.5))}</b>
-            </span>
-            <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-              {exps.map((e, i) => (
-                <button key={e.date} className={`exp-tab ${i === selectedExp ? "active" : ""}`} onClick={() => selectExp(i)}>
-                  {e.label} <span style={{ fontSize: 8, opacity: .6 }}>{e.type}</span>
-                </button>
-              ))}
-            </div>
-            <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted)", fontStyle: "italic" }}>±50 strikes from ATM</span>
-          </div>
 
-          {/* Spot bar */}
-          <div style={{ display: "flex", gap: 14, alignItems: "center", padding: "6px 14px", background: "var(--bg)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
-            <span style={{ fontSize: 10, color: "var(--muted)" }}>Spot @ {replayDateDisplay}</span>
-            <span className="mono" style={{ fontSize: 16, fontWeight: 500 }}>{fmtN(replaySpot)}</span>
-            <span style={{ fontSize: 12 }} className={replaySpot >= entrySpot ? "c-green" : "c-red"}>
-              {(replaySpot >= entrySpot ? "+" : "") + fmtN(replaySpot - entrySpot)} ({((replaySpot - entrySpot) / entrySpot * 100).toFixed(2)}%)
-            </span>
-            <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted2)" }}>DTE: <span style={{ color: "var(--amber)" }}>{dteDisplay}d</span></span>
-          </div>
-
-          <div className="chain-hint">
-            <span>Left-click CALL = Buy &nbsp;|&nbsp; Right-click = Sell</span>
-            <span>Left-click PUT = Buy &nbsp;|&nbsp; Right-click = Sell</span>
-          </div>
-
-          <div className="chain-scroll">
-            <table className="ct">
-              <thead>
-                <tr>
-                  <th className="call-h tc">Θ Theta</th>
-                  <th className="call-h tc">Δ Delta</th>
-                  <th className="call-h tc">IV%</th>
-                  <th className="call-h tc" style={{ minWidth: 70 }}>Call LTP</th>
-                  <th className="strike-h" style={{ minWidth: 110 }}>Strike</th>
-                  <th className="put-h tp" style={{ minWidth: 70 }}>Put LTP</th>
-                  <th className="put-h tp">IV%</th>
-                  <th className="put-h tp">Δ Delta</th>
-                  <th className="put-h tp">Θ Theta</th>
-                </tr>
-              </thead>
-              <tbody>
-                {strikes.map(K => {
-                  const isATM = K === atm;
-                  const isOTM = K > atm;
-                  const dte_ = getDTE();
-                  const T_ = dte_ / 365;
-                  const r_ = rhoRate / 100;
-                  const iv_ = getIV(replaySpot, K, T_);
-                  const cp = calcPremium(replaySpot, K, dte_, "C");
-                  const pp = calcPremium(replaySpot, K, dte_, "P");
-                  const cIV = (iv_ * 100).toFixed(1);
-                  const cg = bsGreeks(replaySpot, K, T_, r_, iv_, "C");
-                  const pg = bsGreeks(replaySpot, K, T_, r_, iv_, "P");
-                  const hasBuyC = positions.some(p => p.K === K && p.type === "C" && p.dir === 1);
-                  const hasSellC = positions.some(p => p.K === K && p.type === "C" && p.dir === -1);
-                  const hasBuyP = positions.some(p => p.K === K && p.type === "P" && p.dir === 1);
-                  const hasSellP = positions.some(p => p.K === K && p.type === "P" && p.dir === -1);
-                  const hasAny = hasBuyC || hasSellC || hasBuyP || hasSellP;
-                  const currentExpiry = exps[selectedExp];
-                  return (
-                    <tr key={K} className={`chain-row ${isATM ? "atm" : ""} ${hasAny ? "has-pos" : ""} ${isOTM && !isATM ? "otm" : ""}`}>
-                      <td className="tc tv">{cg.theta.toFixed(2)}</td>
-                      <td className="tc dv">{cg.delta.toFixed(2)}</td>
-                      <td className="tc iv-v">{cIV}</td>
-                      <td className="tc cv"
-                        onClick={e => handleChainClick(K, "C", cp, e, 1)}
-                        onContextMenu={e => handleChainClick(K, "C", cp, e, -1)}>
-                        <b>{cp.toFixed(2)}</b>
-                        {(hasBuyC || hasSellC) && (
-                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "C"); }}>✕</span>
-                        )}
-                      </td>
-                      <td className="td-strike">
-                        <div className="strike-cell-inner">
-                          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                            {isATM && <span className="atm-pill">ATM</span>}
-                            <b>{K}</b>
-                          </div>
-                          <div className="strike-bs-row">
-                            <button className="bs-btn bs-buy bs-buy-call" onClick={() => addPos(K, "C", cp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Call">BC</button>
-                            <button className="bs-btn bs-sell bs-sell-call" onClick={() => addPos(K, "C", cp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Call">SC</button>
-                            <button className="bs-btn bs-buy-put" onClick={() => addPos(K, "P", pp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Put">BP</button>
-                            <button className="bs-btn bs-sell-put" onClick={() => addPos(K, "P", pp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Put">SP</button>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="tp pv"
-                        onClick={e => handleChainClick(K, "P", pp, e, 1)}
-                        onContextMenu={e => handleChainClick(K, "P", pp, e, -1)}>
-                        <b>{pp.toFixed(2)}</b>
-                        {(hasBuyP || hasSellP) && (
-                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "P"); }}>✕</span>
-                        )}
-                      </td>
-                      <td className="tp iv-v">{cIV}</td>
-                      <td className="tp dv">{pg.delta.toFixed(2)}</td>
-                      <td className="tp tv">{pg.theta.toFixed(2)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            <div style={{ padding: "5px 14px", background: "var(--bg1)", borderTop: "1px solid var(--border)", fontSize: 9.5, color: "var(--muted)", fontStyle: "italic" }}>
-              ◉ ATM &nbsp;|&nbsp; Premiums are <b style={{ color: "var(--amber)" }}>synthetic</b> — Black-Scholes + VIX smile/skew
-            </div>
-          </div>
-        </div>
-
-        {/* ════ RIGHT: CONTROLS + POSITIONS + CHART ════ */}
-        <div className="mg-right">
-
-          {/* ── REPLAY DAY NAV (sticky top) ── */}
-          <div style={{ padding: "10px 16px", borderBottom: "2px solid var(--accent)", background: "rgba(99,102,241,0.04)", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }}>
-            <button className="rnav-btn" style={{ flex: "0 0 auto", padding: "8px 18px", fontWeight: 600, fontSize: 13 }} onClick={() => stepReplay(-1)}>← Prev Day</button>
+          {/* ── REPLAY DAY NAV (sticky top of left) ── */}
+          <div style={{ padding: "10px 14px", borderBottom: "2px solid var(--accent)", background: "rgba(99,102,241,0.04)", flexShrink: 0, display: "flex", alignItems: "center", gap: 8, position: "sticky", top: 0, zIndex: 10 }}>
+            <button className="rnav-btn" style={{ flex: "0 0 auto", padding: "7px 14px", fontWeight: 600, fontSize: 12 }} onClick={() => stepReplay(-1)}>← Prev Day</button>
             <div style={{ flex: 1, textAlign: "center" }}>
-              <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 500 }}>{replayDateDisplay}</div>
+              <div style={{ fontSize: 10, color: "var(--muted)", fontWeight: 500 }}>{replayDateDisplay}</div>
               {analytics && (
-                <div className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 16, fontWeight: 700 }}>
-                  MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
+                <div className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 18, fontWeight: 700, lineHeight: 1.2 }}>
+                  {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
                 </div>
               )}
+              {analytics && <div style={{ fontSize: 9, color: "var(--muted)" }}>MTM P&amp;L</div>}
             </div>
-            <button className="rnav-btn accent" style={{ flex: "0 0 auto", padding: "8px 18px", fontWeight: 600, fontSize: 13 }} onClick={() => stepReplay(1)}>Next Day →</button>
+            <button className="rnav-btn accent" style={{ flex: "0 0 auto", padding: "7px 14px", fontWeight: 600, fontSize: 12 }} onClick={() => stepReplay(1)}>Next Day →</button>
           </div>
 
-          {/* ── CONTROLS (entry date, entry spot, etc.) ── */}
-          <div className="ctrl-panel">
-            <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .5, marginBottom: 10 }}>Simulation Controls</div>
-            <div className="ctrl-grid">
-              <div className="ctrl-field">
-                <span className="ctrl-label">Replay Date</span>
-                <input type="date" value={replayDate} onChange={e => setReplayDate(e.target.value)} />
-              </div>
-              <div className="ctrl-field">
-                <span className="ctrl-label">Entry Date</span>
-                <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} />
-              </div>
-              <div className="ctrl-field">
-                <span className="ctrl-label">Spot @ {replayDateDisplay}</span>
-                <input type="number" value={replaySpot} onChange={e => setReplaySpot(+e.target.value)} />
-              </div>
-              <div className="ctrl-field">
-                <span className="ctrl-label">Entry Spot</span>
-                <input type="number" value={entrySpot} onChange={e => setEntrySpot(+e.target.value)} />
-              </div>
-              <div className="ctrl-field">
-                <span className="ctrl-label">VIX / IV%</span>
-                <input type="number" value={replayVIX} step={0.1} onChange={e => setReplayVIX(+e.target.value)} />
-              </div>
-              <div className="ctrl-field">
-                <span className="ctrl-label">Expiry Date</span>
-                <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} />
-              </div>
-              <div className="ctrl-field">
-                <span className="ctrl-label">Rate % (ρ)</span>
-                <input type="number" value={rhoRate} step={0.1} min={0} max={20} onChange={e => setRhoRate(+e.target.value)} />
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-              <button className="clear-btn" onClick={() => setPositions([])}>✕ Clear All</button>
-            </div>
-          </div>
+          {/* ── ANALYTICS CONTENT (scrollable) ── */}
+          <div className="analytics-content">
 
-          {/* ── STATUS BAR ── */}
-          <div className={`status-row ${spotFlash ? "spot-flash" : ""}`}>
-            {[
-              { label: "Index", val: CFG[currentIndex].label, cls: "" },
-              { label: "Entry Spot", val: fmtN(entrySpot), cls: "" },
-              { label: `Spot @ ${replayDateDisplay}`, val: fmtN(replaySpot), cls: "" },
-              { label: "DTE", val: dteDisplay + "d", cls: "c-amber" },
-              { label: "Lot Size", val: CFG[currentIndex].lot + " units", cls: "" },
-            ].map(({ label, val, cls }, i) => (
-              <React.Fragment key={label}>
-                {i > 0 && <div className="sb-sep" />}
-                <div className="sb-item">
-                  <div className="sb-lbl">{label}</div>
-                  <div className={`mono ${cls}`} style={{ fontSize: 13, fontWeight: 500 }}>{val}</div>
+            {/* STATUS */}
+            <div className={`status-row ${spotFlash ? "spot-flash" : ""}`} style={{ borderRadius: 8, margin: 0 }}>
+              {[
+                { label: "Index", val: CFG[currentIndex].label, cls: "" },
+                { label: "Entry Spot", val: fmtN(entrySpot), cls: "" },
+                { label: `Spot Now`, val: fmtN(replaySpot), cls: replaySpot >= entrySpot ? "c-green" : "c-red" },
+                { label: "DTE", val: dteDisplay + "d", cls: "c-amber" },
+              ].map(({ label, val, cls }, i) => (
+                <React.Fragment key={label}>
+                  {i > 0 && <div className="sb-sep" />}
+                  <div className="sb-item">
+                    <div className="sb-lbl">{label}</div>
+                    <div className={`mono ${cls}`} style={{ fontSize: 12, fontWeight: 600 }}>{val}</div>
+                  </div>
+                </React.Fragment>
+              ))}
+            </div>
+
+            {/* PAYOFF CHART */}
+            <div className="panel" style={{ padding: "12px 14px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
+                <span style={{ fontSize: 12, fontWeight: 600 }}>Payoff Chart</span>
+                <div style={{ display: "flex", gap: 5 }}>
+                  <button className={`vtab ${chartView === "expiry" ? "active" : ""}`} onClick={() => setChartView("expiry")}>At Expiry</button>
+                  <button className={`vtab ${chartView === "mtm" ? "active" : ""}`} onClick={() => setChartView("mtm")}>MTM Now</button>
                 </div>
-              </React.Fragment>
-            ))}
-          </div>
+              </div>
+              <div className={`chart-wrap ${spotFlash ? "flashing" : ""}`}>
+                <canvas ref={canvasRef} role="img" aria-label="Options payoff P&L chart" />
+              </div>
+              {analytics && analytics.bes.length > 0 && (
+                <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {analytics.bes.map(be => {
+                    const dist = Math.abs(be - replaySpot);
+                    const distPct = ((dist / replaySpot) * 100).toFixed(1);
+                    const above = be > replaySpot;
+                    return (
+                      <span key={be} style={{ fontSize: 10, background: "#fffbeb", color: "var(--amber)", border: "1px solid #fde68a", borderRadius: 4, padding: "2px 8px" }}>
+                        BE: {fmtN(be)} &nbsp;
+                        <span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot &nbsp; ({fmtN(dist)} pts away)</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 10, color: "var(--muted)", flexWrap: "wrap" }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--green)", display: "inline-block", borderRadius: 1 }} />Profit</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--red)", display: "inline-block", borderRadius: 1 }} />Loss</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 1, background: "var(--amber)", display: "inline-block" }} />Breakeven</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--accent)", display: "inline-block" }} />Spot @ {replayDateDisplay}</span>
+              </div>
+            </div>
 
-          {/* ── RIGHT CONTENT ── */}
-          <div className="right-content">
+            {/* STRATEGY DETECT + KEY METRICS */}
+            <div className="panel" style={{ padding: "10px 14px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>{analytics?.strat.name ?? "No Strategy"}</span>
+                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, background: "rgba(124,58,237,0.08)", color: "var(--purple)", border: "1px solid rgba(124,58,237,0.2)" }}>{analytics?.strat.bias ?? "—"}</span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                {[
+                  { label: "Max Profit", val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
+                  { label: "Max Loss", val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
+                  { label: "Risk : Reward", val: analytics?.rr ?? "—", cls: "" },
+                  { label: "MTM P&L Now", val: analytics ? (analytics.mtmPnl >= 0 ? "+" : "") + fmtP(analytics.mtmPnl) : "—", cls: analytics ? (analytics.mtmPnl >= 0 ? "c-green" : "c-red") : "" },
+                  { label: "Breakeven(s)", val: analytics?.bes.length ? analytics.bes.join(" / ") : "No crossover", cls: "" },
+                  { label: "POP", val: analytics?.popPct ?? "—", cls: "c-blue" },
+                ].map(({ label, val, cls }) => (
+                  <div key={label} className="sd-item">
+                    <div className="sd-ilabel">{label}</div>
+                    <div className={`sd-ival ${cls}`}>{val}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* GREEKS */}
+            <div className="panel">
+              <div style={{ padding: "9px 14px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center" }}>
+                <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Portfolio Greeks</span>
+                <span style={{ fontSize: 9.5, color: "var(--muted)", marginLeft: "auto" }}>BS + VIX smile</span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 7, padding: "10px 12px" }}>
+                {[
+                  { sym: "Δ", name: "Delta", val: analytics?.pD.toFixed(2) ?? "—", hint: "₹/+1pt spot" },
+                  { sym: "Γ", name: "Gamma", val: analytics?.pG.toFixed(4) ?? "—", hint: "Delta/+1pt" },
+                  { sym: "Θ", name: "Theta", val: analytics?.pTh.toFixed(2) ?? "—", hint: "₹ decay/day", cls: "c-red" },
+                  { sym: "V", name: "Vega",  val: analytics?.pV.toFixed(2) ?? "—", hint: "₹/1% IV" },
+                  { sym: "ρ", name: "Rho",   val: analytics?.pR.toFixed(2) ?? "—", hint: "₹/1% rate" },
+                ].map(({ sym, name, val, hint, cls }) => (
+                  <div key={name} className="gk">
+                    <div className="gk-name"><span className="gk-sym">{sym}</span>{name}</div>
+                    <div className={`gk-val ${cls ?? ""}`}>{val}</div>
+                    <div className="gk-hint">{hint}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
 
             {/* POSITIONS */}
             <div className="panel">
@@ -1133,7 +1071,7 @@ export default function OptionsSimulator() {
                   Positions <span style={{ color: "var(--accent)", fontSize: 10 }}>{positions.length} leg{positions.length !== 1 ? "s" : ""}</span>
                 </span>
                 {positions.length > 0 && (
-                  <span style={{ fontSize: 9, color: "var(--muted)", marginLeft: "auto" }}>Auto-expire on expiry date</span>
+                  <button className="clear-btn" style={{ marginLeft: "auto", padding: "3px 10px", fontSize: 11 }} onClick={() => setPositions([])}>✕ Clear All</button>
                 )}
               </div>
               {positions.length === 0 ? (
@@ -1204,7 +1142,7 @@ export default function OptionsSimulator() {
                   totalMargin += m;
                 });
                 return (
-                  <div style={{ background: "var(--bg1)", borderTop: "1px solid var(--border)", padding: "8px 12px", fontSize: 11 }}>
+                  <div style={{ background: "var(--bg2)", borderTop: "1px solid var(--border)", padding: "8px 12px", fontSize: 11 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
                       <span style={{ color: "var(--muted)" }}>Premium {netPrem >= 0 ? "Collected" : "Paid"}</span>
                       <span className="mono">{fmtP(netPrem)}</span>
@@ -1236,94 +1174,157 @@ export default function OptionsSimulator() {
               ))}
             </div>
 
-            {/* STRATEGY DETECT */}
-            <div className="panel" style={{ padding: "10px 14px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                <span style={{ fontSize: 13, fontWeight: 500 }}>{analytics?.strat.name ?? "No Strategy"}</span>
-                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 100, background: "rgba(167,139,250,0.1)", color: "var(--purple)", border: "1px solid rgba(167,139,250,0.2)" }}>{analytics?.strat.bias ?? "—"}</span>
+          </div>
+        </div>
+
+        {/* ════ RIGHT: OPTION CHAIN + CONTROLS ════ */}
+        <div className="mg-right-chain">
+
+          {/* ── CONTROLS (entry date, entry spot, etc.) ── */}
+          <div className="ctrl-panel">
+            <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .5, marginBottom: 8 }}>Simulation Controls</div>
+            <div className="ctrl-grid">
+              <div className="ctrl-field">
+                <span className="ctrl-label">Replay Date</span>
+                <input type="date" value={replayDate} onChange={e => setReplayDate(e.target.value)} />
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                {[
-                  { label: "Max Profit", val: analytics?.isUnlimP ? "Unlimited ∞" : analytics ? fmtP(analytics.maxP) : "—", cls: "c-green" },
-                  { label: "Max Loss", val: analytics?.isUnlimL ? "Unlimited ∞" : analytics ? fmtP(analytics.minP) : "—", cls: "c-red" },
-                  { label: "Risk : Reward", val: analytics?.rr ?? "—", cls: "" },
-                  { label: "MTM P&L Now", val: analytics ? (analytics.mtmPnl >= 0 ? "+" : "") + fmtP(analytics.mtmPnl) : "—", cls: analytics ? (analytics.mtmPnl >= 0 ? "c-green" : "c-red") : "" },
-                  { label: "Breakeven(s)", val: analytics?.bes.length ? analytics.bes.join(" / ") : "No crossover", cls: "" },
-                  { label: "POP", val: analytics?.popPct ?? "—", cls: "c-blue" },
-                ].map(({ label, val, cls }) => (
-                  <div key={label} className="sd-item">
-                    <div className="sd-ilabel">{label}</div>
-                    <div className={`sd-ival ${cls}`}>{val}</div>
-                  </div>
-                ))}
+              <div className="ctrl-field">
+                <span className="ctrl-label">Entry Date</span>
+                <input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Spot @ {replayDateDisplay}</span>
+                <input type="number" value={replaySpot} onChange={e => setReplaySpot(+e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Entry Spot</span>
+                <input type="number" value={entrySpot} onChange={e => setEntrySpot(+e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">VIX / IV%</span>
+                <input type="number" value={replayVIX} step={0.1} onChange={e => setReplayVIX(+e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Expiry Date</span>
+                <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} />
+              </div>
+              <div className="ctrl-field">
+                <span className="ctrl-label">Rate % (ρ)</span>
+                <input type="number" value={rhoRate} step={0.1} min={0} max={20} onChange={e => setRhoRate(+e.target.value)} />
               </div>
             </div>
+          </div>
 
-            {/* GREEKS */}
-            <div className="panel">
-              <div style={{ padding: "9px 14px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center" }}>
-                <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Portfolio Greeks</span>
-                <span style={{ fontSize: 9.5, color: "var(--muted)", marginLeft: "auto" }}>BS + VIX smile model</span>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 7, padding: "10px 12px" }}>
-                {[
-                  { sym: "Δ", name: "Delta", val: analytics?.pD.toFixed(2) ?? "—", hint: "₹/+1pt spot" },
-                  { sym: "Γ", name: "Gamma", val: analytics?.pG.toFixed(4) ?? "—", hint: "Delta/+1pt" },
-                  { sym: "Θ", name: "Theta", val: analytics?.pTh.toFixed(2) ?? "—", hint: "₹ decay/day", cls: "c-red" },
-                  { sym: "V", name: "Vega",  val: analytics?.pV.toFixed(2) ?? "—", hint: "₹/1% IV" },
-                  { sym: "ρ", name: "Rho",   val: analytics?.pR.toFixed(2) ?? "—", hint: "₹/1% rate" },
-                ].map(({ sym, name, val, hint, cls }) => (
-                  <div key={name} className="gk">
-                    <div className="gk-name"><span className="gk-sym">{sym}</span>{name}</div>
-                    <div className={`gk-val ${cls ?? ""}`}>{val}</div>
-                    <div className="gk-hint">{hint}</div>
-                  </div>
-                ))}
-              </div>
+          {/* ── OPTION CHAIN HEADER ── */}
+          <div className="mg-left-header">
+            <span style={{ fontSize: 11, fontWeight: 500, color: "var(--muted)", textTransform: "uppercase", letterSpacing: .4 }}>Option Chain</span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "var(--bg2)", border: "1px solid var(--border)", padding: "2px 8px", borderRadius: 100, fontSize: 10, color: "var(--muted)" }}>
+              FUT: <b className="mono" style={{ color: "var(--text)", marginLeft: 3 }}>{fmtN(Math.round(replaySpot * (1 + rhoRate / 100 * dte / 365) * 0.5 + replaySpot * 0.5))}</b>
+            </span>
+            <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+              {exps.map((e, i) => (
+                <button key={e.date} className={`exp-tab ${i === selectedExp ? "active" : ""}`} onClick={() => selectExp(i)}>
+                  {e.label} <span style={{ fontSize: 8, opacity: .6 }}>{e.type}</span>
+                </button>
+              ))}
             </div>
+          </div>
 
-            {/* PAYOFF CHART */}
-            <div className="panel" style={{ padding: "12px 14px" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
-                <div>
-                  <span style={{ fontSize: 12, fontWeight: 600 }}>Payoff Chart</span>
-                  {analytics && (
-                    <span className={`mono ${analytics.mtmPnl >= 0 ? "c-green" : "c-red"}`} style={{ fontSize: 14, fontWeight: 600, marginLeft: 12 }}>
-                      MTM {analytics.mtmPnl >= 0 ? "+" : ""}{fmtP(analytics.mtmPnl)}
-                    </span>
-                  )}
-                </div>
-                <div style={{ display: "flex", gap: 5 }}>
-                  <button className={`vtab ${chartView === "expiry" ? "active" : ""}`} onClick={() => setChartView("expiry")}>At Expiry</button>
-                  <button className={`vtab ${chartView === "mtm" ? "active" : ""}`} onClick={() => setChartView("mtm")}>MTM Now</button>
-                </div>
-              </div>
-              <div className={`chart-wrap ${spotFlash ? "flashing" : ""}`}>
-                <canvas ref={canvasRef} role="img" aria-label="Options payoff P&L chart" />
-              </div>
-              {analytics && analytics.bes.length > 0 && (
-                <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  {analytics.bes.map(be => {
-                    const dist = Math.abs(be - replaySpot);
-                    const distPct = ((dist / replaySpot) * 100).toFixed(1);
-                    const above = be > replaySpot;
-                    return (
-                      <span key={be} style={{ fontSize: 10, background: "#fffbeb", color: "var(--amber)", border: "1px solid #fde68a", borderRadius: 4, padding: "2px 8px" }}>
-                        BE: {fmtN(be)} &nbsp;
-                        <span style={{ color: "var(--muted)" }}>{distPct}% {above ? "above" : "below"} spot &nbsp; ({fmtN(dist)} pts away)</span>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
-              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 10, color: "var(--muted)", flexWrap: "wrap" }}>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--green)", display: "inline-block", borderRadius: 1 }} />Profit</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--red)", display: "inline-block", borderRadius: 1 }} />Loss</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 1, background: "var(--amber)", display: "inline-block" }} />Breakeven</span>
-                <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "var(--accent)", display: "inline-block" }} />Spot @ {replayDateDisplay}</span>
-              </div>
+          {/* Spot bar */}
+          <div style={{ display: "flex", gap: 14, alignItems: "center", padding: "5px 14px", background: "var(--bg1)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+            <span style={{ fontSize: 10, color: "var(--muted)" }}>Spot</span>
+            <span className="mono" style={{ fontSize: 15, fontWeight: 600 }}>{fmtN(replaySpot)}</span>
+            <span style={{ fontSize: 11 }} className={replaySpot >= entrySpot ? "c-green" : "c-red"}>
+              {(replaySpot >= entrySpot ? "+" : "") + fmtN(replaySpot - entrySpot)} ({((replaySpot - entrySpot) / entrySpot * 100).toFixed(2)}%)
+            </span>
+            <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--muted2)" }}>DTE: <span style={{ color: "var(--amber)" }}>{dteDisplay}d</span></span>
+          </div>
+
+          <div className="chain-hint">
+            <span>Left-click CALL/PUT = Buy &nbsp;|&nbsp; Right-click = Sell</span>
+            <span>Use BC/SC/BP/SP buttons to add legs</span>
+          </div>
+
+          <div className="chain-scroll">
+            <table className="ct">
+              <thead>
+                <tr>
+                  <th className="call-h tc">Θ Theta</th>
+                  <th className="call-h tc">Δ Delta</th>
+                  <th className="call-h tc">IV%</th>
+                  <th className="call-h tc" style={{ minWidth: 70 }}>Call LTP</th>
+                  <th className="strike-h" style={{ minWidth: 110 }}>Strike</th>
+                  <th className="put-h tp" style={{ minWidth: 70 }}>Put LTP</th>
+                  <th className="put-h tp">IV%</th>
+                  <th className="put-h tp">Δ Delta</th>
+                  <th className="put-h tp">Θ Theta</th>
+                </tr>
+              </thead>
+              <tbody>
+                {strikes.map(K => {
+                  const isATM = K === atm;
+                  const isOTM = K > atm;
+                  const dte_ = getDTE();
+                  const T_ = dte_ / 365;
+                  const r_ = rhoRate / 100;
+                  const iv_ = getIV(replaySpot, K, T_);
+                  const cp = calcPremium(replaySpot, K, dte_, "C");
+                  const pp = calcPremium(replaySpot, K, dte_, "P");
+                  const cIV = (iv_ * 100).toFixed(1);
+                  const cg = bsGreeks(replaySpot, K, T_, r_, iv_, "C");
+                  const pg = bsGreeks(replaySpot, K, T_, r_, iv_, "P");
+                  const hasBuyC = positions.some(p => p.K === K && p.type === "C" && p.dir === 1);
+                  const hasSellC = positions.some(p => p.K === K && p.type === "C" && p.dir === -1);
+                  const hasBuyP = positions.some(p => p.K === K && p.type === "P" && p.dir === 1);
+                  const hasSellP = positions.some(p => p.K === K && p.type === "P" && p.dir === -1);
+                  const hasAny = hasBuyC || hasSellC || hasBuyP || hasSellP;
+                  const currentExpiry = exps[selectedExp];
+                  return (
+                    <tr key={K} className={`chain-row ${isATM ? "atm" : ""} ${hasAny ? "has-pos" : ""} ${isOTM && !isATM ? "otm" : ""}`}>
+                      <td className="tc tv">{cg.theta.toFixed(2)}</td>
+                      <td className="tc dv">{cg.delta.toFixed(2)}</td>
+                      <td className="tc iv-v">{cIV}</td>
+                      <td className="tc cv"
+                        onClick={e => handleChainClick(K, "C", cp, e, 1)}
+                        onContextMenu={e => handleChainClick(K, "C", cp, e, -1)}>
+                        <b>{cp.toFixed(2)}</b>
+                        {(hasBuyC || hasSellC) && (
+                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "C"); }}>✕</span>
+                        )}
+                      </td>
+                      <td className="td-strike">
+                        <div className="strike-cell-inner">
+                          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                            {isATM && <span className="atm-pill">ATM</span>}
+                            <b>{K}</b>
+                          </div>
+                          <div className="strike-bs-row">
+                            <button className="bs-btn bs-buy-call" onClick={() => addPos(K, "C", cp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Call">BC</button>
+                            <button className="bs-btn bs-sell-call" onClick={() => addPos(K, "C", cp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Call">SC</button>
+                            <button className="bs-btn bs-buy-put" onClick={() => addPos(K, "P", pp, 1, currentExpiry.label, currentExpiry.date)} title="Buy Put">BP</button>
+                            <button className="bs-btn bs-sell-put" onClick={() => addPos(K, "P", pp, -1, currentExpiry.label, currentExpiry.date)} title="Sell Put">SP</button>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="tp pv"
+                        onClick={e => handleChainClick(K, "P", pp, e, 1)}
+                        onContextMenu={e => handleChainClick(K, "P", pp, e, -1)}>
+                        <b>{pp.toFixed(2)}</b>
+                        {(hasBuyP || hasSellP) && (
+                          <span className="added-x" onClick={e => { e.stopPropagation(); removeByKType(K, "P"); }}>✕</span>
+                        )}
+                      </td>
+                      <td className="tp iv-v">{cIV}</td>
+                      <td className="tp dv">{pg.delta.toFixed(2)}</td>
+                      <td className="tp tv">{pg.theta.toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div style={{ padding: "5px 14px", background: "var(--bg2)", borderTop: "1px solid var(--border)", fontSize: 9.5, color: "var(--muted)", fontStyle: "italic" }}>
+              ◉ ATM &nbsp;|&nbsp; Premiums are <b style={{ color: "var(--amber)" }}>synthetic</b> — Black-Scholes + VIX smile/skew
             </div>
-
           </div>
         </div>
       </div>
