@@ -267,35 +267,347 @@ async function fetchLivePrices(items: { symbol: string; instrument: InstrumentTy
   return out
 }
 
-// Fetch India VIX from Supabase bhav copy
-async function fetchVIXFromSupabase(): Promise<number> {
-  const { data } = await supabase
-    .from("india_vix")
-    .select("close")
-    .order("date", { ascending: false })
-    .limit(1)
-    .single()
-  if (data?.close && data.close > 0) return data.close
-  return 15 // fallback default
+// ─── Schema-aware Supabase bhav data layer ───────────────────────────────────
+//
+// NSE bhav CSVs can be stored with many different column naming conventions
+// depending on who built the ingestion pipeline.  We probe one sample row,
+// detect the schema variant, and normalise every row into a stable shape:
+//
+//   { strike_price, expiry_date, ce_ltp, pe_ltp, ce_oi, pe_oi,
+//     ce_volume, pe_volume, ce_iv, pe_iv, ce_bid, pe_bid,
+//     ce_ask, pe_ask, ce_delta, pe_delta }
+//
+// Supported raw column name variants:
+//   strike_price | STRIKE_PR | strikeprice | strike
+//   expiry_date  | EXPIRY_DT | expirydate  | expiry
+//   ce_ltp / pe_ltp            (already normalised)
+//   CALLS_LTP / PUTS_LTP       (NSE web format)
+//   call_ltp / put_ltp
+//   call_close / put_close     (EOD bhav)
+//   ltp (single-row format – one row per option, with OPTION_TYP CE/PE)
+//   close / CLOSE              (generic close price)
+//   oi / OI / open_interest    (single-row OI, needs OPTION_TYP to split)
+//   ce_oi / pe_oi / call_oi / put_oi
+//   ce_volume / pe_volume / call_volume / put_volume / volume / CONTRACTS
+//   ce_iv / pe_iv / iv / IV / impliedvolatility
+//   india_vix.close | india_vix.vix_close | india_vix.CLOSE | india_vix.VIX
+
+type NormRow = {
+  strike_price: number
+  expiry_date:  string
+  ce_ltp:    number | null
+  pe_ltp:    number | null
+  ce_oi:     number | null
+  pe_oi:     number | null
+  ce_volume: number | null
+  pe_volume: number | null
+  ce_iv:     number | null
+  pe_iv:     number | null
 }
 
-// Fetch ATM strike data from bhav copy (nifty_options or banknifty_options)
-async function fetchBhavOptionChain(symbol: string, expiry: string, spot: number): Promise<any[]> {
+function n(v: any): number | null {
+  if (v === null || v === undefined || v === "" || v === "-") return null
+  const f = parseFloat(String(v).replace(/,/g, ""))
+  return isNaN(f) ? null : f
+}
+
+// Pick the first truthy value from a list of keys on an object
+function pick(row: any, ...keys: string[]): any {
+  for (const k of keys) {
+    if (row[k] !== undefined && row[k] !== null && row[k] !== "") return row[k]
+  }
+  return null
+}
+
+// Normalise a raw Supabase row into NormRow.
+// Two formats handled:
+//   A) Wide row  – one row per strike, CE and PE columns side by side
+//   B) Narrow row – one row per option contract, with option_type CE/PE
+//      (we call normaliseBhavRows which pairs them up)
+function normaliseWideRow(raw: any): NormRow {
+  const strike = n(pick(raw, "strike_price","STRIKE_PR","strikeprice","strike","STRIKEPRICE","strike_pr")) ?? 0
+  const expiry = String(pick(raw, "expiry_date","EXPIRY_DT","expirydate","expiry","EXPIRY","expiry_dt") ?? "")
+
+  return {
+    strike_price: strike,
+    expiry_date:  expiry,
+
+    // CE LTP – try every known alias
+    ce_ltp: n(pick(raw,
+      "ce_ltp","CE_LTP","calls_ltp","CALLS_LTP","call_ltp","CALL_LTP",
+      "call_close","CALL_CLOSE","ce_close","CE_CLOSE","calls_close","ce_last",
+    )),
+
+    // PE LTP
+    pe_ltp: n(pick(raw,
+      "pe_ltp","PE_LTP","puts_ltp","PUTS_LTP","put_ltp","PUT_LTP",
+      "put_close","PUT_CLOSE","pe_close","PE_CLOSE","puts_close","pe_last",
+    )),
+
+    // CE OI
+    ce_oi: n(pick(raw,
+      "ce_oi","CE_OI","calls_oi","CALLS_OI","call_oi","CALL_OI",
+      "ce_open_int","CE_OPEN_INT","calls_open_int","CALLS_OPEN_INT",
+    )),
+
+    // PE OI
+    pe_oi: n(pick(raw,
+      "pe_oi","PE_OI","puts_oi","PUTS_OI","put_oi","PUT_OI",
+      "pe_open_int","PE_OPEN_INT","puts_open_int","PUTS_OPEN_INT",
+    )),
+
+    // CE Volume
+    ce_volume: n(pick(raw,
+      "ce_volume","CE_VOLUME","calls_volume","CALLS_VOLUME","call_volume","CALL_VOLUME",
+      "ce_vol","CE_VOL","calls_vol","CALLS_VOL","ce_contracts","CE_CONTRACTS",
+    )),
+
+    // PE Volume
+    pe_volume: n(pick(raw,
+      "pe_volume","PE_VOLUME","puts_volume","PUTS_VOLUME","put_volume","PUT_VOLUME",
+      "pe_vol","PE_VOL","puts_vol","PUTS_VOL","pe_contracts","PE_CONTRACTS",
+    )),
+
+    // CE IV
+    ce_iv: n(pick(raw,
+      "ce_iv","CE_IV","calls_iv","CALLS_IV","call_iv","CALL_IV",
+      "ce_implied_volatility","CE_IMPLIED_VOLATILITY","calls_implied_vol",
+    )),
+
+    // PE IV
+    pe_iv: n(pick(raw,
+      "pe_iv","PE_IV","puts_iv","PUTS_IV","put_iv","PUT_IV",
+      "pe_implied_volatility","PE_IMPLIED_VOLATILITY","puts_implied_vol",
+    )),
+  }
+}
+
+// For narrow (single-contract) rows, detect option type and pair CE/PE
+function normaliseNarrowRows(rows: any[]): NormRow[] {
+  const byStrike: Record<number, NormRow> = {}
+
+  for (const raw of rows) {
+    const strike = n(pick(raw, "strike_price","STRIKE_PR","strikeprice","strike","STRIKEPRICE","strike_pr")) ?? 0
+    if (!strike) continue
+
+    const expiry = String(pick(raw, "expiry_date","EXPIRY_DT","expirydate","expiry","EXPIRY","expiry_dt") ?? "")
+    const optType = String(pick(raw, "option_type","OPTION_TYP","optiontype","opt_type","type","OPT_TYPE","CE_PE") ?? "").toUpperCase().trim()
+    const isCE = optType === "CE" || optType.includes("CALL")
+    const isPE = optType === "PE" || optType.includes("PUT")
+    if (!isCE && !isPE) continue
+
+    if (!byStrike[strike]) {
+      byStrike[strike] = {
+        strike_price: strike, expiry_date: expiry,
+        ce_ltp: null, pe_ltp: null, ce_oi: null, pe_oi: null,
+        ce_volume: null, pe_volume: null, ce_iv: null, pe_iv: null,
+      }
+    }
+    const norm = byStrike[strike]
+
+    const ltp = n(pick(raw,
+      "ltp","LTP","last","LAST","close","CLOSE","last_price","LAST_PRICE",
+      "settle_price","SETTLE_PR","settlement_price",
+    ))
+    const oi = n(pick(raw,
+      "oi","OI","open_int","OPEN_INT","open_interest","OPEN_INTEREST",
+      "oi_contracts","OI_CONTRACTS","contracts","CONTRACTS",
+    ))
+    const vol = n(pick(raw,
+      "volume","VOLUME","vol","VOL","no_of_contracts","NO_OF_CONTRACTS","qty","QTY",
+    ))
+    const iv = n(pick(raw,
+      "iv","IV","implied_volatility","IMPLIED_VOLATILITY","impliedvol","IMPLIEDVOL",
+    ))
+
+    if (isCE) {
+      if (ltp !== null) norm.ce_ltp = ltp
+      if (oi  !== null) norm.ce_oi  = oi
+      if (vol !== null) norm.ce_volume = vol
+      if (iv  !== null) norm.ce_iv  = iv
+    } else {
+      if (ltp !== null) norm.pe_ltp = ltp
+      if (oi  !== null) norm.pe_oi  = oi
+      if (vol !== null) norm.pe_volume = vol
+      if (iv  !== null) norm.pe_iv  = iv
+    }
+  }
+  return Object.values(byStrike)
+}
+
+// Detect whether rows are wide or narrow format
+function isNarrowFormat(rows: any[]): boolean {
+  if (!rows.length) return false
+  const r = rows[0]
+  // narrow = has option_type / OPTION_TYP column
+  return !!(r.option_type ?? r.OPTION_TYP ?? r.optiontype ?? r.opt_type ?? r.OPT_TYPE ?? r.CE_PE)
+}
+
+// ─── VIX: try every plausible column name ────────────────────────────────────
+async function fetchVIXFromSupabase(): Promise<number> {
+  // Try common date-sorted columns
+  const tryColumns = [
+    { col: "close",     dateCol: "date"       },
+    { col: "vix_close", dateCol: "date"       },
+    { col: "CLOSE",     dateCol: "date"       },
+    { col: "VIX",       dateCol: "date"       },
+    { col: "vix",       dateCol: "date"       },
+    { col: "close",     dateCol: "TIMESTAMP"  },
+    { col: "close",     dateCol: "trade_date" },
+  ]
+
+  for (const { col, dateCol } of tryColumns) {
+    try {
+      const { data } = await supabase
+        .from("india_vix")
+        .select(`${col},${dateCol}`)
+        .order(dateCol, { ascending: false })
+        .limit(1)
+        .single()
+      const v = n(data?.[col])
+      if (v && v > 0) return v
+    } catch {}
+  }
+
+  // Last resort: select * and look at whatever came back
+  try {
+    const { data } = await supabase.from("india_vix").select("*").order("date", { ascending: false }).limit(1).single()
+    if (data) {
+      for (const key of Object.keys(data)) {
+        const v = n(data[key])
+        if (v && v > 5 && v < 100) return v   // VIX is always in this range
+      }
+    }
+  } catch {}
+
+  return 15 // safe default
+}
+
+// ─── Main bhav option chain fetcher ──────────────────────────────────────────
+async function fetchBhavOptionChain(
+  symbol: string,
+  expiry: string,        // YYYY-MM-DD format
+  spot: number
+): Promise<NormRow[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-  const interval = getStrikeInterval(symbol)
-  const atm = Math.round(spot / interval) * interval
-  const strikes = Array.from({ length: 21 }, (_, i) => atm - 500 + i * interval)
-    .filter(s => s > 0)
+  const interval  = getStrikeInterval(symbol)
+  const atm       = Math.round(spot / interval) * interval
+  // 10 strikes each side of ATM = 21 total
+  const strikes   = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
 
-  const { data, error } = await supabase
+  // We don't know the exact column name for strike_price or expiry_date up front.
+  // Strategy: fetch a small probe row first, detect schema, then run main query.
+
+  // ── Step 1: probe to detect schema variant ──────────────────────────────────
+  const { data: probe } = await supabase.from(tableName).select("*").limit(2)
+  if (!probe || probe.length === 0) return []
+
+  const sampleRow = probe[0]
+  const keys = Object.keys(sampleRow)
+
+  // Detect the actual column names in this table
+  const strikeCol  = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
+  const expiryCol  = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
+
+  // Also check: does the expiry in DB have different format? (DD-MMM-YYYY, YYYY-MM-DD, etc.)
+  // Probe what the actual expiry value looks like for the first row
+  const probeExpiry = String(sampleRow[expiryCol] ?? "")
+
+  // Convert our YYYY-MM-DD expiry to match DB format
+  function convertExpiry(isoDate: string): string[] {
+    const d = new Date(isoDate + "T00:00:00")
+    const dd  = String(d.getDate()).padStart(2, "0")
+    const mon3 = d.toLocaleDateString("en-US", { month: "short" }).toUpperCase()
+    const yyyy = d.getFullYear()
+    const yy   = String(yyyy).slice(2)
+    return [
+      isoDate,                          // YYYY-MM-DD
+      `${dd}-${mon3}-${yyyy}`,          // DD-MMM-YYYY  (NSE standard)
+      `${dd}-${mon3}-${yy}`,            // DD-MMM-YY
+      `${yyyy}/${String(d.getMonth()+1).padStart(2,"0")}/${dd}`, // YYYY/MM/DD
+      `${dd}/${String(d.getMonth()+1).padStart(2,"0")}/${yyyy}`, // DD/MM/YYYY
+    ]
+  }
+
+  const expiryVariants = convertExpiry(expiry)
+
+  // Try each expiry variant until we get results
+  for (const ev of expiryVariants) {
+    const { data, error } = await supabase
+      .from(tableName)
+      .select("*")
+      .eq(expiryCol, ev)
+      .in(strikeCol, strikes)
+      .order(strikeCol, { ascending: true })
+      .limit(500)
+
+    if (error || !data || data.length === 0) continue
+
+    // Detect format and normalise
+    if (isNarrowFormat(data)) {
+      return normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
+    } else {
+      return data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
+    }
+  }
+
+  // Nothing found for this expiry — return empty (caller will use BS fallback)
+  return []
+}
+
+// ─── Fetch all available expiry dates from bhav tables ───────────────────────
+async function fetchBhavExpiries(symbol: string): Promise<string[]> {
+  const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+  // Probe schema first to find expiry column
+  const { data: probe } = await supabase.from(tableName).select("*").limit(1)
+  if (!probe || !probe.length) return []
+  const keys = Object.keys(probe[0])
+  const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
+
+  const { data } = await supabase
     .from(tableName)
-    .select("*")
-    .eq("expiry_date", expiry)
-    .in("strike_price", strikes)
-    .order("strike_price", { ascending: true })
+    .select(expiryCol)
+    .order(expiryCol, { ascending: true })
+  if (!data) return []
 
-  if (error || !data) return []
-  return data
+  const raw = [...new Set(data.map((r: any) => String(r[expiryCol] ?? "").trim()))].filter(Boolean)
+  // Normalise all to YYYY-MM-DD
+  return raw.map(v => {
+    // Try DD-MMM-YYYY  e.g. "25-JAN-2025"
+    const m1 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+    if (m1) {
+      const months: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
+      const mm = months[m1[2].toUpperCase()]
+      if (mm) return `${m1[3]}-${mm}-${m1[1].padStart(2,"0")}`
+    }
+    // Try DD-MMM-YY  e.g. "25-JAN-25"
+    const m2 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/)
+    if (m2) {
+      const months: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
+      const mm = months[m2[2].toUpperCase()]
+      const year = `20${m2[3]}`
+      if (mm) return `${year}-${mm}-${m2[1].padStart(2,"0")}`
+    }
+    // YYYY-MM-DD already
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v
+    return v // leave as-is if unrecognised
+  }).sort()
+}
+
+// ─── Fetch all dates available in bhav (for replay) ──────────────────────────
+async function fetchBhavDates(symbol: string): Promise<string[]> {
+  const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+  const { data: probe } = await supabase.from(tableName).select("*").limit(1)
+  if (!probe || !probe.length) return []
+  const keys = Object.keys(probe[0])
+  const dateCol = keys.find(k => /^date$|^trade_date$|^timestamp$/i.test(k)) ?? "date"
+
+  const { data } = await supabase
+    .from(tableName)
+    .select(dateCol)
+    .order(dateCol, { ascending: true })
+  if (!data) return []
+  return [...new Set(data.map((r: any) => String(r[dateCol] ?? "").slice(0, 10)))].filter(Boolean).sort()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -557,7 +869,7 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
 // EXPIRY P&L POPUP
 // ═════════════════════════════════════════════════════════════════════════════
 
-function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () => void }) {
+function ExpiryPnLPopup({ positions, onClose, onNewSession }: { positions: any[]; onClose: () => void; onNewSession?: () => void }) {
   const totalPnL = positions.reduce((s, p) => s + (p.realized_pnl ?? 0), 0)
   const profitable = positions.filter(p => (p.realized_pnl ?? 0) >= 0)
   const losing = positions.filter(p => (p.realized_pnl ?? 0) < 0)
@@ -574,7 +886,7 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
               </div>
               <div>
                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Expiry Settlement</div>
-                <div className="text-sm font-bold text-foreground">Today's Expired Positions</div>
+                <div className="text-sm font-bold text-foreground">Session Expired · Final P&amp;L</div>
               </div>
             </div>
             <button onClick={onClose} className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center hover:bg-muted/80">
@@ -585,7 +897,7 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
             <div className="text-3xl font-bold font-mono mb-1" style={{ color: totalPnL >= 0 ? "var(--success)" : "var(--destructive)" }}>
               {totalPnL >= 0 ? "+" : ""}{fmt(totalPnL)}
             </div>
-            <div className="text-sm text-muted-foreground">Net P&L from expiry</div>
+            <div className="text-sm text-muted-foreground">Net P&amp;L from expiry</div>
           </div>
           {/* Win/Loss summary */}
           <div className="grid grid-cols-3 gap-3 mt-4">
@@ -604,7 +916,7 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
           </div>
         </div>
         {/* Positions list */}
-        <div className="p-4 max-h-64 overflow-y-auto">
+        <div className="p-4 max-h-56 overflow-y-auto">
           <div className="space-y-2">
             {positions.map((p, i) => {
               const pnl = p.realized_pnl ?? 0
@@ -626,9 +938,16 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
             })}
           </div>
         </div>
-        <div className="p-4 pt-0">
-          <button onClick={onClose} className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors">
-            Got it! Continue Trading
+        <div className="p-4 pt-0 space-y-2">
+          {onNewSession && (
+            <button onClick={onNewSession}
+              className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors flex items-center justify-center gap-2">
+              <RefreshCw className="w-4 h-4" /> Start New Session (Reset ₹10L)
+            </button>
+          )}
+          <button onClick={onClose}
+            className="w-full bg-muted text-muted-foreground font-semibold py-2.5 rounded-xl text-sm hover:bg-muted/80 transition-colors">
+            Continue with current balance
           </button>
         </div>
       </div>
@@ -645,46 +964,87 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
   spot: number; vix: number; symbol: string; expiry: string
   onExpiryChange: (e: string) => void; onSymbolChange: (s: string) => void
 }) {
-  const [chainData, setChainData] = useState<any[]>([])
-  const [loading, setLoading] = useState(false)
-  const [tradeModal, setTradeModal] = useState<{ strike: number; type: OptionType; premium: number } | null>(null)
-  const [lots, setLots] = useState(1)
-  const [tradeType, setTradeType] = useState<TradeType>("BUY")
-  const [placing, setPlacing] = useState(false)
-  const [tradeMsg, setTradeMsg] = useState("")
+  const [chainData,    setChainData]    = useState<NormRow[]>([])
+  const [dataSource,   setDataSource]   = useState<"bhav" | "bs" | "none">("none")
+  const [loading,      setLoading]      = useState(false)
+  const [bhavExpiries, setBhavExpiries] = useState<string[]>([])
+  const [tradeModal,   setTradeModal]   = useState<{ strike: number; type: OptionType; premium: number } | null>(null)
+  const [lots,         setLots]         = useState(1)
+  const [tradeType,    setTradeType]    = useState<TradeType>("BUY")
+  const [placing,      setPlacing]      = useState(false)
+  const [tradeMsg,     setTradeMsg]     = useState("")
+  const [debugMsg,     setDebugMsg]     = useState("")
 
-  const expiryOptions = getWeeklyExpiries(symbol)
   const interval = getStrikeInterval(symbol)
   const atm = spot > 0 ? Math.round(spot / interval) * interval : 0
-
   const lotSize = LOT_SIZES[symbol] ?? 75
   const dte = expiry ? daysToExpiry(expiry) : 30
   const move = spot > 0 && vix > 0 ? expectedMove(spot, vix, dte) : null
 
+  // Merge bhav expiries with calculated ones; bhav expiries take priority
+  const calculatedExpiries = getWeeklyExpiries(symbol)
+  const allExpiries = bhavExpiries.length > 0
+    ? [...new Set([...bhavExpiries, ...calculatedExpiries])].sort()
+    : calculatedExpiries
+
+  // Load bhav expiries once per symbol change
   useEffect(() => {
-    if (!expiry || spot <= 0) return
+    fetchBhavExpiries(symbol).then(exps => {
+      if (exps.length > 0) {
+        setBhavExpiries(exps)
+        const today = new Date().toISOString().slice(0,10)
+        if (!exps.includes(expiry)) {
+          const future = exps.filter(e => e >= today)
+          if (future.length > 0) onExpiryChange(future[0])
+        }
+      }
+    })
+  }, [symbol])
+
+  useEffect(() => {
+    if (!expiry) return
     loadChain()
-  }, [symbol, expiry, spot])
+  }, [symbol, expiry, spot, vix])
 
   async function loadChain() {
     setLoading(true)
-    // Try bhav copy first for historical/today's data
-    const bhavData = await fetchBhavOptionChain(symbol, expiry, spot)
+    setDebugMsg("")
+
+    // ── 1. Try Supabase bhav data ─────────────────────────────────────────────
+    const bhavData = await fetchBhavOptionChain(symbol, expiry, spot > 0 ? spot : 24500)
+
     if (bhavData.length > 0) {
-      setChainData(bhavData)
+      // Enrich missing IV / LTP with BS estimates so the chain is never empty
+      const enriched = bhavData.map(row => {
+        const s = spot > 0 ? spot : row.strike_price
+        return {
+          ...row,
+          ce_ltp: row.ce_ltp ?? (s > 0 ? calcOptionPremium(s, row.strike_price, expiry, "CE", vix/100) : null),
+          pe_ltp: row.pe_ltp ?? (s > 0 ? calcOptionPremium(s, row.strike_price, expiry, "PE", vix/100) : null),
+          ce_iv: row.ce_iv ?? vix,
+          pe_iv: row.pe_iv ?? vix,
+        }
+      })
+      setChainData(enriched)
+      setDataSource("bhav")
+      const hasOI = enriched.some(r => r.ce_oi != null || r.pe_oi != null)
+      setDebugMsg(`📊 Live Bhav data — ${enriched.length} strikes${hasOI ? " · OI + Volume available" : " · no OI column in table"}`)
     } else {
-      // Synthesize from Black-Scholes for live/future dates
-      if (spot <= 0) { setLoading(false); return }
+      // ── 2. Fall back to Black-Scholes when no bhav data ───────────────────
+      if (spot <= 0) { setLoading(false); setDataSource("none"); setDebugMsg("⚠ Enter or fetch spot price first"); return }
       const strikes = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
-      const synthetic = strikes.map(strike => ({
+      const synthetic: NormRow[] = strikes.map(strike => ({
         strike_price: strike,
-        ce_ltp: calcOptionPremium(spot, strike, expiry, "CE", vix / 100),
-        pe_ltp: calcOptionPremium(spot, strike, expiry, "PE", vix / 100),
-        ce_iv: vix, pe_iv: vix,
-        ce_oi: null, pe_oi: null,
+        expiry_date:  expiry,
+        ce_ltp:    calcOptionPremium(spot, strike, expiry, "CE", vix / 100),
+        pe_ltp:    calcOptionPremium(spot, strike, expiry, "PE", vix / 100),
+        ce_iv:     vix, pe_iv: vix,
+        ce_oi:     null, pe_oi:     null,
         ce_volume: null, pe_volume: null,
       }))
       setChainData(synthetic)
+      setDataSource("bs")
+      setDebugMsg("~Black-Scholes estimates (no bhav match for this expiry — check expiry date format in DB)")
     }
     setLoading(false)
   }
@@ -754,7 +1114,6 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
     setTimeout(() => { setTradeModal(null); setTradeMsg("") }, 1500)
   }
 
-  const ceStrikes = chainData.filter(r => r.ce_ltp != null || r.call_close != null)
   const sortedStrikes = [...new Set(chainData.map(r => r.strike_price))].sort((a, b) => a - b)
 
   return (
@@ -773,7 +1132,7 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
             <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Expiry</label>
             <select value={expiry} onChange={e => onExpiryChange(e.target.value)}
               className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
-              {expiryOptions.map(e => <option key={e} value={e}>{formatExpiry(e)} · {Math.round(daysToExpiry(e))}d</option>)}
+              {allExpiries.map(e => <option key={e} value={e}>{formatExpiry(e)}{bhavExpiries.includes(e) ? " ✦" : ""} · {Math.round(daysToExpiry(e))}d</option>)}
             </select>
           </div>
           <button onClick={loadChain} disabled={loading}
@@ -824,12 +1183,14 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
         <div className="px-4 py-3 border-b border-border bg-muted/50 flex items-center gap-2">
           <span className="text-xs font-bold text-foreground">Option Chain — {symbol} {expiry ? formatExpiry(expiry) : ""}</span>
           <span className="text-[10px] text-muted-foreground">{loading ? "Loading…" : `${sortedStrikes.length} strikes · ATM: ${atm}`}</span>
-          {chainData.length > 0 && chainData[0]?.ce_oi != null && (
-            <span className="ml-auto text-[10px] bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 px-2 py-0.5 rounded-full font-semibold">📊 Bhav Copy Data</span>
-          )}
-          {chainData.length > 0 && chainData[0]?.ce_oi == null && (
-            <span className="ml-auto text-[10px] bg-warning/10 text-warning px-2 py-0.5 rounded-full font-semibold">~BS Theoretical</span>
-          )}
+          <span className={`ml-auto text-[10px] px-2 py-0.5 rounded-full font-semibold ${
+            dataSource === "bhav" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" :
+            dataSource === "bs"   ? "bg-warning/10 text-warning" :
+                                    "bg-muted text-muted-foreground"
+          }`}>
+            {dataSource === "bhav" ? "📊 Bhav Data" : dataSource === "bs" ? "~BS Theoretical" : "No Data"}
+          </span>
+          {debugMsg && <span className="text-[10px] text-muted-foreground truncate max-w-xs">{debugMsg}</span>}
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-xs">
@@ -1335,32 +1696,66 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
   const [currentDate, setCurrentDate] = useState("2024-08-01")
   const [isPlaying, setIsPlaying] = useState(false)
   const [speed, setSpeed] = useState(1000) // ms per day
-  const [bhavData, setBhavData] = useState<any[]>([])
+  const [allDates, setAllDates] = useState<string[]>([])
+  const [normRows, setNormRows] = useState<NormRow[]>([])  // normalised rows for current date
   const [loading, setLoading] = useState(false)
-  const [currentRow, setCurrentRow] = useState<any | null>(null)
+  const [loadMsg, setLoadMsg] = useState("")
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
   const replaySym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
   const tableName = replaySym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
 
   async function loadBhav() {
     setLoading(true)
-    // Get distinct dates from bhav
-    const { data } = await supabase
-      .from(tableName)
-      .select("date, strike_price, expiry_date, ce_ltp, pe_ltp, ce_iv, pe_iv, ce_oi, pe_oi")
-      .gte("date", fromDate)
-      .order("date", { ascending: true })
-      .limit(5000)
-    if (data) { setBhavData(data); if (data.length > 0) setCurrentDate(data[0].date) }
+    setLoadMsg("")
+
+    // Step 1: get all available dates from the table (schema-aware)
+    const dates = await fetchBhavDates(replaySym)
+    const filteredDates = dates.filter(d => d >= fromDate)
+
+    if (filteredDates.length === 0) {
+      setLoadMsg("⚠ No data found from this date. Check table name and date column.")
+      setLoading(false); return
+    }
+
+    setAllDates(filteredDates)
+    const firstDate = filteredDates[0]
+    setCurrentDate(firstDate)
+    await loadDateRows(firstDate)
+    setLoadMsg(`✅ Loaded ${filteredDates.length} trading days`)
     setLoading(false)
   }
 
-  const allDates = [...new Set(bhavData.map(r => r.date))].sort()
+  async function loadDateRows(date: string) {
+    // Probe schema to find actual date column name
+    const { data: probe } = await supabase.from(tableName).select("*").limit(1)
+    if (!probe || !probe.length) return
+    const keys = Object.keys(probe[0])
+    const dateCol   = keys.find(k => /^date$|^trade_date$|^timestamp$/i.test(k)) ?? "date"
+    const strikeCol = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
+
+    const { data } = await supabase
+      .from(tableName)
+      .select("*")
+      .eq(dateCol, date)
+      .order(strikeCol, { ascending: true })
+      .limit(500)
+
+    if (!data || data.length === 0) { setNormRows([]); return }
+
+    if (isNarrowFormat(data)) {
+      setNormRows(normaliseNarrowRows(data))
+    } else {
+      setNormRows(data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price))
+    }
+  }
+
+  const currentIdxRef = useRef(0)
 
   function stepTo(date: string) {
+    const idx = allDates.indexOf(date)
+    currentIdxRef.current = idx >= 0 ? idx : currentIdxRef.current
     setCurrentDate(date)
-    const rows = bhavData.filter(r => r.date === date)
-    if (rows.length > 0) setCurrentRow({ date, rows })
+    loadDateRows(date)
   }
 
   function togglePlay() {
@@ -1368,16 +1763,19 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
       if (intervalRef.current) clearInterval(intervalRef.current)
       setIsPlaying(false)
     } else {
+      // Sync ref to current state before starting
+      currentIdxRef.current = allDates.indexOf(currentDate)
       setIsPlaying(true)
-      let idx = allDates.indexOf(currentDate)
       intervalRef.current = setInterval(() => {
-        idx++
-        if (idx >= allDates.length) {
+        currentIdxRef.current++
+        if (currentIdxRef.current >= allDates.length) {
           if (intervalRef.current) clearInterval(intervalRef.current)
           setIsPlaying(false)
           return
         }
-        stepTo(allDates[idx])
+        const nextDate = allDates[currentIdxRef.current]
+        setCurrentDate(nextDate)
+        loadDateRows(nextDate)
       }, speed)
     }
   }
@@ -1387,7 +1785,6 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
   }, [])
 
   const currentIdx = allDates.indexOf(currentDate)
-  const todayRows = bhavData.filter(r => r.date === currentDate)
 
   return (
     <div className="space-y-4">
@@ -1417,6 +1814,7 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
             className="flex items-center gap-1.5 px-4 py-2 bg-primary text-primary-foreground text-xs font-semibold rounded-lg hover:bg-primary/90">
             {loading ? <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <><Search className="w-3.5 h-3.5" />Load Data</>}
           </button>
+          {loadMsg && !loading && <p className={`text-xs self-end ${loadMsg.startsWith("✅") ? "text-success" : "text-warning"}`}>{loadMsg}</p>}
         </div>
 
         {allDates.length > 0 && (
@@ -1455,33 +1853,43 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
         )}
       </div>
 
-      {/* Today's bhav data */}
-      {todayRows.length > 0 && (
+      {/* Normalised bhav data for current replay date */}
+      {normRows.length > 0 && (
         <div className="bg-card border border-border rounded-xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-border bg-muted/50">
+          <div className="px-4 py-3 border-b border-border bg-muted/50 flex items-center gap-2">
             <span className="text-xs font-bold text-foreground">{replaySym} Option Chain — {currentDate}</span>
-            <span className="text-[10px] text-muted-foreground ml-2">{todayRows.length} rows from Bhav Copy</span>
+            <span className="text-[10px] text-muted-foreground ml-2">{normRows.length} strikes</span>
+            {normRows.some(r => r.ce_oi != null) && <span className="text-[10px] bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 px-2 py-0.5 rounded-full font-semibold ml-auto">OI ✓</span>}
           </div>
           <div className="overflow-x-auto max-h-80">
             <table className="w-full text-xs">
               <thead>
                 <tr className="bg-muted/30 sticky top-0">
-                  {["Expiry","Strike","CE LTP","CE OI","PE LTP","PE OI","CE IV","PE IV"].map(h => (
-                    <th key={h} className="px-3 py-2 text-right first:text-left text-[10px] font-semibold text-muted-foreground">{h}</th>
-                  ))}
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-muted-foreground">Expiry</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">Strike</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-bold text-success">CE LTP</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">CE OI</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">CE Vol</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-bold text-destructive">PE LTP</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">PE OI</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">PE Vol</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">CE IV</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">PE IV</th>
                 </tr>
               </thead>
               <tbody>
-                {[...todayRows].sort((a, b) => a.strike_price - b.strike_price).map((r, i) => (
+                {normRows.map((r, i) => (
                   <tr key={i} className="border-t border-border/50 hover:bg-muted/30">
-                    <td className="px-3 py-2 font-mono text-muted-foreground">{r.expiry_date}</td>
+                    <td className="px-3 py-2 font-mono text-muted-foreground text-[10px]">{r.expiry_date || "—"}</td>
                     <td className="px-3 py-2 text-right font-mono font-bold">{fmtN(r.strike_price)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-success">{r.ce_ltp != null ? fmtN(r.ce_ltp) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.ce_oi != null ? (r.ce_oi / 1000).toFixed(0) + "K" : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-destructive">{r.pe_ltp != null ? fmtN(r.pe_ltp) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.pe_oi != null ? (r.pe_oi / 1000).toFixed(0) + "K" : "—"}</td>
-                    <td className="px-3 py-2 text-right text-muted-foreground">{r.ce_iv != null ? r.ce_iv.toFixed(1) + "%" : "—"}</td>
-                    <td className="px-3 py-2 text-right text-muted-foreground">{r.pe_iv != null ? r.pe_iv.toFixed(1) + "%" : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-success font-semibold">{r.ce_ltp != null ? fmtN(r.ce_ltp) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.ce_oi != null ? (r.ce_oi >= 1000 ? (r.ce_oi/1000).toFixed(0)+"K" : r.ce_oi) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.ce_volume != null ? (r.ce_volume >= 1000 ? (r.ce_volume/1000).toFixed(0)+"K" : r.ce_volume) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-destructive font-semibold">{r.pe_ltp != null ? fmtN(r.pe_ltp) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.pe_oi != null ? (r.pe_oi >= 1000 ? (r.pe_oi/1000).toFixed(0)+"K" : r.pe_oi) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.pe_volume != null ? (r.pe_volume >= 1000 ? (r.pe_volume/1000).toFixed(0)+"K" : r.pe_volume) : "—"}</td>
+                    <td className="px-3 py-2 text-right text-muted-foreground">{r.ce_iv != null ? r.ce_iv.toFixed(1)+"%" : "—"}</td>
+                    <td className="px-3 py-2 text-right text-muted-foreground">{r.pe_iv != null ? r.pe_iv.toFixed(1)+"%" : "—"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1490,11 +1898,12 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
         </div>
       )}
 
-      {bhavData.length === 0 && !loading && (
+      {allDates.length === 0 && !loading && (
         <div className="bg-card border border-border rounded-xl p-10 text-center">
           <Clock className="w-10 h-10 text-muted-foreground/30 mx-auto mb-3" />
           <p className="text-sm font-semibold text-muted-foreground">Load historical bhav data to replay</p>
           <p className="text-xs text-muted-foreground mt-1">Data available from Aug 2024 – May 2026</p>
+          {loadMsg && <p className="text-xs text-warning mt-2">{loadMsg}</p>}
         </div>
       )}
     </div>
@@ -1731,10 +2140,11 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [vix,          setVix]          = useState(15)
   const [chainSymbol,  setChainSymbol]  = useState("NIFTY")
   const [chainExpiry,  setChainExpiry]  = useState(getThursdaysForNext3Months()[0] ?? "")
-  const [expiryPopup,  setExpiryPopup]  = useState<any[] | null>(null)
+  const [expiryPopup,          setExpiryPopup]          = useState<any[] | null>(null)
+  const [autoPlayShowNewSession, setAutoPlayShowNewSession] = useState(false)
   const positionsRef    = useRef<any[]>([])
   const targetPricesRef = useRef<Record<string, number>>({})
-  const [autoPlayTimer, setAutoPlayTimer] = useState<NodeJS.Timeout | null>(null)
+  const [autoPlayTimer, setAutoPlayTimer] = useState<ReturnType<typeof setTimeout> | null>(null)
   const [isAutoPlay, setIsAutoPlay] = useState(false)
   const autoPlayRef = useRef(false)
 
@@ -1816,18 +2226,44 @@ function TradingDashboard({ userId }: { userId: string }) {
     setFetching(false)
   }, [vix])
 
-  // Auto-fetch spot for option chain
+  const [schemaInfo,   setSchemaInfo]   = useState<string>("")
+  const [showSchema,   setShowSchema]   = useState(false)
+  const [manualSpot,   setManualSpot]   = useState("")
+
+  // Auto-fetch spot for option chain — fully wrapped so a CORS/network failure never crashes the component
   async function fetchChainSpot() {
-    const p = await fetchLivePrice(chainSymbol, "EQUITY")
-    if (p) setSpot(p)
-    const v = await fetchVIXFromSupabase()
-    setVix(v)
+    try {
+      const p = await fetchLivePrice(chainSymbol, "EQUITY")
+      if (p && p > 0) { setSpot(p); setManualSpot(String(p)) }
+    } catch {}
+    try {
+      const v = await fetchVIXFromSupabase()
+      if (v > 0) setVix(v)
+    } catch {}
+  }
+
+  // Schema probe — shows exactly what columns are in your bhav tables
+  async function probeSchema() {
+    const lines: string[] = []
+    for (const tbl of ["nifty_options","banknifty_options","india_vix"]) {
+      const { data, error } = await supabase.from(tbl).select("*").limit(3)
+      if (error) { lines.push(`❌ ${tbl}: ${error.message}`); continue }
+      if (!data || !data.length) { lines.push(`⚠ ${tbl}: table exists but no rows`); continue }
+      const cols = Object.keys(data[0])
+      lines.push(`✅ ${tbl} (${cols.length} cols): ${cols.join(", ")}`)
+      lines.push(`   Sample row[0]: ${JSON.stringify(data[0]).slice(0,200)}`)
+    }
+    setSchemaInfo(lines.join("\n"))
+    setShowSchema(true)
   }
 
   useEffect(() => {
     load().then(() => {
-      setTimeout(() => { checkExpiry(); checkSquareOff() }, 1500)
-    })
+      setTimeout(() => {
+        try { checkExpiry() } catch {}
+        try { checkSquareOff() } catch {}
+      }, 1500)
+    }).catch(() => {})
   }, [load])
 
   useEffect(() => {
@@ -1841,26 +2277,87 @@ function TradingDashboard({ userId }: { userId: string }) {
   }, [positions.length, refreshLivePrices])
 
   // Fetch spot on symbol change
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchChainSpot() }, [chainSymbol])
 
-  // Daily auto-play: check expiry at start of each "day"
+  // ─── AutoPlay: simulate one trading day at a time through bhav replay ────────
+  // When the expiry date of an open position is reached, settle it, show popup,
+  // then automatically reset the virtual wallet and start a new session.
+  const autoPlayDatesRef  = useRef<string[]>([])
+  const autoPlayIdxRef    = useRef(0)
+  const autoPlaySpeedRef  = useRef(1500) // ms per simulated day
+
+  async function resetSession() {
+    // Close all open positions at 0 (expired worthless), then reset wallet to ₹10L
+    for (const pos of positionsRef.current) {
+      await supabase.from("positions").update({ status: "CLOSED", closed_at: new Date().toISOString(), pnl: 0 }).eq("id", pos.id)
+    }
+    await supabase.from("wallets").update({ balance: 1_000_000 }).eq("user_id", userId)
+    await load()
+  }
+
   function startAutoPlay() {
     if (isAutoPlay) return
-    setIsAutoPlay(true)
-    autoPlayRef.current = true
-    const t = setInterval(async () => {
-      if (!autoPlayRef.current) { clearInterval(t); return }
-      await refreshLivePrices()
-      checkExpiry()
-      checkSquareOff()
-    }, 60_000) // check every minute for expiry
-    setAutoPlayTimer(t)
+    // Load all bhav dates for current symbol for the replay
+    fetchBhavDates(["NIFTY","BANKNIFTY"].includes(chainSymbol) ? chainSymbol : "NIFTY").then(dates => {
+      if (dates.length === 0) return
+      autoPlayDatesRef.current = dates
+      autoPlayIdxRef.current = 0
+      setIsAutoPlay(true)
+      autoPlayRef.current = true
+
+      const tick = async () => {
+        if (!autoPlayRef.current) return
+        const idx = autoPlayIdxRef.current
+        const allDates = autoPlayDatesRef.current
+        if (idx >= allDates.length) {
+          stopAutoPlay(); return
+        }
+
+        const simDate = allDates[idx]
+        autoPlayIdxRef.current = idx + 1
+
+        // Check if any open position expires on or before this date
+        const expired = positionsRef.current.filter(p =>
+          (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
+          p.expiry && simDate >= p.expiry
+        )
+
+        if (expired.length > 0) {
+          // Settle expired positions
+          const settled: any[] = []
+          for (const pos of expired) {
+            const settlementPrice = pos.instrument === "OPTIONS" ? 0
+              : (livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price)
+            const pnl = await closePos(pos, settlementPrice)
+            settled.push({ ...pos, realized_pnl: pnl })
+          }
+          autoPlayRef.current = false
+          setIsAutoPlay(false)
+          setExpiryPopup(settled)
+          setAutoPlayShowNewSession(true)
+          return
+        }
+
+        // Refresh live prices
+        try { await refreshLivePrices() } catch {}
+        try { await checkSquareOff() } catch {}
+
+        if (autoPlayRef.current) {
+          const t = setTimeout(tick, autoPlaySpeedRef.current)
+          setAutoPlayTimer(t)
+        }
+      }
+
+      const t = setTimeout(tick, autoPlaySpeedRef.current)
+      setAutoPlayTimer(t)
+    })
   }
 
   function stopAutoPlay() {
     setIsAutoPlay(false)
     autoPlayRef.current = false
-    if (autoPlayTimer) { clearInterval(autoPlayTimer); setAutoPlayTimer(null) }
+    if (autoPlayTimer) { clearTimeout(autoPlayTimer); setAutoPlayTimer(null) }
   }
 
   async function closePos(pos: any, forcePrice?: number) {
@@ -2004,10 +2501,42 @@ function TradingDashboard({ userId }: { userId: string }) {
   return (
     <div>
       {/* Expiry Popup */}
-      {expiryPopup && <ExpiryPnLPopup positions={expiryPopup} onClose={() => setExpiryPopup(null)} />}
+      {expiryPopup && (
+        <ExpiryPnLPopup
+          positions={expiryPopup}
+          onClose={() => { setExpiryPopup(null); setAutoPlayShowNewSession(false) }}
+          onNewSession={autoPlayShowNewSession ? async () => {
+            setExpiryPopup(null)
+            setAutoPlayShowNewSession(false)
+            await resetSession()
+          } : undefined}
+        />
+      )}
+
+      {/* Schema debug modal */}
+      {showSchema && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-card border border-border rounded-2xl w-full max-w-2xl shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+              <div>
+                <div className="font-bold text-foreground">Supabase Table Schema Probe</div>
+                <div className="text-[11px] text-muted-foreground">Shows actual column names in your bhav tables — use this to verify the data layer</div>
+              </div>
+              <button onClick={() => setShowSchema(false)} className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center"><X className="w-4 h-4" /></button>
+            </div>
+            <div className="p-5 max-h-96 overflow-y-auto">
+              <pre className="text-[11px] font-mono text-foreground whitespace-pre-wrap bg-muted rounded-xl p-4 leading-relaxed">{schemaInfo || "Loading…"}</pre>
+            </div>
+            <div className="px-5 py-3 border-t border-border text-[10px] text-muted-foreground">
+              If column names differ from what the code expects, the normaliser will still try to map them.
+              Check that strike and expiry columns are present.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Top bar */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs bg-primary/10 text-primary px-2 py-1 rounded-full font-semibold">PAPER MONEY</span>
           {profile && <span className="text-xs text-muted-foreground hidden sm:block">{profile.full_name} · +91 {profile.mobile}</span>}
@@ -2019,10 +2548,33 @@ function TradingDashboard({ userId }: { userId: string }) {
             {isAutoPlay ? <><Pause className="w-3 h-3" />Auto-Play ON</> : <><Play className="w-3 h-3" />Auto-Play</>}
           </button>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Manual spot override — for when Yahoo fetch fails */}
+          <div className="flex items-center gap-1 bg-muted rounded-lg px-2 py-1">
+            <span className="text-[10px] text-muted-foreground font-semibold">Spot ₹</span>
+            <input
+              type="number" value={manualSpot} placeholder={spot > 0 ? String(Math.round(spot)) : "e.g. 24500"}
+              onChange={e => {
+                setManualSpot(e.target.value)
+                const v = parseFloat(e.target.value)
+                if (v > 1000) setSpot(v)
+              }}
+              className="w-20 text-xs font-mono bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground/50"
+            />
+            <button onClick={fetchChainSpot} title="Auto-fetch from Yahoo Finance"
+              className="text-primary hover:text-primary/80">
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </div>
           <button onClick={() => { load(); refreshLivePrices(); fetchChainSpot() }}
             className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground bg-muted rounded-lg px-2 py-1.5 transition-colors">
             <RefreshCw className={`w-3.5 h-3.5 ${fetching ? "animate-spin text-primary" : ""}`} /> Refresh
+          </button>
+          {/* Schema debug button */}
+          <button onClick={probeSchema}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground bg-muted rounded-lg px-2 py-1.5 transition-colors"
+            title="Check what columns exist in your Supabase bhav tables">
+            <Settings className="w-3 h-3" /> DB Schema
           </button>
           <button onClick={() => supabase.auth.signOut().then(() => window.location.reload())}
             className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-destructive transition-colors">
@@ -2083,7 +2635,11 @@ function TradingDashboard({ userId }: { userId: string }) {
       <div className="flex items-center gap-2 mb-4 text-[10px] text-muted-foreground">
         <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
         {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · auto-refresh every 30s` : "Click refresh to load prices"}
-        {isAutoPlay && <span className="ml-2 text-success font-semibold animate-pulse">● Auto-play active — daily expiry check running</span>}
+        {isAutoPlay && (
+          <span className="ml-2 text-success font-semibold animate-pulse">
+            ● Auto-play active · simulating day {autoPlayIdxRef.current} of {autoPlayDatesRef.current.length} · expiry check running
+          </span>
+        )}
       </div>
 
       {/* Tab content */}
