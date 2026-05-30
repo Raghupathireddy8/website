@@ -12,6 +12,25 @@
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS strike_price   NUMERIC;
 //   ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS option_type    TEXT;
 //
+//   -- Strategy builder tables
+//   CREATE TABLE IF NOT EXISTS strategies (
+//     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+//     user_id UUID REFERENCES auth.users(id),
+//     name TEXT NOT NULL,
+//     description TEXT,
+//     legs JSONB DEFAULT '[]',
+//     created_at TIMESTAMPTZ DEFAULT NOW()
+//   );
+//
+//   -- Replay sessions
+//   CREATE TABLE IF NOT EXISTS replay_sessions (
+//     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+//     user_id UUID REFERENCES auth.users(id),
+//     symbol TEXT NOT NULL,
+//     from_date DATE NOT NULL,
+//     to_date DATE,
+//     created_at TIMESTAMPTZ DEFAULT NOW()
+//   );
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const dynamic = "force-dynamic"
@@ -25,10 +44,12 @@ import {
   Eye, EyeOff, Phone, Lock, User, ArrowRight, Mail,
   TrendingUp, TrendingDown, RefreshCw, LogOut,
   X, History, BarChart2, ChevronDown, Wallet, KeyRound, BookOpen,
+  Play, Pause, SkipForward, SkipBack, Zap, Target, Layers,
+  ChevronRight, Plus, Minus, Activity, Clock, Calendar,
+  Info, AlertTriangle, CheckCircle2, Search, Settings, Star,
 } from "lucide-react"
 
 // ─── NSE F&O Lot Sizes — effective 2025-26 ───────────────────────────────────
-// Source: NSE circulars. Update when NSE revises: nseindia.com/circulars
 const LOT_SIZES: Record<string, number> = {
   NIFTY: 75,    BANKNIFTY: 30,  FINNIFTY: 60,   MIDCPNIFTY: 120,
   RELIANCE: 500, TCS: 175,      INFY: 400,      HDFCBANK: 550,
@@ -43,19 +64,23 @@ const LOT_SIZES: Record<string, number> = {
   GRASIM: 475,  INDUSINDBK: 700, TATACONSUM: 1100, DIVISLAB: 200,
 }
 
-// ─── Margin calculator (Zerodha SPAN approximation) ──────────────────────────
-// Options sell: ~20-25% of notional. Futures: ~15% of notional.
-// These are approximations — real margin fluctuates with volatility.
+// Strike intervals per symbol
+const STRIKE_INTERVALS: Record<string, number> = {
+  NIFTY: 50, BANKNIFTY: 100, FINNIFTY: 50, MIDCPNIFTY: 25,
+  default: 50,
+}
+
+function getStrikeInterval(symbol: string): number {
+  return STRIKE_INTERVALS[symbol] ?? STRIKE_INTERVALS.default
+}
+
 function calcOptionsMargin(spot: number, lotSize: number, lots: number): number {
-  // ~20% of notional as initial margin (SPAN + Exposure approx)
   return Math.round(spot * lotSize * lots * 0.20)
 }
 function calcFuturesMargin(spot: number, lotSize: number, lots: number): number {
-  // ~15% of notional (lower than options short margin)
   return Math.round(spot * lotSize * lots * 0.15)
 }
 
-// ─── Nifty 50 stocks only ─────────────────────────────────────────────────────
 const NIFTY50_EQUITY = [
   "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","SBIN",
   "BHARTIARTL","ITC","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI",
@@ -65,15 +90,13 @@ const NIFTY50_EQUITY = [
   "ADANIENT","BAJAJFINSV","DRREDDY","CIPLA","DIVISLAB","INDUSINDBK","TATACONSUM",
 ]
 
-const NIFTY50_FNO = [
-  "NIFTY","BANKNIFTY","FINNIFTY",
-  ...NIFTY50_EQUITY,
-]
+const NIFTY50_FNO = ["NIFTY","BANKNIFTY","FINNIFTY", ...NIFTY50_EQUITY]
 
 type InstrumentType = "EQUITY" | "OPTIONS" | "FUTURES"
 type TradeType      = "BUY" | "SELL"
 type OptionType     = "CE" | "PE"
 type AuthMode       = "login" | "signup" | "forgot" | "verify" | "otp" | "reset"
+type Tab            = "chain" | "strategy" | "replay" | "future" | "positions" | "history" | "ledger"
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmt  = (n: number) =>
@@ -81,65 +104,72 @@ const fmt  = (n: number) =>
 const fmtN = (n: number) =>
   new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n)
 
-// ─── Generate expiry dates ────────────────────────────────────────────────────
-// NSE rules:
-//   Nifty 50  → weekly expiry every TUESDAY
-//   All others → monthly expiry = LAST TUESDAY of the contract month
-//   Holiday rule → user enters date manually
-
 function toISO(d: Date): string {
-  // Use local date (not UTC) to avoid off-by-one due to timezone
   const y = d.getFullYear()
   const m = String(d.getMonth() + 1).padStart(2, "0")
   const day = String(d.getDate()).padStart(2, "0")
   return `${y}-${m}-${day}`
 }
 
-// Nifty weekly: every Tuesday for next 3 months
+// Nifty weekly: every Thursday for next 3 months
 function getThursdaysForNext3Months(): string[] {
   const dates: string[] = []
   const now = new Date(); now.setHours(0, 0, 0, 0)
   const end = new Date(now); end.setMonth(end.getMonth() + 3)
-
   const d = new Date(now)
-  // days until next Tuesday (JS weekday: 0=Sun,1=Mon,2=Tue)
-  let daysAhead = (2 - d.getDay() + 7) % 7
-  if (daysAhead === 0) daysAhead = 7  // if today is Tuesday, go to next Tuesday
+  let daysAhead = (4 - d.getDay() + 7) % 7
+  if (daysAhead === 0) daysAhead = 7
   d.setDate(d.getDate() + daysAhead)
   d.setHours(0, 0, 0, 0)
-
-  while (d <= end) {
-    dates.push(toISO(d))
-    d.setDate(d.getDate() + 7)
-  }
+  while (d <= end) { dates.push(toISO(d)); d.setDate(d.getDate() + 7) }
   return dates
 }
 
-// Monthly: last Tuesday of each month for next 6 months
+function getWeeklyExpiries(symbol: string): string[] {
+  if (symbol === "NIFTY") return getThursdaysForNext3Months()
+  if (symbol === "BANKNIFTY") {
+    // BankNifty weekly on Wednesday
+    const dates: string[] = []
+    const now = new Date(); now.setHours(0, 0, 0, 0)
+    const end = new Date(now); end.setMonth(end.getMonth() + 3)
+    const d = new Date(now)
+    let daysAhead = (3 - d.getDay() + 7) % 7
+    if (daysAhead === 0) daysAhead = 7
+    d.setDate(d.getDate() + daysAhead)
+    d.setHours(0, 0, 0, 0)
+    while (d <= end) { dates.push(toISO(d)); d.setDate(d.getDate() + 7) }
+    return dates
+  }
+  return getMonthlyExpiries()
+}
+
 function getMonthlyExpiries(): string[] {
   const dates: string[] = []
   const now = new Date(); now.setHours(0, 0, 0, 0)
-
   for (let m = 0; m < 6; m++) {
     const totalMonth = now.getMonth() + m
     const year  = now.getFullYear() + Math.floor(totalMonth / 12)
     const month = totalMonth % 12
-    // Last day of this month
     const d = new Date(year, month + 1, 0)
     d.setHours(0, 0, 0, 0)
-    // Walk back to last Tuesday (weekday 2)
-    while (d.getDay() !== 2) d.setDate(d.getDate() - 1)
+    while (d.getDay() !== 4) d.setDate(d.getDate() - 1)
     if (d >= now) dates.push(toISO(d))
   }
   return dates
 }
 
 function formatExpiry(iso: string): string {
-  const d = new Date(iso)
+  const d = new Date(iso + "T00:00:00")
   return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "2-digit" })
 }
 
-// ─── Black-Scholes option pricing ────────────────────────────────────────────
+function daysToExpiry(iso: string): number {
+  const now = new Date()
+  const exp = new Date(iso + "T15:30:00") // NSE close time
+  return Math.max((exp.getTime() - now.getTime()) / (1000 * 60 * 60 * 24), 0)
+}
+
+// ─── Black-Scholes ────────────────────────────────────────────────────────────
 function normalCDF(x: number): number {
   const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741
   const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911
@@ -150,41 +180,44 @@ function normalCDF(x: number): number {
   return 0.5 * (1.0 + sign * y)
 }
 
-function blackScholes(
-  S: number,      // spot price
-  K: number,      // strike price
-  T: number,      // time to expiry in years
-  r: number,      // risk-free rate (0.065 for India)
-  sigma: number,  // volatility (IV)
-  type: "CE" | "PE"
-): number {
+function blackScholes(S: number, K: number, T: number, r: number, sigma: number, type: "CE" | "PE"): number {
   if (T <= 0) return Math.max(type === "CE" ? S - K : K - S, 0)
   const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T))
   const d2 = d1 - sigma * Math.sqrt(T)
-  if (type === "CE") {
-    return S * normalCDF(d1) - K * Math.exp(-r * T) * normalCDF(d2)
-  } else {
-    return K * Math.exp(-r * T) * normalCDF(-d2) - S * normalCDF(-d1)
-  }
+  if (type === "CE") return S * normalCDF(d1) - K * Math.exp(-r * T) * normalCDF(d2)
+  return K * Math.exp(-r * T) * normalCDF(-d2) - S * normalCDF(-d1)
 }
 
-function calcOptionPremium(
-  spot: number,
-  strike: number,
-  expiryDate: string,
-  optType: OptionType,
-  iv = 0.18 // default 18% IV — typical for Nifty
-): number {
+function calcOptionPremium(spot: number, strike: number, expiryDate: string, optType: OptionType, iv = 0.18): number {
   const now   = new Date()
-  const expiry = new Date(expiryDate)
+  const expiry = new Date(expiryDate + "T15:30:00")
   const T     = Math.max((expiry.getTime() - now.getTime()) / (365 * 24 * 60 * 60 * 1000), 0)
   const premium = blackScholes(spot, strike, T, 0.065, iv, optType)
   return Math.round(premium * 100) / 100
 }
 
-// ─── Charges calculation ──────────────────────────────────────────────────────
+// Greeks calculation
+function calcGreeks(S: number, K: number, T: number, r: number, sigma: number, type: "CE" | "PE") {
+  if (T <= 0) return { delta: type === "CE" ? (S > K ? 1 : 0) : (S < K ? -1 : 0), gamma: 0, theta: 0, vega: 0, iv: sigma }
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T))
+  const d2 = d1 - sigma * Math.sqrt(T)
+  const nd1 = (1 / Math.sqrt(2 * Math.PI)) * Math.exp(-0.5 * d1 * d1)
+  const delta = type === "CE" ? normalCDF(d1) : normalCDF(d1) - 1
+  const gamma = nd1 / (S * sigma * Math.sqrt(T))
+  const theta = type === "CE"
+    ? (-(S * nd1 * sigma) / (2 * Math.sqrt(T)) - r * K * Math.exp(-r * T) * normalCDF(d2)) / 365
+    : (-(S * nd1 * sigma) / (2 * Math.sqrt(T)) + r * K * Math.exp(-r * T) * normalCDF(-d2)) / 365
+  const vega = S * nd1 * Math.sqrt(T) / 100
+  return { delta, gamma, theta: Math.round(theta * 100) / 100, vega: Math.round(vega * 100) / 100, iv: sigma }
+}
+
+// VIX-based expected move: 1SD move = Spot × (VIX/100) × √(DTE/365)
+function expectedMove(spot: number, vix: number, dte: number): { up: number; down: number; pct: number } {
+  const pct = (vix / 100) * Math.sqrt(dte / 365)
+  return { up: spot * (1 + pct), down: spot * (1 - pct), pct: pct * 100 }
+}
+
 function calcCharges(premium: number, qty: number, type: InstrumentType, side: TradeType) {
-  // For options: turnover = premium * qty (NOT spot * qty)
   const to        = premium * qty
   const brokerage = type === "EQUITY" ? Math.min(20, to * 0.0003) : 20
   const stt       = side === "SELL" && type === "EQUITY" ? to * 0.001
@@ -194,19 +227,14 @@ function calcCharges(premium: number, qty: number, type: InstrumentType, side: T
   return Math.round((brokerage + stt + other + stamp) * 100) / 100
 }
 
-// ─── Live price fetch (Yahoo Finance via CORS proxy) ─────────────────────────
-// Returns null on failure — caller should show last known price
 async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<number | null> {
-  const ySym = type === "EQUITY"         ? `${symbol}.NS`
-             : symbol === "NIFTY"        ? "^NSEI"
-             : symbol === "BANKNIFTY"    ? "^NSEBANK"
-             : symbol === "FINNIFTY"     ? "^NSEMDCP50"
-             : symbol === "MIDCPNIFTY"   ? "^NSEMDCP50"
+  const ySym = type === "EQUITY"      ? `${symbol}.NS`
+             : symbol === "NIFTY"     ? "^NSEI"
+             : symbol === "BANKNIFTY" ? "^NSEBANK"
+             : symbol === "FINNIFTY"  ? "^NSEMDCP50"
              : `${symbol}.NS`
 
   const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySym)}?interval=1m&range=1d`
-
-  // Try proxy 1
   try {
     const res  = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`, { cache: "no-store" })
     if (res.ok) {
@@ -215,46 +243,63 @@ async function fetchLivePrice(symbol: string, type: InstrumentType): Promise<num
       const p    = json?.chart?.result?.[0]?.meta?.regularMarketPrice
       if (p && p > 0) return Math.round(p * 100) / 100
     }
-  } catch { /* fall through */ }
-
-  // Try proxy 2
+  } catch {}
   try {
-    const res2 = await fetch(
-      `https://corsproxy.io/?${encodeURIComponent(`https://query2.finance.yahoo.com/v8/finance/chart/${ySym}?interval=1m&range=1d`)}`,
-      { cache: "no-store" }
-    )
+    const res2 = await fetch(`https://corsproxy.io/?${encodeURIComponent(`https://query2.finance.yahoo.com/v8/finance/chart/${ySym}?interval=1m&range=1d`)}`, { cache: "no-store" })
     if (res2.ok) {
       const json2 = await res2.json()
       const p2    = json2?.chart?.result?.[0]?.meta?.regularMarketPrice
       if (p2 && p2 > 0) return Math.round(p2 * 100) / 100
     }
-  } catch { /* give up */ }
-
+  } catch {}
   return null
 }
 
-// Fetch live prices for multiple symbols in parallel
-async function fetchLivePrices(
-  items: { symbol: string; instrument: InstrumentType }[]
-): Promise<Record<string, number>> {
-  const unique = Array.from(
-    new Map(items.map(i => [`${i.symbol}__${i.instrument}`, i])).values()
-  )
+async function fetchLivePrices(items: { symbol: string; instrument: InstrumentType }[]): Promise<Record<string, number>> {
+  const unique = Array.from(new Map(items.map(i => [`${i.symbol}__${i.instrument}`, i])).values())
   const results = await Promise.allSettled(
     unique.map(i => fetchLivePrice(i.symbol, i.instrument).then(p => ({ key: `${i.symbol}__${i.instrument}`, p })))
   )
   const out: Record<string, number> = {}
   for (const r of results) {
-    if (r.status === "fulfilled" && r.value.p !== null) {
-      out[r.value.key] = r.value.p
-    }
+    if (r.status === "fulfilled" && r.value.p !== null) out[r.value.key] = r.value.p
   }
   return out
 }
 
+// Fetch India VIX from Supabase bhav copy
+async function fetchVIXFromSupabase(): Promise<number> {
+  const { data } = await supabase
+    .from("india_vix")
+    .select("close")
+    .order("date", { ascending: false })
+    .limit(1)
+    .single()
+  if (data?.close && data.close > 0) return data.close
+  return 15 // fallback default
+}
+
+// Fetch ATM strike data from bhav copy (nifty_options or banknifty_options)
+async function fetchBhavOptionChain(symbol: string, expiry: string, spot: number): Promise<any[]> {
+  const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+  const interval = getStrikeInterval(symbol)
+  const atm = Math.round(spot / interval) * interval
+  const strikes = Array.from({ length: 21 }, (_, i) => atm - 500 + i * interval)
+    .filter(s => s > 0)
+
+  const { data, error } = await supabase
+    .from(tableName)
+    .select("*")
+    .eq("expiry_date", expiry)
+    .in("strike_price", strikes)
+    .order("strike_price", { ascending: true })
+
+  if (error || !data) return []
+  return data
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
-// ═════════════════════════════════════════════════════════════════════════════
-// AUTH
+// AUTH SECTION (preserved from original)
 // ═════════════════════════════════════════════════════════════════════════════
 
 function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; initialMode?: AuthMode }) {
@@ -265,204 +310,80 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
   const [confirm,  setConfirm]  = useState("")
   const [fullName, setFullName] = useState("")
   const [otp,      setOtp]      = useState("")
-  const [otpRefs]               = useState(() => Array.from({ length: 6 }, () => ({ current: null as HTMLInputElement | null })))
   const [showPass, setShowPass] = useState(false)
   const [loading,  setLoading]  = useState(false)
   const [resendCD, setResendCD] = useState(0)
   const [error,    setError]    = useState("")
   const [success,  setSuccess]  = useState("")
-  // Saved signup data to upsert profile after OTP verify
   const [pendingUid,    setPendingUid]    = useState("")
   const [pendingMobile, setPendingMobile] = useState("")
 
   const normMobile = (m: string) => m.replace(/\D/g, "").slice(-10)
 
-  // Resend countdown timer
   useEffect(() => {
     if (resendCD <= 0) return
     const t = setTimeout(() => setResendCD(c => c - 1), 1000)
     return () => clearTimeout(t)
   }, [resendCD])
 
-  // Recovery mode is controlled by parent VirtualTradePage via initialMode prop.
+  function switchMode(m: AuthMode) { setMode(m); setError(""); setSuccess("") }
 
   function validate() {
-    if (mode === "otp") {
-      if (otp.replace(/\D/g, "").length !== 6) return "Enter the 6-digit code sent to your email"
-      return ""
-    }
+    if (mode === "otp") { if (otp.replace(/\D/g,"").length !== 6) return "Enter 6-digit code"; return "" }
     if (mode === "forgot") return email ? "" : "Enter your registered email"
     if (mode === "reset") {
-      if (!password)             return "Enter new password"
-      if (password.length < 8)  return "Password must be at least 8 characters"
-      if (password !== confirm)  return "Passwords do not match"
+      if (!password) return "Enter new password"
+      if (password.length < 8) return "Password must be at least 8 characters"
+      if (password !== confirm) return "Passwords do not match"
       return ""
     }
     if (mode === "login") {
       const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
-      if (!isEmail && normMobile(mobile).length !== 10) return "Enter a valid 10-digit mobile number or email address"
+      if (!isEmail && normMobile(mobile).length !== 10) return "Enter a valid 10-digit mobile number or email"
       if (!password) return "Enter your password"
       return ""
     }
-    // signup
     const m = normMobile(mobile)
-    if (m.length !== 10)                      return "Enter a valid 10-digit mobile number"
-    if (!fullName.trim())                     return "Enter your full name"
-    if (!email.trim())                        return "Enter your email address"
-    if (!/\S+@\S+\.\S+/.test(email))         return "Enter a valid email"
-    if (!password)                            return "Enter your password"
-    if (password.length < 8)                 return "Password must be at least 8 characters"
-    if (password !== confirm)                return "Passwords do not match"
+    if (m.length !== 10) return "Enter a valid 10-digit mobile number"
+    if (!fullName.trim()) return "Enter your full name"
+    if (!email.trim() || !/\S+@\S+\.\S+/.test(email)) return "Enter a valid email"
+    if (!password || password.length < 8) return "Password must be at least 8 characters"
+    if (password !== confirm) return "Passwords do not match"
     return ""
   }
 
-  // ── Signup: create user then send Supabase OTP ─────────────────────────────────
   async function handleSignup() {
     const m = normMobile(mobile)
-
-    // Check mobile uniqueness via RPC (bypasses RLS)
     const { data: mobileExists } = await supabase.rpc("mobile_registered", { p_mobile: m })
-    if (mobileExists) {
-      setError("Mobile number already registered. Please sign in.")
-      setLoading(false); return
-    }
-
-    // Step 1: Create the auth user with email+password.
-    // We set shouldSendConfirmationEmail implicitly via signUp.
+    if (mobileExists) { setError("Mobile already registered. Please sign in."); setLoading(false); return }
     const { data, error: signUpErr } = await supabase.auth.signUp({
-      email: email.toLowerCase(),
-      password,
-      options: {
-        emailRedirectTo: `${window.location.origin}/virtual-trade`,
-        data: { full_name: fullName, mobile: m },
-      },
+      email: email.toLowerCase(), password,
+      options: { emailRedirectTo: `${window.location.origin}/virtual-trade`, data: { full_name: fullName, mobile: m } },
     })
-
-    if (signUpErr) {
-      if (signUpErr.message.toLowerCase().includes("already registered") ||
-          signUpErr.message.toLowerCase().includes("already exists")) {
-        setError("Email already registered. Please sign in or use Forgot Password.")
-      } else {
-        setError(signUpErr.message)
-      }
-      setLoading(false); return
-    }
-
+    if (signUpErr) { setError(signUpErr.message); setLoading(false); return }
     const uid = data.user?.id
-
-    // Save profile + wallet if we have a uid (user confirmed or auto-confirmed)
     if (uid) {
-      await supabase.from("profiles").upsert({
-        id: uid, mobile: m, full_name: fullName, email: email.toLowerCase(),
-      })
-      const { data: existingWallet } = await supabase
-        .from("wallets").select("id").eq("user_id", uid).maybeSingle()
-      if (!existingWallet) {
-        await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
-      }
+      setPendingUid(uid); setPendingMobile(m)
+      await supabase.from("profiles").upsert({ id: uid, email: email.toLowerCase(), mobile: m, full_name: fullName })
     }
-    // Whether uid exists or not, Supabase has sent a confirmation email.
-    // Show the verify screen — user must click the link to activate account.
-    setMode("verify")
-    setLoading(false)
+    if (data.user && !data.session) switchMode("otp")
+    else { onAuth() }
   }
 
-    // ── Verify OTP (after signup) ──────────────────────────────────────────
-  async function handleVerifyOtp() {
-    const code = otp.replace(/\s/g, "")
-
-    // Verify using Supabase’s native OTP verifier.
-    // type "email" covers both signup confirmation and signInWithOtp codes.
-    const { data, error: e } = await supabase.auth.verifyOtp({
-      email: email.toLowerCase(),
-      token: code,
-      type: "email",
-    })
-
-    if (e || !data.session) {
-      setError("Invalid or expired code. Please check the code or click Resend.")
-      setLoading(false); return
+  async function handleOtp() {
+    const { error: verErr } = await supabase.auth.verifyOtp({ email: email.toLowerCase(), token: otp.replace(/\D/g,""), type: "signup" })
+    if (verErr) { setError(verErr.message); setLoading(false); return }
+    if (pendingUid) {
+      const { data: wal } = await supabase.from("wallets").select("id").eq("user_id", pendingUid).maybeSingle()
+      if (!wal) await supabase.from("wallets").insert({ user_id: pendingUid, balance: 1000000 })
     }
-
     onAuth()
-    setLoading(false)
   }
 
-  // ── Resend OTP ────────────────────────────────────────────────────────────────────────
   async function handleResendOtp() {
-    setError(""); setSuccess(""); setResendCD(60)
-    const { error: e } = await supabase.auth.signInWithOtp({
-      email: email.toLowerCase(),
-      options: { shouldCreateUser: false },
-    })
-    if (e) { setError(e.message); setResendCD(0); return }
-    setSuccess("New code sent! Check your inbox.")
-  }
-
-    // ── Login ─────────────────────────────────────────────────────────────────
-  async function handleLogin() {
-    const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
-    let loginEmail = ""
-
-    if (isEmail) {
-      loginEmail = mobile.trim().toLowerCase()
-    } else {
-      const m = normMobile(mobile)
-      // Try plain 10-digit first, then with +91 prefix (handles both storage formats)
-      let foundEmail: string | null = null
-      const { data: d1 } = await supabase.rpc("get_email_by_mobile", { p_mobile: m })
-      if (d1) {
-        foundEmail = d1 as string
-      } else {
-        const { data: d2 } = await supabase.rpc("get_email_by_mobile", { p_mobile: "+91" + m })
-        if (d2) foundEmail = d2 as string
-      }
-      if (!foundEmail) {
-        setError("Mobile number not registered. Please sign up first, or log in with your email address.")
-        setLoading(false); return
-      }
-      loginEmail = foundEmail
-    }
-
-    const { error: e } = await supabase.auth.signInWithPassword({
-      email: loginEmail,
-      password,
-    })
-
-    if (e) {
-      if (e.message.toLowerCase().includes("email not confirmed")) {
-        setError("Email not verified. Check your inbox for the OTP or verification link, or sign up again.")
-      } else if (e.message.toLowerCase().includes("invalid login") ||
-                 e.message.toLowerCase().includes("invalid credentials")) {
-        setError("Wrong password. Try again or use Forgot Password.")
-      } else {
-        setError(e.message)
-      }
-      setLoading(false); return
-    }
-
-    onAuth()
-    setLoading(false)
-  }
-
-  // ── Forgot password ───────────────────────────────────────────────────────
-  async function handleForgot() {
-    const { error: e } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), {
-      redirectTo: `${window.location.origin}/virtual-trade`,
-    })
-    if (e) { setError(e.message); setLoading(false); return }
-    setSuccess("Reset link sent! Check your inbox and spam folder.")
-    setLoading(false)
-  }
-
-  // ── Reset password (after clicking email link) ────────────────────────────
-  async function handleReset() {
-    const { error: e } = await supabase.auth.updateUser({ password })
-    if (e) { setError(e.message); setLoading(false); return }
-    setSuccess("Password updated successfully!")
-    window.history.replaceState({}, document.title, window.location.pathname)
-    setTimeout(() => { setMode("login"); setPassword(""); setConfirm("") }, 1500)
-    setLoading(false)
+    setResendCD(60); setError("")
+    await supabase.auth.resend({ type: "signup", email: email.toLowerCase() })
+    setSuccess("Verification code resent!")
   }
 
   async function submit(ev: React.FormEvent) {
@@ -470,193 +391,67 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
     const err = validate()
     if (err) { setError(err); return }
     setLoading(true); setError(""); setSuccess("")
-    if (mode === "signup") await handleSignup()
-    if (mode === "login")  await handleLogin()
-    if (mode === "otp")    await handleVerifyOtp()
-    if (mode === "forgot") await handleForgot()
-    if (mode === "reset")  await handleReset()
+    try {
+      if (mode === "otp") { await handleOtp(); return }
+      if (mode === "signup") { await handleSignup(); return }
+      if (mode === "login") {
+        const isEmail = /\S+@\S+\.\S+/.test(mobile.trim())
+        const loginEmail = isEmail ? mobile.trim().toLowerCase() : ""
+        let resolvedEmail = loginEmail
+        if (!isEmail) {
+          const { data: prof } = await supabase.from("profiles").select("email").eq("mobile", normMobile(mobile)).maybeSingle()
+          if (!prof?.email) { setError("Mobile number not found. Please sign up."); setLoading(false); return }
+          resolvedEmail = prof.email
+        }
+        const { error: loginErr } = await supabase.auth.signInWithPassword({ email: resolvedEmail, password })
+        if (loginErr) { setError(loginErr.message); setLoading(false); return }
+        onAuth(); return
+      }
+      if (mode === "forgot") {
+        const { error: forgotErr } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), { redirectTo: `${window.location.origin}/virtual-trade` })
+        if (forgotErr) { setError(forgotErr.message) } else { setSuccess("Password reset link sent! Check your email.") }
+        setLoading(false); return
+      }
+      if (mode === "reset") {
+        const { error: resetErr } = await supabase.auth.updateUser({ password })
+        if (resetErr) { setError(resetErr.message) } else { setSuccess("Password updated! Signing you in…"); setTimeout(() => onAuth(), 1500) }
+        setLoading(false); return
+      }
+    } catch (e: any) { setError(e.message ?? "Unknown error"); setLoading(false) }
   }
 
-  const switchMode = (m: AuthMode) => {
-    setMode(m); setError(""); setSuccess("")
-    setMobile(""); setEmail(""); setPassword(""); setConfirm(""); setFullName(""); setOtp("")
-  }
-
-  // ── OTP input: auto-advance on digit entry ────────────────────────────────
-  function handleOtpKey(i: number, e: React.KeyboardEvent<HTMLInputElement>) {
-    const val = e.key
-    if (/^\d$/.test(val)) {
-      const arr = otp.split("")
-      arr[i] = val
-      const next = arr.join("")
-      setOtp(next.padEnd(6, " ").slice(0, 6))
-      if (i < 5) otpRefs[i + 1].current?.focus()
-      e.preventDefault()
-    } else if (val === "Backspace") {
-      const arr = otp.split("")
-      arr[i] = " "
-      setOtp(arr.join(""))
-      if (i > 0) otpRefs[i - 1].current?.focus()
-      e.preventDefault()
-    }
-  }
-
-  // ── OTP screen ────────────────────────────────────────────────────────────
   if (mode === "otp") {
-    const digits = otp.padEnd(6, " ").split("")
     return (
       <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
         <div className="w-full max-w-md">
-          <div className="text-center mb-8">
-            <div className="inline-flex items-center justify-center w-16 h-16 bg-primary/10 rounded-2xl mb-4">
-              <Mail className="w-8 h-8 text-primary" />
+          <div className="text-center mb-6">
+            <div className="inline-flex items-center justify-center w-14 h-14 bg-primary rounded-2xl mb-3">
+              <Mail className="w-7 h-7 text-primary-foreground" />
             </div>
-            <h2 className="text-2xl font-bold text-foreground">Check your email</h2>
-            <p className="text-sm text-muted-foreground mt-2">
-              We sent a 6-digit code to <strong>{email}</strong>
-            </p>
+            <h2 className="text-2xl font-bold text-foreground">Verify your email</h2>
+            <p className="text-sm text-muted-foreground mt-1">Enter the 6-digit code sent to <strong>{email}</strong></p>
           </div>
           <div className="bg-card border border-border rounded-2xl p-6">
-            {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
+            {error && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
             {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
-            <form onSubmit={submit} className="space-y-5">
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-3 block text-center">Enter verification code</label>
-                <div className="flex gap-2 justify-center">
-                  {digits.map((d, i) => (
-                    <input
-                      key={i}
-                      ref={el => { otpRefs[i].current = el }}
-                      type="text"
-                      inputMode="numeric"
-                      maxLength={1}
-                      value={d.trim()}
-                      onKeyDown={e => handleOtpKey(i, e)}
-                      onChange={() => {}}
-                      onFocus={e => e.target.select()}
-                      className="w-11 h-12 text-center text-lg font-bold border-2 border-border rounded-xl bg-background focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-colors"
-                    />
-                  ))}
-                </div>
-              </div>
-              <button type="submit" disabled={loading || otp.replace(/\s/g, "").length < 6}
+            <form onSubmit={submit} className="space-y-4">
+              <input type="text" value={otp} onChange={e => setOtp(e.target.value)} maxLength={6} placeholder="123456"
+                className="w-full text-center text-2xl font-mono tracking-widest border border-border rounded-xl py-3 bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+              <button type="submit" disabled={loading}
                 className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
-                {loading
-                  ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                  : <><span>Verify & Continue</span><ArrowRight className="w-4 h-4" /></>
-                }
+                {loading ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" /> : <><span>Verify & Continue</span><ArrowRight className="w-4 h-4" /></>}
               </button>
             </form>
             <div className="mt-4 text-center">
-              {resendCD > 0 ? (
-                <p className="text-xs text-muted-foreground">Resend code in <span className="font-semibold text-foreground">{resendCD}s</span></p>
-              ) : (
-                <button onClick={handleResendOtp} className="text-xs text-primary hover:underline font-semibold">
-                  Didn't receive it? Resend code
-                </button>
-              )}
+              {resendCD > 0 ? <p className="text-xs text-muted-foreground">Resend in {resendCD}s</p>
+                : <button onClick={handleResendOtp} className="text-xs text-primary hover:underline font-semibold">Resend code</button>}
             </div>
-            <p className="text-center text-xs text-muted-foreground mt-3">
-              Check spam/junk if you don't see it in inbox
-            </p>
-          </div>
-          <p className="text-center text-xs text-muted-foreground mt-3">
-            Wrong email?{" "}
-            <button onClick={() => switchMode("signup")} className="text-primary hover:underline font-semibold">Start over</button>
-          </p>
-        </div>
-      </div>
-    )
-  }
-
-  // ── Verify screen ────────────────────────────────────────────────────────
-  if (mode === "verify") {
-    return (
-      <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
-        <div className="w-full max-w-md text-center">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-green-100 dark:bg-green-900/30 rounded-2xl mb-4">
-            <Mail className="w-8 h-8 text-green-600 dark:text-green-400" />
-          </div>
-          <h2 className="text-2xl font-bold text-foreground mb-2">Verification link sent!</h2>
-          <p className="text-muted-foreground text-sm mb-1">Please check your inbox at</p>
-          <p className="font-bold text-foreground text-sm mb-6">{email}</p>
-          <div className="bg-card border border-border rounded-2xl p-5 text-left space-y-3 mb-6">
-            {[
-              "Open your email inbox",
-              "Click the confirmation link from MarketGreeks",
-              "You will be automatically signed in after confirming",
-              "Check spam/junk folder if you don’t see it",
-            ].map((step, i) => (
-              <div key={i} className="flex items-start gap-3">
-                <span className="w-5 h-5 rounded-full text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5 bg-primary text-primary-foreground">
-                  {i + 1}
-                </span>
-                <p className="text-xs text-muted-foreground">{step}</p>
-              </div>
-            ))}
-          </div>
-          <p className="text-xs text-muted-foreground mt-3">
-            Wrong email?{" "}
-            <button onClick={() => switchMode("signup")} className="text-primary hover:underline font-semibold">Sign up again</button>
-          </p>
-        </div>
-      </div>
-    )
-  }
-
-  // ── Reset password screen ─────────────────────────────────────────────────
-  if (mode === "reset") {
-    return (
-      <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
-        <div className="w-full max-w-md">
-          <div className="text-center mb-8">
-            <div className="inline-flex items-center justify-center w-14 h-14 bg-primary rounded-2xl mb-3">
-              <KeyRound className="w-7 h-7 text-primary-foreground" />
-            </div>
-            <h2 className="text-2xl font-bold text-foreground">Set New Password</h2>
-            <p className="text-sm text-muted-foreground mt-1">Choose a strong password for your account</p>
-          </div>
-          <div className="bg-card border border-border rounded-2xl p-6">
-            {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
-            {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
-            <form onSubmit={submit} className="space-y-4">
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">New Password</label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input type={showPass ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)}
-                    placeholder="Min 8 characters"
-                    className="w-full pl-9 pr-10 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                  <button type="button" onClick={() => setShowPass(!showPass)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                    {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Confirm New Password</label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input type={showPass ? "text" : "password"} value={confirm} onChange={e => setConfirm(e.target.value)}
-                    placeholder="Re-enter new password"
-                    className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                </div>
-              </div>
-              <button type="submit" disabled={loading}
-                className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
-                {loading
-                  ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                  : <><span>Update Password</span><ArrowRight className="w-4 h-4" /></>
-                }
-              </button>
-            </form>
           </div>
         </div>
       </div>
     )
   }
 
-  // ── Main auth form (login / signup / forgot) ──────────────────────────────
   return (
     <div className="min-h-[70vh] flex items-center justify-center py-12 px-4">
       <div className="w-full max-w-md">
@@ -668,26 +463,23 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
           <p className="text-sm text-muted-foreground mt-1">
             {mode === "signup" ? "Create account & get ₹10L virtual money"
             : mode === "forgot" ? "Reset your password via email"
-            : "Sign in with mobile number or email"}
+            : mode === "reset" ? "Set your new password"
+            : "Sign in to start trading"}
           </p>
         </div>
-
         <div className="bg-card border border-border rounded-2xl p-6">
           {mode === "signup" && (
             <div className="bg-primary/10 rounded-xl p-3 mb-5 flex items-center gap-3">
               <span className="text-2xl">💰</span>
               <div>
                 <p className="text-xs font-bold text-primary">Free ₹10,00,000 Virtual Wallet</p>
-                <p className="text-[11px] text-muted-foreground">Trade Nifty 50 Equity, Options & Futures. No real money.</p>
+                <p className="text-[11px] text-muted-foreground">Trade with real Bhav data. No real money.</p>
               </div>
             </div>
           )}
-
-          {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
+          {error && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-4">{error}</div>}
           {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-4">{success}</div>}
-
           <form onSubmit={submit} className="space-y-4">
-            {/* Full name — signup only */}
             {mode === "signup" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Full Name</label>
@@ -698,64 +490,44 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
                 </div>
               </div>
             )}
-
-            {/* Mobile — signup; mobile or email — login */}
-            {mode !== "forgot" && (
+            {mode !== "forgot" && mode !== "reset" && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
-                  {mode === "login" ? "Mobile Number or Email" : "Mobile Number"}
-                </label>
-                {mode === "login" ? (
-                  <input type="text" value={mobile} onChange={e => setMobile(e.target.value)}
-                    placeholder="9876543210 or you@email.com"
-                    className="w-full px-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                ) : (
-                  <div className="flex">
-                    <span className="inline-flex items-center px-3 text-sm text-muted-foreground bg-muted border border-r-0 border-border rounded-l-xl">
-                      <Phone className="w-3.5 h-3.5 mr-1" />+91
-                    </span>
-                    <input type="tel" value={mobile} onChange={e => setMobile(e.target.value)} placeholder="9876543210" maxLength={10}
-                      className="flex-1 px-4 py-2.5 text-sm border border-border rounded-r-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                  </div>
-                )}
-                {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">Used for login. Each number registers only once.</p>}
-              </div>
-            )}
-
-            {/* Email — signup + forgot */}
-            {(mode === "signup" || mode === "forgot") && (
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
-                  {mode === "signup" ? "Email Address" : "Registered Email Address"}
+                  {mode === "signup" ? "Mobile Number" : "Mobile or Email"}
                 </label>
                 <div className="relative">
-                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@gmail.com"
+                  <Phone className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input type="text" value={mobile} onChange={e => setMobile(e.target.value)} placeholder={mode === "signup" ? "9876543210" : "Mobile or email"}
                     className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
                 </div>
-                {mode === "signup" && <p className="text-[10px] text-muted-foreground mt-1">A 6-digit OTP will be sent here to verify your account.</p>}
               </div>
             )}
-
-            {/* Password — login + signup */}
+            {(mode === "signup" || mode === "forgot") && (
+              <div>
+                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Email</label>
+                <div className="relative">
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com"
+                    className="w-full pl-9 pr-4 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+                </div>
+              </div>
+            )}
             {mode !== "forgot" && (
               <div>
-                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Password</label>
+                <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">
+                  {mode === "reset" ? "New Password" : "Password"}
+                </label>
                 <div className="relative">
                   <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input type={showPass ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)}
-                    placeholder={mode === "signup" ? "Min 8 characters" : "Enter password"}
+                  <input type={showPass ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="Min 8 characters"
                     className="w-full pl-9 pr-10 py-2.5 text-sm border border-border rounded-xl bg-background focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
-                  <button type="button" onClick={() => setShowPass(!showPass)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                  <button type="button" onClick={() => setShowPass(!showPass)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">
                     {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
               </div>
             )}
-
-            {/* Confirm password — signup only */}
-            {mode === "signup" && (
+            {(mode === "signup" || mode === "reset") && (
               <div>
                 <label className="text-xs font-semibold text-muted-foreground mb-1.5 block">Confirm Password</label>
                 <div className="relative">
@@ -765,543 +537,1176 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
                 </div>
               </div>
             )}
-
-            {mode === "login" && (
-              <div className="text-right -mt-1">
-                <button type="button" onClick={() => switchMode("forgot")} className="text-xs text-primary hover:underline">Forgot password?</button>
-              </div>
-            )}
-
             <button type="submit" disabled={loading}
               className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-3 rounded-xl text-sm transition-colors disabled:opacity-60">
-              {loading
-                ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                : <><span>{mode === "login" ? "Sign In" : mode === "signup" ? "Create Account & Send OTP" : "Send Reset Link"}</span><ArrowRight className="w-4 h-4" /></>
-              }
+              {loading ? <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" /> : <><span>{mode === "signup" ? "Create Account" : mode === "forgot" ? "Send Reset Link" : mode === "reset" ? "Update Password" : "Sign In"}</span><ArrowRight className="w-4 h-4" /></>}
             </button>
           </form>
-
-          <div className="mt-5 text-center text-xs text-muted-foreground">
-            {mode === "login"  && <>Don't have an account? <button onClick={() => switchMode("signup")} className="text-primary font-semibold hover:underline">Sign up free</button></>}
-            {mode === "signup" && <>Already have an account? <button onClick={() => switchMode("login")} className="text-primary font-semibold hover:underline">Sign in</button></>}
-            {mode === "forgot" && <button onClick={() => switchMode("login")} className="text-primary font-semibold hover:underline">← Back to Sign In</button>}
+          <div className="mt-4 pt-4 border-t border-border text-center space-y-2">
+            {mode === "login" && <><button onClick={() => switchMode("signup")} className="block w-full text-xs text-primary hover:underline font-semibold">Don't have an account? Sign up</button><button onClick={() => switchMode("forgot")} className="block w-full text-xs text-muted-foreground hover:underline">Forgot password?</button></>}
+            {mode === "signup" && <button onClick={() => switchMode("login")} className="text-xs text-primary hover:underline font-semibold">Already have an account? Sign in</button>}
+            {(mode === "forgot" || mode === "reset") && <button onClick={() => switchMode("login")} className="text-xs text-primary hover:underline font-semibold">Back to sign in</button>}
           </div>
         </div>
-        <p className="text-center text-[10px] text-muted-foreground mt-4">
-          Virtual trading only. No real money. For educational purposes. Not SEBI registered.
-        </p>
       </div>
     </div>
   )
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// EXPIRY P&L POPUP
+// ═════════════════════════════════════════════════════════════════════════════
+
+function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () => void }) {
+  const totalPnL = positions.reduce((s, p) => s + (p.realized_pnl ?? 0), 0)
+  const profitable = positions.filter(p => (p.realized_pnl ?? 0) >= 0)
+  const losing = positions.filter(p => (p.realized_pnl ?? 0) < 0)
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div className="bg-card border border-border rounded-2xl w-full max-w-lg shadow-2xl">
+        {/* Header */}
+        <div className={`p-6 rounded-t-2xl ${totalPnL >= 0 ? "bg-success/10" : "bg-destructive/10"}`}>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${totalPnL >= 0 ? "bg-success text-white" : "bg-destructive text-white"}`}>
+                {totalPnL >= 0 ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
+              </div>
+              <div>
+                <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Expiry Settlement</div>
+                <div className="text-sm font-bold text-foreground">Today's Expired Positions</div>
+              </div>
+            </div>
+            <button onClick={onClose} className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center hover:bg-muted/80">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="text-center">
+            <div className="text-3xl font-bold font-mono mb-1" style={{ color: totalPnL >= 0 ? "var(--success)" : "var(--destructive)" }}>
+              {totalPnL >= 0 ? "+" : ""}{fmt(totalPnL)}
+            </div>
+            <div className="text-sm text-muted-foreground">Net P&L from expiry</div>
+          </div>
+          {/* Win/Loss summary */}
+          <div className="grid grid-cols-3 gap-3 mt-4">
+            <div className="bg-card/50 rounded-xl p-3 text-center">
+              <div className="text-lg font-bold text-foreground">{positions.length}</div>
+              <div className="text-[11px] text-muted-foreground">Expired</div>
+            </div>
+            <div className="bg-success/10 rounded-xl p-3 text-center">
+              <div className="text-lg font-bold text-success">{profitable.length}</div>
+              <div className="text-[11px] text-muted-foreground">Profitable</div>
+            </div>
+            <div className="bg-destructive/10 rounded-xl p-3 text-center">
+              <div className="text-lg font-bold text-destructive">{losing.length}</div>
+              <div className="text-[11px] text-muted-foreground">Loss</div>
+            </div>
+          </div>
+        </div>
+        {/* Positions list */}
+        <div className="p-4 max-h-64 overflow-y-auto">
+          <div className="space-y-2">
+            {positions.map((p, i) => {
+              const pnl = p.realized_pnl ?? 0
+              const isProfit = pnl >= 0
+              return (
+                <div key={i} className={`flex items-center justify-between p-3 rounded-xl border ${isProfit ? "border-success/20 bg-success/5" : "border-destructive/20 bg-destructive/5"}`}>
+                  <div>
+                    <div className="font-bold text-sm text-foreground">{p.symbol}</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {p.instrument === "OPTIONS" ? `${p.strike_price} ${p.option_type} · ${p.trade_type}` : p.instrument}
+                      {p.expiry && ` · Exp: ${formatExpiry(p.expiry)}`}
+                    </div>
+                  </div>
+                  <div className={`font-mono font-bold text-sm ${isProfit ? "text-success" : "text-destructive"}`}>
+                    {isProfit ? "+" : ""}{fmt(pnl)}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+        <div className="p-4 pt-0">
+          <button onClick={onClose} className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors">
+            Got it! Continue Trading
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TRADE FORM
+// OPTION CHAIN
 // ═════════════════════════════════════════════════════════════════════════════
 
-function TradeForm({ userId, balance, onDone }: { userId: string; balance: number; onDone: () => void }) {
-  const [inst,      setInst]      = useState<InstrumentType>("EQUITY")
-  const [side,      setSide]      = useState<TradeType>("BUY")
-  const [symbol,    setSymbol]    = useState("RELIANCE")
-  const [qty,       setQty]       = useState(1)
-  const [price,     setPrice]     = useState<number | "">("")
-  const [strike,    setStrike]    = useState<number | "">("")
-  const [optType,   setOptType]   = useState<OptionType>("CE")
-  const [expiry,    setExpiry]    = useState("")
-  const [manualExpiry, setManualExpiry] = useState(false)
-  const [fetching,  setFetching]  = useState(false)
-  const [loading,   setLoading]   = useState(false)
-  const [error,     setError]     = useState("")
-  const [success,   setSuccess]   = useState("")
-  const [spotPrice, setSpotPrice] = useState<number | null>(null)
-  const [lotSizeOverride, setLotSizeOverride] = useState<number | "">("")  // manual lot size override
+function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, expiry, onExpiryChange, onSymbolChange }: {
+  userId: string; balance: number; positions: any[]; onTrade: () => void
+  spot: number; vix: number; symbol: string; expiry: string
+  onExpiryChange: (e: string) => void; onSymbolChange: (s: string) => void
+}) {
+  const [chainData, setChainData] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [tradeModal, setTradeModal] = useState<{ strike: number; type: OptionType; premium: number } | null>(null)
+  const [lots, setLots] = useState(1)
+  const [tradeType, setTradeType] = useState<TradeType>("BUY")
+  const [placing, setPlacing] = useState(false)
+  const [tradeMsg, setTradeMsg] = useState("")
 
-  const symbols  = inst === "EQUITY" ? NIFTY50_EQUITY : NIFTY50_FNO
-  const defaultLotSize = LOT_SIZES[symbol] ?? 1
-  const lotSize  = (lotSizeOverride !== "" && (lotSizeOverride as number) > 0) ? (lotSizeOverride as number) : defaultLotSize
-  const actualQty = inst === "EQUITY" ? qty : qty * lotSize
+  const expiryOptions = getWeeklyExpiries(symbol)
+  const interval = getStrikeInterval(symbol)
+  const atm = spot > 0 ? Math.round(spot / interval) * interval : 0
 
-  // Expiry options — weekly for Nifty, monthly for others
-  const expiryOptions = symbol === "NIFTY"
-    ? getThursdaysForNext3Months()
-    : getMonthlyExpiries()
+  const lotSize = LOT_SIZES[symbol] ?? 75
+  const dte = expiry ? daysToExpiry(expiry) : 30
+  const move = spot > 0 && vix > 0 ? expectedMove(spot, vix, dte) : null
 
-  // For options: cost = premium * qty (not spot * qty)
-  // For equity/futures: cost = price * qty
-  const premiumPerUnit = price as number || 0
-  const turnover = premiumPerUnit * actualQty
-  const charges  = premiumPerUnit ? calcCharges(premiumPerUnit, actualQty, inst, side) : 0
-  const net      = side === "BUY" ? turnover + charges : turnover - charges
-
-  useEffect(() => { setSymbol(symbols[0]); setPrice(""); setSpotPrice(null); setLotSizeOverride("") }, [inst])
-  useEffect(() => { setPrice(""); setSpotPrice(null); setLotSizeOverride("") }, [symbol])
   useEffect(() => {
-    if (expiryOptions.length > 0 && !expiry) setExpiry(expiryOptions[0])
-  }, [symbol, inst])
+    if (!expiry || spot <= 0) return
+    loadChain()
+  }, [symbol, expiry, spot])
 
-  // When user enters spot price manually for options, recalc BS premium
-  function recalcBS(spot: number) {
-    if (inst === "OPTIONS" && spot > 0 && strike && expiry) {
-      const bs = calcOptionPremium(spot, strike as number, expiry, optType)
-      setPrice(bs)
-      setSpotPrice(spot)
-    }
-  }
-
-  async function fetchPrice() {
-    setFetching(true); setError("")
-    const p = await fetchLivePrice(symbol, inst)
-    if (p) {
-      if (inst === "OPTIONS") {
-        setSpotPrice(p)
-        if (strike && expiry) {
-          setPrice(calcOptionPremium(p, strike as number, expiry, optType))
-        }
-      } else {
-        setPrice(p)
-      }
-    } else {
-      setError("Could not fetch live price. Enter manually.")
-    }
-    setFetching(false)
-  }
-
-  // Auto-recalculate BS premium when strike/expiry/optType changes (if spot already entered)
-  useEffect(() => {
-    if (inst === "OPTIONS" && spotPrice && strike && expiry) {
-      const bs = calcOptionPremium(spotPrice, strike as number, expiry, optType)
-      setPrice(bs)
-    }
-  }, [strike, expiry, optType, spotPrice, inst])
-
-  async function placeTrade(ev: React.FormEvent) {
-    ev.preventDefault()
-    setError(""); setSuccess("")
-
-    if (!price || (price as number) <= 0) { setError("Enter or fetch a valid price"); return }
-    if (qty < 1)                           { setError("Enter valid quantity"); return }
-    if (inst !== "EQUITY" && !expiry)      { setError("Select expiry date"); return }
-    if (inst === "OPTIONS" && !strike)     { setError("Enter strike price"); return }
-
+  async function loadChain() {
     setLoading(true)
-
-    // ── Local variables to avoid stale closure bugs ───────────────────────────
-    const tradePrice    = price as number
-    const tradeQty      = actualQty   // shares for equity, lots×lotSize for F&O
-    const tradeTurnover = tradePrice * tradeQty
-    const tradeCharges  = calcCharges(tradePrice, tradeQty, inst, side)
-
-    // ── WALLET IMPACT LOGIC ──────────────────────────────────────────────────
-    // EQUITY BUY:         debit  full value + charges
-    // EQUITY SELL:        credit full value − charges
-    // OPTIONS BUY:        debit  premium × qty + charges  (not notional!)
-    // OPTIONS SELL:       debit  margin (blocked); P&L settled on exit
-    // FUTURES BUY/SELL:   debit  margin (blocked)
-    let walletDebit  = 0  // amount to subtract from wallet
-    let walletCredit = 0  // amount to add to wallet
-    let marginBlocked = 0 // stored in position for future release
-
-    if (inst === "EQUITY") {
-      if (side === "BUY")  walletDebit  = tradeTurnover + tradeCharges
-      else                  walletCredit = tradeTurnover - tradeCharges
-    } else if (inst === "OPTIONS") {
-      if (side === "BUY") {
-        // Only premium × qty is debited
-        walletDebit = tradeTurnover + tradeCharges
-      } else {
-        // SELL: block margin based on strike price (best proxy for spot when not fetched)
-        // spotPrice is only set if user clicked "Auto BS". Otherwise use strike.
-        const spotForMargin = spotPrice ?? (strike as number)
-        marginBlocked = calcOptionsMargin(spotForMargin, lotSize, qty)
-        walletDebit = marginBlocked
-      }
+    // Try bhav copy first for historical/today's data
+    const bhavData = await fetchBhavOptionChain(symbol, expiry, spot)
+    if (bhavData.length > 0) {
+      setChainData(bhavData)
     } else {
-      // FUTURES: margin based on futures price (close to spot)
-      marginBlocked = calcFuturesMargin(tradePrice, lotSize, qty)
+      // Synthesize from Black-Scholes for live/future dates
+      if (spot <= 0) { setLoading(false); return }
+      const strikes = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
+      const synthetic = strikes.map(strike => ({
+        strike_price: strike,
+        ce_ltp: calcOptionPremium(spot, strike, expiry, "CE", vix / 100),
+        pe_ltp: calcOptionPremium(spot, strike, expiry, "PE", vix / 100),
+        ce_iv: vix, pe_iv: vix,
+        ce_oi: null, pe_oi: null,
+        ce_volume: null, pe_volume: null,
+      }))
+      setChainData(synthetic)
+    }
+    setLoading(false)
+  }
+
+  function getPositionForStrike(strike: number, optType: OptionType) {
+    return positions.find(p =>
+      p.instrument === "OPTIONS" &&
+      p.symbol === symbol &&
+      p.strike_price === strike &&
+      p.option_type === optType &&
+      p.status === "OPEN"
+    )
+  }
+
+  async function placeOptionTrade() {
+    if (!tradeModal) return
+    setPlacing(true); setTradeMsg("")
+    const { strike, type: optType, premium } = tradeModal
+    const actualQty = lots * lotSize
+    const charges = calcCharges(premium, actualQty, "OPTIONS", tradeType)
+    let walletDebit = 0, marginBlocked = 0
+
+    if (tradeType === "BUY") {
+      walletDebit = premium * actualQty + charges
+    } else {
+      marginBlocked = calcOptionsMargin(spot, lotSize, lots)
       walletDebit = marginBlocked
     }
 
-    const tradeNet = walletDebit > 0 ? walletDebit : walletCredit
-
-    // ── Fetch FRESH wallet balance ────────────────────────────────────────────
-    const { data: walletData, error: walletFetchErr } = await supabase
-      .from("wallets").select("balance").eq("user_id", userId).single()
-    if (walletFetchErr || !walletData) {
-      setError("Could not read wallet balance. Please refresh and try again.")
-      setLoading(false); return
-    }
-    const freshBalance = walletData.balance
-
-    if (walletDebit > freshBalance) {
-      setError(`Insufficient balance. Need ${fmt(walletDebit)}, have ${fmt(freshBalance)}`)
-      setLoading(false); return
+    const { data: walletData } = await supabase.from("wallets").select("balance").eq("user_id", userId).single()
+    if (!walletData || walletData.balance < walletDebit) {
+      setTradeMsg(`Insufficient balance. Need ${fmt(walletDebit)}`); setPlacing(false); return
     }
 
-    // ── Check for existing open position to average ───────────────────────────
-    const matchQuery = supabase
-      .from("positions")
-      .select("id, quantity, entry_price, avg_price, margin_blocked")
-      .eq("user_id", userId)
-      .eq("symbol", symbol)
-      .eq("instrument", inst)
-      .eq("trade_type", side)
-      .eq("status", "OPEN")
-    if (inst !== "EQUITY") matchQuery.eq("expiry", expiry || "")
-    if (inst === "OPTIONS") matchQuery.eq("strike_price", strike as number).eq("option_type", optType)
-
-    const { data: existing } = await matchQuery.maybeSingle()
+    // Check existing position
+    const { data: existing } = await supabase.from("positions")
+      .select("id, quantity, avg_price, margin_blocked")
+      .eq("user_id", userId).eq("symbol", symbol).eq("instrument", "OPTIONS")
+      .eq("trade_type", tradeType).eq("status", "OPEN").eq("expiry", expiry)
+      .eq("strike_price", strike).eq("option_type", optType).maybeSingle()
 
     if (existing) {
-      const oldQty   = existing.quantity
-      const oldAvg   = existing.avg_price ?? existing.entry_price
-      const newTotalQty = oldQty + tradeQty
-      const newAvg   = Math.round(((oldQty * oldAvg) + (tradeQty * tradePrice)) / newTotalQty * 100) / 100
-      const newMargin = (existing.margin_blocked ?? 0) + marginBlocked
-
-      const { error: updErr } = await supabase
-        .from("positions")
-        .update({ quantity: newTotalQty, avg_price: newAvg, current_price: tradePrice, margin_blocked: newMargin })
-        .eq("id", existing.id)
-
-      if (updErr) {
-        setError(`Failed to update position: ${updErr.message}`)
-        setLoading(false); return
-      }
+      const newQty = existing.quantity + actualQty
+      const newAvg = Math.round(((existing.quantity * (existing.avg_price || premium)) + (actualQty * premium)) / newQty * 100) / 100
+      await supabase.from("positions").update({ quantity: newQty, avg_price: newAvg, margin_blocked: (existing.margin_blocked || 0) + marginBlocked }).eq("id", existing.id)
     } else {
-      const { error: posErr } = await supabase.from("positions").insert({
-        user_id:       userId,
-        symbol,
-        instrument:    inst,
-        trade_type:    side,
-        quantity:      tradeQty,
-        entry_price:   tradePrice,
-        avg_price:     tradePrice,
-        current_price: tradePrice,
-        expiry:        expiry || null,
-        strike_price:  inst === "OPTIONS" ? strike : null,
-        option_type:   inst === "OPTIONS" ? optType : null,
-        lot_size:      lotSize,
-        margin_blocked: marginBlocked,
-        status:        "OPEN",
-        pnl:           0,
+      await supabase.from("positions").insert({
+        user_id: userId, symbol, instrument: "OPTIONS", trade_type: tradeType,
+        quantity: actualQty, entry_price: premium, avg_price: premium, current_price: premium,
+        expiry, strike_price: strike, option_type: optType,
+        margin_blocked: marginBlocked, status: "OPEN", opened_at: new Date().toISOString(),
       })
-      if (posErr) {
-        setError(`Failed to place trade: ${posErr.message}`)
-        setLoading(false); return
+    }
+
+    await supabase.from("wallets").update({ balance: walletData.balance - walletDebit }).eq("user_id", userId)
+    await supabase.from("trade_history").insert({
+      user_id: userId, symbol, instrument: "OPTIONS", trade_type: tradeType,
+      quantity: actualQty, price: premium, total_value: premium * actualQty,
+      charges, net_value: walletDebit, margin_blocked: marginBlocked,
+      expiry, strike_price: strike, option_type: optType,
+      executed_at: new Date().toISOString(), created_at: new Date().toISOString(),
+    })
+
+    setTradeMsg(`✅ ${tradeType} ${lots} lot${lots > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${fmtN(premium)}`)
+    setPlacing(false)
+    onTrade()
+    setTimeout(() => { setTradeModal(null); setTradeMsg("") }, 1500)
+  }
+
+  const ceStrikes = chainData.filter(r => r.ce_ltp != null || r.call_close != null)
+  const sortedStrikes = [...new Set(chainData.map(r => r.strike_price))].sort((a, b) => a - b)
+
+  return (
+    <div className="space-y-4">
+      {/* Controls */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <div className="flex flex-wrap gap-3 items-center">
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Symbol</label>
+            <select value={symbol} onChange={e => onSymbolChange(e.target.value)}
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
+              {["NIFTY","BANKNIFTY","FINNIFTY"].map(s => <option key={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Expiry</label>
+            <select value={expiry} onChange={e => onExpiryChange(e.target.value)}
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
+              {expiryOptions.map(e => <option key={e} value={e}>{formatExpiry(e)} · {Math.round(daysToExpiry(e))}d</option>)}
+            </select>
+          </div>
+          <button onClick={loadChain} disabled={loading}
+            className="self-end flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-primary/10 text-primary rounded-lg hover:bg-primary/20 transition-colors">
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} /> Refresh
+          </button>
+          {spot > 0 && (
+            <div className="self-end ml-auto text-right">
+              <div className="text-xs text-muted-foreground">Spot</div>
+              <div className="font-mono font-bold text-lg text-foreground">₹{fmtN(spot)}</div>
+            </div>
+          )}
+        </div>
+
+        {/* Expected move banner */}
+        {move && (
+          <div className="mt-3 p-3 bg-primary/5 border border-primary/20 rounded-xl">
+            <div className="flex items-center gap-2 mb-2">
+              <Activity className="w-4 h-4 text-primary" />
+              <span className="text-xs font-bold text-primary">Market Expected Move (1σ) based on VIX {vix.toFixed(1)}</span>
+              <span className="text-[10px] text-muted-foreground">for {Math.round(dte)} days to expiry</span>
+            </div>
+            <div className="flex items-center gap-4 text-xs">
+              <div className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-success inline-block" />
+                <span className="text-muted-foreground">Upside:</span>
+                <span className="font-mono font-bold text-success">₹{fmtN(move.up)}</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-destructive inline-block" />
+                <span className="text-muted-foreground">Downside:</span>
+                <span className="font-mono font-bold text-destructive">₹{fmtN(move.down)}</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-muted-foreground">Range:</span>
+                <span className="font-mono font-bold">±{move.pct.toFixed(1)}%</span>
+              </div>
+            </div>
+            <div className="mt-1.5 text-[10px] text-muted-foreground">
+              Formula: Spot × (VIX÷100) × √(DTE÷365) — 68% probability the market stays within this range
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Option Chain Table */}
+      <div className="bg-card border border-border rounded-xl overflow-hidden">
+        <div className="px-4 py-3 border-b border-border bg-muted/50 flex items-center gap-2">
+          <span className="text-xs font-bold text-foreground">Option Chain — {symbol} {expiry ? formatExpiry(expiry) : ""}</span>
+          <span className="text-[10px] text-muted-foreground">{loading ? "Loading…" : `${sortedStrikes.length} strikes · ATM: ${atm}`}</span>
+          {chainData.length > 0 && chainData[0]?.ce_oi != null && (
+            <span className="ml-auto text-[10px] bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 px-2 py-0.5 rounded-full font-semibold">📊 Bhav Copy Data</span>
+          )}
+          {chainData.length > 0 && chainData[0]?.ce_oi == null && (
+            <span className="ml-auto text-[10px] bg-warning/10 text-warning px-2 py-0.5 rounded-full font-semibold">~BS Theoretical</span>
+          )}
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-muted/30">
+                <th colSpan={4} className="px-3 py-2 text-center text-[10px] font-bold text-success uppercase tracking-wide border-r border-border">CALLS (CE)</th>
+                <th className="px-3 py-2 text-center text-[10px] font-bold text-foreground uppercase tracking-wide bg-primary/5">STRIKE</th>
+                <th colSpan={4} className="px-3 py-2 text-center text-[10px] font-bold text-destructive uppercase tracking-wide border-l border-border">PUTS (PE)</th>
+              </tr>
+              <tr className="bg-muted/10">
+                {["OI","Vol","IV","LTP"].map(h => <th key={`ce-${h}`} className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">{h}</th>)}
+                <th className="px-3 py-2 text-center text-[10px] font-bold text-foreground bg-primary/5">STRIKE</th>
+                {["LTP","IV","Vol","OI"].map(h => <th key={`pe-${h}`} className="px-3 py-2 text-left text-[10px] font-semibold text-muted-foreground">{h}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr><td colSpan={9} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                  <div className="flex items-center justify-center gap-2">
+                    <div className="w-4 h-4 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
+                    Loading option chain…
+                  </div>
+                </td></tr>
+              ) : sortedStrikes.length === 0 ? (
+                <tr><td colSpan={9} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                  No data. Select a symbol and expiry, then click Refresh.
+                </td></tr>
+              ) : sortedStrikes.map(strike => {
+                const row = chainData.find(r => r.strike_price === strike)
+                if (!row) return null
+
+                const ceLtp = row.ce_ltp ?? row.call_close ?? (spot > 0 ? calcOptionPremium(spot, strike, expiry, "CE", vix / 100) : 0)
+                const peLtp = row.pe_ltp ?? row.put_close  ?? (spot > 0 ? calcOptionPremium(spot, strike, expiry, "PE", vix / 100) : 0)
+                const ceIV  = row.ce_iv ?? vix
+                const peIV  = row.pe_iv ?? vix
+                const ceOI  = row.ce_oi ?? row.call_oi ?? null
+                const peOI  = row.pe_oi ?? row.put_oi  ?? null
+                const ceVol = row.ce_volume ?? row.call_volume ?? null
+                const peVol = row.pe_volume ?? row.put_volume  ?? null
+
+                const isATM = Math.abs(strike - atm) < interval / 2
+                const isITM_CE = strike < atm
+                const isITM_PE = strike > atm
+
+                const cePos = getPositionForStrike(strike, "CE")
+                const pePos = getPositionForStrike(strike, "PE")
+
+                return (
+                  <tr key={strike}
+                    className={`border-t border-border/50 transition-colors ${isATM ? "bg-primary/5 font-semibold" : ""}`}>
+                    {/* CE side */}
+                    <td className={`px-3 py-2.5 text-right font-mono ${isITM_CE ? "bg-success/5" : ""}`}>
+                      {ceOI != null ? fmtN(ceOI / 1000) + "K" : "—"}
+                    </td>
+                    <td className={`px-3 py-2.5 text-right font-mono text-muted-foreground ${isITM_CE ? "bg-success/5" : ""}`}>
+                      {ceVol != null ? fmtN(ceVol / 1000) + "K" : "—"}
+                    </td>
+                    <td className={`px-3 py-2.5 text-right text-muted-foreground ${isITM_CE ? "bg-success/5" : ""}`}>
+                      {ceIV != null ? ceIV.toFixed(1) + "%" : "—"}
+                    </td>
+                    <td className={`px-3 py-2.5 text-right ${isITM_CE ? "bg-success/5" : ""}`}>
+                      <button
+                        onClick={() => { setTradeModal({ strike, type: "CE", premium: ceLtp }); setTradeType("BUY") }}
+                        className={`font-mono font-bold transition-all px-2 py-1 rounded-lg cursor-pointer ${
+                          cePos ? "bg-success/20 text-success ring-2 ring-success/50 animate-pulse" : "text-success hover:bg-success/10"
+                        }`}>
+                        ₹{fmtN(ceLtp)}
+                        {cePos && <span className="ml-1 text-[9px]">●{cePos.trade_type}</span>}
+                      </button>
+                    </td>
+                    {/* Strike */}
+                    <td className={`px-3 py-2.5 text-center font-mono font-bold text-sm bg-primary/5 border-x border-border/30 ${isATM ? "text-primary" : "text-foreground"}`}>
+                      {fmtN(strike)}
+                      {isATM && <div className="text-[9px] text-primary font-bold">ATM</div>}
+                    </td>
+                    {/* PE side */}
+                    <td className={`px-3 py-2.5 text-left ${isITM_PE ? "bg-destructive/5" : ""}`}>
+                      <button
+                        onClick={() => { setTradeModal({ strike, type: "PE", premium: peLtp }); setTradeType("BUY") }}
+                        className={`font-mono font-bold transition-all px-2 py-1 rounded-lg cursor-pointer ${
+                          pePos ? "bg-destructive/20 text-destructive ring-2 ring-destructive/50 animate-pulse" : "text-destructive hover:bg-destructive/10"
+                        }`}>
+                        ₹{fmtN(peLtp)}
+                        {pePos && <span className="ml-1 text-[9px]">●{pePos.trade_type}</span>}
+                      </button>
+                    </td>
+                    <td className={`px-3 py-2.5 text-muted-foreground ${isITM_PE ? "bg-destructive/5" : ""}`}>
+                      {peIV != null ? peIV.toFixed(1) + "%" : "—"}
+                    </td>
+                    <td className={`px-3 py-2.5 font-mono text-muted-foreground ${isITM_PE ? "bg-destructive/5" : ""}`}>
+                      {peVol != null ? fmtN(peVol / 1000) + "K" : "—"}
+                    </td>
+                    <td className={`px-3 py-2.5 font-mono ${isITM_PE ? "bg-destructive/5" : ""}`}>
+                      {peOI != null ? fmtN(peOI / 1000) + "K" : "—"}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="px-4 py-2 border-t border-border bg-muted/20 text-[10px] text-muted-foreground flex gap-4">
+          <span>🟢 Highlighted = open position</span>
+          <span>CE ITM = shaded green | PE ITM = shaded red</span>
+          <span>Click any LTP to trade</span>
+        </div>
+      </div>
+
+      {/* Trade Modal */}
+      {tradeModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-card border border-border rounded-2xl w-full max-w-sm shadow-2xl">
+            <div className="p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Place Order</div>
+                  <div className="font-bold text-lg text-foreground">{symbol} {tradeModal.strike} {tradeModal.type}</div>
+                  <div className="text-xs text-muted-foreground">{expiry ? formatExpiry(expiry) : ""} · {Math.round(dte)} days</div>
+                </div>
+                <button onClick={() => { setTradeModal(null); setTradeMsg("") }} className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* B/S toggle */}
+              <div className="flex gap-2 mb-4">
+                {(["BUY","SELL"] as TradeType[]).map(t => (
+                  <button key={t} onClick={() => setTradeType(t)}
+                    className={`flex-1 py-2.5 rounded-xl text-sm font-bold transition-colors ${
+                      tradeType === t ? (t === "BUY" ? "bg-success text-white" : "bg-destructive text-white") : "bg-muted text-muted-foreground"
+                    }`}>{t}</button>
+                ))}
+              </div>
+
+              {/* Lots */}
+              <div className="mb-4">
+                <label className="text-xs font-semibold text-muted-foreground block mb-1">Lots (1 lot = {lotSize} shares)</label>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setLots(l => Math.max(1, l - 1))} className="w-9 h-9 rounded-lg bg-muted flex items-center justify-center font-bold"><Minus className="w-4 h-4" /></button>
+                  <input type="number" value={lots} min={1} onChange={e => setLots(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="flex-1 text-center font-mono font-bold text-lg bg-muted border border-border rounded-lg py-2 focus:outline-none focus:border-primary" />
+                  <button onClick={() => setLots(l => l + 1)} className="w-9 h-9 rounded-lg bg-muted flex items-center justify-center font-bold"><Plus className="w-4 h-4" /></button>
+                </div>
+              </div>
+
+              {/* Order summary */}
+              <div className="bg-muted rounded-xl p-3 space-y-1.5 text-xs mb-4">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Premium</span>
+                  <span className="font-mono font-bold">₹{fmtN(tradeModal.premium)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Qty</span>
+                  <span className="font-mono">{lots} lots × {lotSize} = {lots * lotSize} shares</span>
+                </div>
+                {tradeType === "BUY" ? (
+                  <div className="flex justify-between border-t border-border pt-1.5">
+                    <span className="font-semibold">Total debit</span>
+                    <span className="font-mono font-bold text-destructive">{fmt(tradeModal.premium * lots * lotSize)}</span>
+                  </div>
+                ) : (
+                  <div className="flex justify-between border-t border-border pt-1.5">
+                    <span className="font-semibold">Margin blocked (~20%)</span>
+                    <span className="font-mono font-bold text-warning">{fmt(calcOptionsMargin(spot, lotSize, lots))}</span>
+                  </div>
+                )}
+              </div>
+
+              {tradeMsg && (
+                <div className={`text-xs rounded-lg px-3 py-2 mb-3 ${tradeMsg.startsWith("✅") ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive"}`}>
+                  {tradeMsg}
+                </div>
+              )}
+
+              <button onClick={placeOptionTrade} disabled={placing}
+                className={`w-full py-3 rounded-xl text-sm font-bold transition-colors flex items-center justify-center gap-2 ${
+                  tradeType === "BUY" ? "bg-success text-white hover:bg-success/90" : "bg-destructive text-white hover:bg-destructive/90"
+                } disabled:opacity-60`}>
+                {placing ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : `${tradeType} ${lots} Lot${lots > 1 ? "s" : ""} ${tradeModal.type}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STRATEGY BUILDER
+// ═════════════════════════════════════════════════════════════════════════════
+
+type StrategyLeg = {
+  id: string; type: OptionType | "FUTURES"; action: TradeType; strike: number
+  lots: number; premium: number; expiry: string; delta?: number; theta?: number
+}
+
+const PRESET_STRATEGIES = [
+  { name: "Bull Call Spread", description: "Buy lower CE, Sell higher CE. Limited risk, limited profit.", icon: "📈",
+    legs: (spot: number, iv: number, exp: string, sym: string) => {
+      const interval = getStrikeInterval(sym)
+      const atm = Math.round(spot / interval) * interval
+      return [
+        { type: "CE" as OptionType, action: "BUY" as TradeType, strike: atm, lots: 1, premium: calcOptionPremium(spot, atm, exp, "CE", iv/100), expiry: exp },
+        { type: "CE" as OptionType, action: "SELL" as TradeType, strike: atm + interval, lots: 1, premium: calcOptionPremium(spot, atm + interval, exp, "CE", iv/100), expiry: exp },
+      ]
+    }
+  },
+  { name: "Bear Put Spread", description: "Buy higher PE, Sell lower PE. Limited risk, limited profit.", icon: "📉",
+    legs: (spot: number, iv: number, exp: string, sym: string) => {
+      const interval = getStrikeInterval(sym)
+      const atm = Math.round(spot / interval) * interval
+      return [
+        { type: "PE" as OptionType, action: "BUY" as TradeType, strike: atm, lots: 1, premium: calcOptionPremium(spot, atm, exp, "PE", iv/100), expiry: exp },
+        { type: "PE" as OptionType, action: "SELL" as TradeType, strike: atm - interval, lots: 1, premium: calcOptionPremium(spot, atm - interval, exp, "PE", iv/100), expiry: exp },
+      ]
+    }
+  },
+  { name: "Iron Condor", description: "Sell strangle + Buy wings. Profits in range-bound market.", icon: "🦅",
+    legs: (spot: number, iv: number, exp: string, sym: string) => {
+      const interval = getStrikeInterval(sym)
+      const atm = Math.round(spot / interval) * interval
+      return [
+        { type: "PE" as OptionType, action: "BUY" as TradeType, strike: atm - 3*interval, lots: 1, premium: calcOptionPremium(spot, atm - 3*interval, exp, "PE", iv/100), expiry: exp },
+        { type: "PE" as OptionType, action: "SELL" as TradeType, strike: atm - interval, lots: 1, premium: calcOptionPremium(spot, atm - interval, exp, "PE", iv/100), expiry: exp },
+        { type: "CE" as OptionType, action: "SELL" as TradeType, strike: atm + interval, lots: 1, premium: calcOptionPremium(spot, atm + interval, exp, "CE", iv/100), expiry: exp },
+        { type: "CE" as OptionType, action: "BUY" as TradeType, strike: atm + 3*interval, lots: 1, premium: calcOptionPremium(spot, atm + 3*interval, exp, "CE", iv/100), expiry: exp },
+      ]
+    }
+  },
+  { name: "Short Straddle", description: "Sell ATM CE + PE. Profits from low volatility / time decay.", icon: "⚡",
+    legs: (spot: number, iv: number, exp: string, sym: string) => {
+      const interval = getStrikeInterval(sym)
+      const atm = Math.round(spot / interval) * interval
+      return [
+        { type: "CE" as OptionType, action: "SELL" as TradeType, strike: atm, lots: 1, premium: calcOptionPremium(spot, atm, exp, "CE", iv/100), expiry: exp },
+        { type: "PE" as OptionType, action: "SELL" as TradeType, strike: atm, lots: 1, premium: calcOptionPremium(spot, atm, exp, "PE", iv/100), expiry: exp },
+      ]
+    }
+  },
+  { name: "Long Straddle", description: "Buy ATM CE + PE. Profits from big moves in either direction.", icon: "🎯",
+    legs: (spot: number, iv: number, exp: string, sym: string) => {
+      const interval = getStrikeInterval(sym)
+      const atm = Math.round(spot / interval) * interval
+      return [
+        { type: "CE" as OptionType, action: "BUY" as TradeType, strike: atm, lots: 1, premium: calcOptionPremium(spot, atm, exp, "CE", iv/100), expiry: exp },
+        { type: "PE" as OptionType, action: "BUY" as TradeType, strike: atm, lots: 1, premium: calcOptionPremium(spot, atm, exp, "PE", iv/100), expiry: exp },
+      ]
+    }
+  },
+  { name: "Covered Call", description: "Hold underlying + Sell CE. Income from sideways market.", icon: "💰",
+    legs: (spot: number, iv: number, exp: string, sym: string) => {
+      const interval = getStrikeInterval(sym)
+      const atm = Math.round(spot / interval) * interval
+      return [
+        { type: "CE" as OptionType, action: "SELL" as TradeType, strike: atm + interval, lots: 1, premium: calcOptionPremium(spot, atm + interval, exp, "CE", iv/100), expiry: exp },
+      ]
+    }
+  },
+]
+
+function StrategyBuilder({ userId, balance, spot, vix, symbol, onTrade }: {
+  userId: string; balance: number; spot: number; vix: number; symbol: string; onTrade: () => void
+}) {
+  const [legs, setLegs] = useState<StrategyLeg[]>([])
+  const [expiry, setExpiry] = useState(getWeeklyExpiries(symbol)[0] ?? "")
+  const [placing, setPlacing] = useState(false)
+  const [msg, setMsg] = useState("")
+  const expiryOptions = getWeeklyExpiries(symbol)
+  const interval = getStrikeInterval(symbol)
+  const atm = spot > 0 ? Math.round(spot / interval) * interval : 0
+  const lotSize = LOT_SIZES[symbol] ?? 75
+  const dte = expiry ? daysToExpiry(expiry) : 30
+  const move = spot > 0 && vix > 0 ? expectedMove(spot, vix, dte) : null
+
+  function addLeg() {
+    setLegs(prev => [...prev, {
+      id: Math.random().toString(36).slice(2), type: "CE", action: "BUY",
+      strike: atm, lots: 1, premium: spot > 0 ? calcOptionPremium(spot, atm, expiry, "CE", vix/100) : 0,
+      expiry,
+    }])
+  }
+
+  function loadPreset(preset: typeof PRESET_STRATEGIES[0]) {
+    if (spot <= 0) { setMsg("Fetch spot price first"); return }
+    const newLegs = preset.legs(spot, vix, expiry, symbol).map((l, i) => ({
+      ...l, id: Math.random().toString(36).slice(2),
+      delta: calcGreeks(spot, l.strike, dte/365, 0.065, vix/100, l.type as OptionType).delta,
+      theta: calcGreeks(spot, l.strike, dte/365, 0.065, vix/100, l.type as OptionType).theta,
+    }))
+    setLegs(newLegs)
+    setMsg(`Loaded ${preset.name}`)
+    setTimeout(() => setMsg(""), 2000)
+  }
+
+  function updateLeg(id: string, field: string, value: any) {
+    setLegs(prev => prev.map(l => {
+      if (l.id !== id) return l
+      const updated = { ...l, [field]: value }
+      if ((field === "strike" || field === "type") && spot > 0) {
+        updated.premium = calcOptionPremium(spot, updated.strike, expiry, updated.type as OptionType, vix/100)
       }
+      return updated
+    }))
+  }
+
+  // Net premium / max profit / max loss summary
+  const netPremium = legs.reduce((s, l) => {
+    const sign = l.action === "BUY" ? -1 : 1
+    return s + sign * l.premium * l.lots * lotSize
+  }, 0)
+
+  async function placeAllLegs() {
+    if (legs.length === 0) { setMsg("Add at least one leg"); return }
+    setPlacing(true); setMsg("")
+
+    const { data: walletData } = await supabase.from("wallets").select("balance").eq("user_id", userId).single()
+    if (!walletData) { setMsg("Could not read wallet"); setPlacing(false); return }
+
+    let totalDebit = 0
+    for (const leg of legs) {
+      const actualQty = leg.lots * lotSize
+      const charges = calcCharges(leg.premium, actualQty, "OPTIONS", leg.action)
+      if (leg.action === "BUY") totalDebit += leg.premium * actualQty + charges
+      else totalDebit += calcOptionsMargin(spot, lotSize, leg.lots)
     }
 
-    // ── Insert trade history ──────────────────────────────────────────────────
-    const now = new Date().toISOString()
-    const openHistRow: Record<string, any> = {
-      user_id:    userId,
-      symbol,
-      instrument: inst,
-      trade_type: side,
-      quantity:   tradeQty,
-      price:      tradePrice,
-      total_value: tradeTurnover,
-      charges:    tradeCharges,
-      net_value:  tradeNet,
-    }
-    try { openHistRow.margin_blocked = marginBlocked                    } catch {}
-    try { openHistRow.expiry         = expiry || null                   } catch {}
-    try { openHistRow.strike_price   = inst === "OPTIONS" ? strike : null } catch {}
-    try { openHistRow.option_type    = inst === "OPTIONS" ? optType : null } catch {}
-    try { openHistRow.executed_at    = now                              } catch {}
-    try { openHistRow.created_at     = now                              } catch {}
-    const { error: openHistErr } = await supabase.from("trade_history").insert(openHistRow)
-    if (openHistErr) console.error("trade_history open insert failed:", openHistErr.message)
+    if (totalDebit > walletData.balance) { setMsg(`Insufficient balance. Need ${fmt(totalDebit)}, have ${fmt(walletData.balance)}`); setPlacing(false); return }
 
-    // ── Update wallet ─────────────────────────────────────────────────────────
-    const newBalance = freshBalance - walletDebit + walletCredit
-    const { error: walletErr } = await supabase
-      .from("wallets").update({ balance: newBalance }).eq("user_id", userId)
+    let bal = walletData.balance
+    for (const leg of legs) {
+      const actualQty = leg.lots * lotSize
+      const charges = calcCharges(leg.premium, actualQty, "OPTIONS", leg.action)
+      const marginBlocked = leg.action === "SELL" ? calcOptionsMargin(spot, lotSize, leg.lots) : 0
+      const walletDebit = leg.action === "BUY" ? leg.premium * actualQty + charges : marginBlocked
 
-    if (walletErr) {
-      setError(`Trade saved but wallet update failed: ${walletErr.message}`)
-      setLoading(false); return
+      await supabase.from("positions").insert({
+        user_id: userId, symbol, instrument: "OPTIONS", trade_type: leg.action,
+        quantity: actualQty, entry_price: leg.premium, avg_price: leg.premium, current_price: leg.premium,
+        expiry: leg.expiry, strike_price: leg.strike, option_type: leg.type,
+        margin_blocked: marginBlocked, status: "OPEN", opened_at: new Date().toISOString(),
+      })
+
+      await supabase.from("trade_history").insert({
+        user_id: userId, symbol, instrument: "OPTIONS", trade_type: leg.action,
+        quantity: actualQty, price: leg.premium, total_value: leg.premium * actualQty,
+        charges, net_value: walletDebit, margin_blocked: marginBlocked,
+        expiry: leg.expiry, strike_price: leg.strike, option_type: leg.type,
+        executed_at: new Date().toISOString(), created_at: new Date().toISOString(),
+      })
+
+      bal -= walletDebit
     }
 
-    // ── Success message ───────────────────────────────────────────────────────
-    let msg = ""
-    if (inst === "OPTIONS" && side === "BUY") {
-      msg = `✅ Bought ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${tradePrice} premium | Debited ₹${fmtN(tradeTurnover)} + charges`
-    } else if (inst === "OPTIONS" && side === "SELL") {
-      msg = `✅ Sold ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike}${optType} @ ₹${tradePrice} | Margin blocked ₹${fmtN(marginBlocked)}`
-    } else if (inst === "FUTURES") {
-      msg = `✅ ${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} Futures @ ₹${tradePrice} | Margin blocked ₹${fmtN(marginBlocked)}`
-    } else {
-      msg = `✅ ${side} ${tradeQty} ${symbol} @ ₹${tradePrice} | Total ₹${fmt(tradeTurnover)} | Charges ₹${tradeCharges.toFixed(2)}`
-    }
-    setSuccess(msg)
-    setLoading(false)
-    onDone()
+    await supabase.from("wallets").update({ balance: bal }).eq("user_id", userId)
+    setMsg(`✅ ${legs.length} leg${legs.length > 1 ? "s" : ""} placed successfully!`)
+    onTrade()
+    setTimeout(() => { setLegs([]); setMsg("") }, 2000)
+    setPlacing(false)
   }
 
   return (
-    <form onSubmit={placeTrade} className="bg-card border border-border rounded-xl p-5">
-      <h3 className="text-base font-semibold text-foreground mb-4">Place Order</h3>
-
-      {error   && <div className="bg-destructive/10 border border-destructive/30 text-destructive text-xs rounded-lg px-3 py-2 mb-3">{error}</div>}
-      {success && <div className="bg-success/10 border border-success/30 text-success text-xs rounded-lg px-3 py-2 mb-3">{success}</div>}
-
-      {/* Instrument tabs */}
-      <div className="flex gap-1 bg-muted p-1 rounded-xl mb-4">
-        {(["EQUITY","OPTIONS","FUTURES"] as InstrumentType[]).map(t => (
-          <button key={t} type="button" onClick={() => setInst(t)}
-            className={`flex-1 text-xs font-semibold py-1.5 rounded-lg transition-colors ${inst === t ? "bg-card text-foreground shadow-sm" : "text-muted-foreground"}`}>
-            {t}
-          </button>
-        ))}
+    <div className="space-y-4">
+      {/* Preset strategies */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Star className="w-4 h-4 text-primary" />
+          <span className="text-sm font-bold text-foreground">Strategy Templates</span>
+          <span className="text-[11px] text-muted-foreground ml-1">Click to load a preset</span>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+          {PRESET_STRATEGIES.map(p => (
+            <button key={p.name} onClick={() => loadPreset(p)}
+              className="text-left p-3 bg-muted hover:bg-muted/80 border border-border hover:border-primary/50 rounded-xl transition-all group">
+              <div className="text-lg mb-1">{p.icon}</div>
+              <div className="text-xs font-bold text-foreground group-hover:text-primary transition-colors">{p.name}</div>
+              <div className="text-[10px] text-muted-foreground mt-0.5 leading-tight">{p.description}</div>
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* BUY / SELL */}
-      <div className="flex gap-2 mb-4">
-        {(["BUY","SELL"] as TradeType[]).map(s => (
-          <button key={s} type="button" onClick={() => setSide(s)}
-            className={`flex-1 py-2 rounded-xl text-sm font-bold transition-colors ${
-              side === s
-                ? s === "BUY" ? "bg-success text-success-foreground" : "bg-destructive text-destructive-foreground"
-                : s === "BUY" ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive"
-            }`}>
-            {s}
-          </button>
-        ))}
-      </div>
-
-      <div className="space-y-3">
-
-        {/* Symbol */}
-        <div>
-          <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            Symbol <span className="text-primary">(Nifty 50)</span>
-          </label>
-          <div className="relative">
-            <select value={symbol} onChange={e => setSymbol(e.target.value)}
-              className="w-full appearance-none bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary">
-              {symbols.map(s => <option key={s}>{s}</option>)}
+      {/* Controls */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <div className="flex flex-wrap gap-3 items-center mb-3">
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Expiry</label>
+            <select value={expiry} onChange={e => setExpiry(e.target.value)}
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
+              {expiryOptions.map(e => <option key={e} value={e}>{formatExpiry(e)} · {Math.round(daysToExpiry(e))}d</option>)}
             </select>
-            <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
           </div>
+          {spot > 0 && <div className="self-end"><div className="text-xs text-muted-foreground">Spot</div><div className="font-mono font-bold text-lg">₹{fmtN(spot)}</div></div>}
+          {move && <div className="self-end"><div className="text-[11px] text-muted-foreground">Expected range ±{move.pct.toFixed(1)}%</div><div className="text-xs font-mono">{fmtN(move.down)} – {fmtN(move.up)}</div></div>}
+          <button onClick={addLeg} className="self-end flex items-center gap-1.5 px-3 py-2 bg-primary text-primary-foreground text-xs font-semibold rounded-lg hover:bg-primary/90 transition-colors ml-auto">
+            <Plus className="w-3.5 h-3.5" /> Add Leg
+          </button>
         </div>
 
-        {/* Expiry — options and futures */}
-        {inst !== "EQUITY" && (
-          <div>
-            <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-              Expiry Date {symbol === "NIFTY" && <span className="text-primary">(Weekly · Every Tuesday)</span>}
-            </label>
-            {!manualExpiry ? (
-              <>
-                <div className="relative">
-                  <select value={expiry} onChange={e => setExpiry(e.target.value)}
-                    className="w-full appearance-none bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary">
-                    {expiryOptions.map(d => (
-                      <option key={d} value={d}>{formatExpiry(d)}</option>
+        {/* Net premium summary */}
+        {legs.length > 0 && (
+          <div className="grid grid-cols-3 gap-3 mb-4 p-3 bg-muted rounded-xl">
+            <div className="text-center">
+              <div className="text-[11px] text-muted-foreground">Net Premium</div>
+              <div className={`font-mono font-bold text-sm ${netPremium >= 0 ? "text-success" : "text-destructive"}`}>
+                {netPremium >= 0 ? "+" : ""}{fmt(Math.abs(netPremium))}
+              </div>
+              <div className="text-[10px] text-muted-foreground">{netPremium >= 0 ? "credit received" : "debit paid"}</div>
+            </div>
+            <div className="text-center">
+              <div className="text-[11px] text-muted-foreground">Legs</div>
+              <div className="font-bold text-sm text-foreground">{legs.length}</div>
+            </div>
+            <div className="text-center">
+              <div className="text-[11px] text-muted-foreground">Net Delta</div>
+              <div className="font-mono text-sm text-foreground">
+                {legs.reduce((s, l) => {
+                  if (l.type === "FUTURES") return s
+                  const g = calcGreeks(spot, l.strike, dte/365, 0.065, vix/100, l.type as OptionType)
+                  return s + (l.action === "BUY" ? 1 : -1) * g.delta * l.lots * lotSize
+                }, 0).toFixed(2)}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Legs */}
+        {legs.length === 0 ? (
+          <div className="text-center py-8 text-muted-foreground text-sm">
+            <Layers className="w-8 h-8 mx-auto mb-2 opacity-30" />
+            Pick a template above or click "Add Leg" to build your strategy
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {legs.map((leg, i) => {
+              const greeks = leg.type !== "FUTURES" ? calcGreeks(spot, leg.strike, dte/365, 0.065, vix/100, leg.type as OptionType) : null
+              return (
+                <div key={leg.id} className="grid grid-cols-[auto_1fr_1fr_1fr_1fr_auto] gap-2 items-center bg-muted/50 rounded-xl p-3">
+                  <span className="text-[11px] font-bold text-muted-foreground w-6 text-center">{i + 1}</span>
+                  {/* B/S */}
+                  <div className="flex gap-1">
+                    {(["BUY","SELL"] as TradeType[]).map(t => (
+                      <button key={t} onClick={() => updateLeg(leg.id, "action", t)}
+                        className={`flex-1 text-[11px] font-bold py-1 px-2 rounded-lg transition-colors ${
+                          leg.action === t ? (t === "BUY" ? "bg-success text-white" : "bg-destructive text-white") : "bg-background text-muted-foreground"
+                        }`}>{t}</button>
                     ))}
-                  </select>
-                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                  </div>
+                  {/* CE/PE */}
+                  <div className="flex gap-1">
+                    {(["CE","PE"] as OptionType[]).map(t => (
+                      <button key={t} onClick={() => updateLeg(leg.id, "type", t)}
+                        className={`flex-1 text-[11px] font-bold py-1 px-2 rounded-lg transition-colors ${
+                          leg.type === t ? "bg-primary text-primary-foreground" : "bg-background text-muted-foreground"
+                        }`}>{t}</button>
+                    ))}
+                  </div>
+                  {/* Strike */}
+                  <div>
+                    <select value={leg.strike} onChange={e => updateLeg(leg.id, "strike", Number(e.target.value))}
+                      className="w-full bg-background border border-border rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-primary">
+                      {Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval)
+                        .filter(s => s > 0)
+                        .map(s => <option key={s} value={s}>{s}{s === atm ? " (ATM)" : ""}</option>)}
+                    </select>
+                    {greeks && <div className="text-[9px] text-muted-foreground mt-0.5">Δ{greeks.delta.toFixed(2)} Θ{greeks.theta.toFixed(2)}/d</div>}
+                  </div>
+                  {/* Lots + Premium */}
+                  <div>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => updateLeg(leg.id, "lots", Math.max(1, leg.lots - 1))} className="w-5 h-5 rounded bg-background text-muted-foreground flex items-center justify-center text-xs"><Minus className="w-3 h-3" /></button>
+                      <span className="text-xs font-mono w-4 text-center">{leg.lots}</span>
+                      <button onClick={() => updateLeg(leg.id, "lots", leg.lots + 1)} className="w-5 h-5 rounded bg-background text-muted-foreground flex items-center justify-center text-xs"><Plus className="w-3 h-3" /></button>
+                    </div>
+                    <div className="text-[9px] font-mono text-muted-foreground mt-0.5">₹{fmtN(leg.premium)}/sh</div>
+                  </div>
+                  <button onClick={() => setLegs(prev => prev.filter(l => l.id !== leg.id))} className="w-7 h-7 rounded-lg bg-destructive/10 text-destructive flex items-center justify-center hover:bg-destructive/20"><X className="w-3.5 h-3.5" /></button>
                 </div>
-                <button type="button" onClick={() => { setManualExpiry(true); setExpiry("") }}
-                  className="text-[10px] text-primary hover:underline mt-1 block">
-                  Holiday? Enter expiry manually
-                </button>
-              </>
-            ) : (
-              <>
-                <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)}
-                  min={new Date().toISOString().split("T")[0]}
-                  className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm font-semibold text-foreground focus:outline-none focus:border-primary" />
-                <button type="button" onClick={() => { setManualExpiry(false); setExpiry(expiryOptions[0] ?? "") }}
-                  className="text-[10px] text-primary hover:underline mt-1 block">
-                  ← Back to standard dates
-                </button>
-              </>
-            )}
+              )
+            })}
           </div>
         )}
 
-        {/* Options: strike + CE/PE */}
-        {inst === "OPTIONS" && (
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">Strike Price ₹</label>
-              <input type="number" value={strike} onChange={e => setStrike(Number(e.target.value))}
-                placeholder="e.g. 24800" step="50"
-                className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-            </div>
-            <div>
-              <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">CE / PE</label>
-              <div className="flex gap-1">
-                {(["CE","PE"] as OptionType[]).map(o => (
-                  <button key={o} type="button" onClick={() => setOptType(o)}
-                    className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-colors ${optType === o ? "bg-primary text-primary-foreground" : "bg-muted border border-border text-muted-foreground"}`}>
-                    {o}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
+        {msg && <div className={`mt-3 text-xs rounded-lg px-3 py-2 ${msg.startsWith("✅") ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive"}`}>{msg}</div>}
 
-        {/* Price / Premium */}
-        <div>
-          <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "OPTIONS" ? "Option Premium ₹" : "Price ₹"}
-          </label>
-          {inst === "OPTIONS" ? (
-            <>
-              <div className="flex gap-2">
-                <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
-                  placeholder="Enter premium (e.g. 86)"
-                  className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-                <button type="button" onClick={fetchPrice} disabled={fetching}
-                  title="Fetch spot price and auto-calculate premium via Black-Scholes"
-                  className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap flex items-center gap-1">
-                  {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Auto BS"}
-                </button>
+        {legs.length > 0 && (
+          <button onClick={placeAllLegs} disabled={placing}
+            className="mt-4 w-full bg-primary text-primary-foreground py-3 rounded-xl text-sm font-bold hover:bg-primary/90 transition-colors disabled:opacity-60 flex items-center justify-center gap-2">
+            {placing ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <><Zap className="w-4 h-4" />Place All {legs.length} Leg{legs.length > 1 ? "s" : ""}</>}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// REPLAY / AUTOPLAY
+// ═════════════════════════════════════════════════════════════════════════════
+
+function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
+  const [fromDate, setFromDate] = useState("2024-08-01")
+  const [currentDate, setCurrentDate] = useState("2024-08-01")
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [speed, setSpeed] = useState(1000) // ms per day
+  const [bhavData, setBhavData] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [currentRow, setCurrentRow] = useState<any | null>(null)
+  const intervalRef = useRef<NodeJS.Timeout | null>(null)
+  const replaySym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
+  const tableName = replaySym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+
+  async function loadBhav() {
+    setLoading(true)
+    // Get distinct dates from bhav
+    const { data } = await supabase
+      .from(tableName)
+      .select("date, strike_price, expiry_date, ce_ltp, pe_ltp, ce_iv, pe_iv, ce_oi, pe_oi")
+      .gte("date", fromDate)
+      .order("date", { ascending: true })
+      .limit(5000)
+    if (data) { setBhavData(data); if (data.length > 0) setCurrentDate(data[0].date) }
+    setLoading(false)
+  }
+
+  const allDates = [...new Set(bhavData.map(r => r.date))].sort()
+
+  function stepTo(date: string) {
+    setCurrentDate(date)
+    const rows = bhavData.filter(r => r.date === date)
+    if (rows.length > 0) setCurrentRow({ date, rows })
+  }
+
+  function togglePlay() {
+    if (isPlaying) {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+      setIsPlaying(false)
+    } else {
+      setIsPlaying(true)
+      let idx = allDates.indexOf(currentDate)
+      intervalRef.current = setInterval(() => {
+        idx++
+        if (idx >= allDates.length) {
+          if (intervalRef.current) clearInterval(intervalRef.current)
+          setIsPlaying(false)
+          return
+        }
+        stepTo(allDates[idx])
+      }, speed)
+    }
+  }
+
+  useEffect(() => {
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
+  }, [])
+
+  const currentIdx = allDates.indexOf(currentDate)
+  const todayRows = bhavData.filter(r => r.date === currentDate)
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-card border border-border rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Clock className="w-4 h-4 text-primary" />
+          <span className="text-sm font-bold text-foreground">Historical Replay</span>
+          <span className="text-[11px] bg-primary/10 text-primary px-2 py-0.5 rounded-full font-semibold">{replaySym}</span>
+        </div>
+        <div className="flex flex-wrap gap-3 items-end mb-4">
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Start Date</label>
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} min="2024-08-01" max="2026-05-29"
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary" />
+          </div>
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Speed</label>
+            <select value={speed} onChange={e => setSpeed(Number(e.target.value))}
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
+              <option value={2000}>0.5x (slow)</option>
+              <option value={1000}>1x (normal)</option>
+              <option value={500}>2x (fast)</option>
+              <option value={200}>5x (very fast)</option>
+            </select>
+          </div>
+          <button onClick={loadBhav} disabled={loading}
+            className="flex items-center gap-1.5 px-4 py-2 bg-primary text-primary-foreground text-xs font-semibold rounded-lg hover:bg-primary/90">
+            {loading ? <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <><Search className="w-3.5 h-3.5" />Load Data</>}
+          </button>
+        </div>
+
+        {allDates.length > 0 && (
+          <>
+            {/* Date progress */}
+            <div className="mb-3">
+              <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+                <span>{allDates[0]}</span>
+                <span className="font-bold text-foreground">📅 {currentDate}</span>
+                <span>{allDates[allDates.length - 1]}</span>
               </div>
-              <p className="text-[10px] text-muted-foreground mt-1">
-                Enter premium manually, or click <strong>Auto BS</strong> to fetch spot price &amp; calculate via Black-Scholes (IV 18%)
-                {spotPrice ? ` · Spot fetched: ₹${fmtN(spotPrice)}` : ""}
-              </p>
-            </>
-          ) : (
-            <div className="flex gap-2">
-              <input type="number" value={price} onChange={e => setPrice(Number(e.target.value))}
-                placeholder="Enter or fetch live price"
-                className="flex-1 bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-              <button type="button" onClick={fetchPrice} disabled={fetching}
-                className="px-3 bg-primary/10 text-primary rounded-xl text-xs font-semibold hover:bg-primary/20 transition-colors disabled:opacity-50 whitespace-nowrap flex items-center gap-1">
-                {fetching ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : "Live ₹"}
+              <input type="range" min={0} max={allDates.length - 1} value={currentIdx >= 0 ? currentIdx : 0}
+                onChange={e => stepTo(allDates[parseInt(e.target.value)])}
+                className="w-full accent-primary" />
+              <div className="text-center text-[11px] text-muted-foreground mt-1">
+                Day {currentIdx + 1} of {allDates.length}
+              </div>
+            </div>
+
+            {/* Playback controls */}
+            <div className="flex items-center justify-center gap-2">
+              <button onClick={() => { if (currentIdx > 0) stepTo(allDates[currentIdx - 1]) }}
+                className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center hover:bg-muted/80 disabled:opacity-40" disabled={currentIdx <= 0}>
+                <SkipBack className="w-4 h-4" />
+              </button>
+              <button onClick={togglePlay}
+                className="w-12 h-12 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90">
+                {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+              </button>
+              <button onClick={() => { if (currentIdx < allDates.length - 1) stepTo(allDates[currentIdx + 1]) }}
+                className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center hover:bg-muted/80 disabled:opacity-40" disabled={currentIdx >= allDates.length - 1}>
+                <SkipForward className="w-4 h-4" />
               </button>
             </div>
-          )}
-        </div>
-
-        {/* Quantity */}
-        <div>
-          <label className="text-[11px] font-semibold text-muted-foreground mb-1 block">
-            {inst === "EQUITY" ? "Quantity (shares)" : "Lots"}
-          </label>
-          <input type="number" value={qty} min={1} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))}
-            className="w-full bg-muted border border-border rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-primary" />
-          {inst !== "EQUITY" && (
-            <div className="mt-2">
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] font-semibold text-muted-foreground">
-                  Lot size <span className="text-primary">(NSE default: {fmtN(defaultLotSize)})</span>
-                </label>
-                {lotSizeOverride !== "" && (
-                  <button type="button" onClick={() => setLotSizeOverride("")}
-                    className="text-[10px] text-primary hover:underline">Reset to default</button>
-                )}
-              </div>
-              <input
-                type="number" value={lotSizeOverride === "" ? defaultLotSize : lotSizeOverride}
-                min={1}
-                onChange={e => {
-                  const v = parseInt(e.target.value) || 1
-                  setLotSizeOverride(v === defaultLotSize ? "" : v)
-                }}
-                className={`w-full bg-muted border rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-primary ${lotSizeOverride !== "" ? "border-warning text-warning font-semibold" : "border-border"}`}
-              />
-              <p className="text-[10px] text-muted-foreground mt-1">
-                Total qty: <strong>{fmtN(actualQty)}</strong> shares
-                {lotSizeOverride !== "" && <span className="text-warning ml-1">⚠ Custom lot size</span>}
-              </p>
-            </div>
-          )}
-        </div>
-
-        {/* Order summary */}
-        {price ? (() => {
-          const p = price as number
-          const marginForSell = (inst === "OPTIONS" && side === "SELL")
-            ? calcOptionsMargin(spotPrice ?? (strike as number) ?? (price as number), lotSize, qty)
-            : (inst === "FUTURES")
-            ? calcFuturesMargin(price as number, lotSize, qty)
-            : 0
-          const displayDebit = (inst === "OPTIONS" && side === "SELL") || inst === "FUTURES"
-            ? marginForSell
-            : inst === "OPTIONS" ? turnover + charges
-            : side === "BUY" ? turnover + charges : 0
-          const displayCredit = (inst === "EQUITY" && side === "SELL") ? turnover - charges : 0
-          const balAfter = balance - displayDebit + displayCredit
-
-          return (
-          <div className="bg-muted rounded-xl p-3 space-y-1.5 text-xs">
-            {inst === "OPTIONS" && side === "BUY" && (
-              <div className="flex justify-between text-primary font-semibold border-b border-border pb-1.5 mb-1">
-                <span>Premium × Qty</span>
-                <span className="font-mono">₹{fmtN(p)} × {actualQty} = {fmt(turnover)}</span>
-              </div>
-            )}
-            {(inst === "OPTIONS" || inst === "FUTURES") && side === "SELL" && (
-              <div className="flex justify-between text-warning font-semibold border-b border-border pb-1.5 mb-1">
-                <span>Margin blocked (SPAN approx)</span>
-                <span className="font-mono">{fmt(marginForSell)}</span>
-              </div>
-            )}
-            {inst === "EQUITY" && (
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Turnover</span>
-                <span className="font-mono font-semibold">{fmt(turnover)}</span>
-              </div>
-            )}
-            {(inst === "OPTIONS" && side === "BUY") && (
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Total Premium</span>
-                <span className="font-mono font-semibold">{fmt(turnover)}</span>
-              </div>
-            )}
-            {inst !== "OPTIONS" || side === "BUY" ? (
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Charges</span>
-                <span className="font-mono text-warning">+{fmt(charges)}</span>
-              </div>
-            ) : null}
-            <div className="flex justify-between border-t border-border pt-1.5">
-              <span className="font-semibold text-foreground">
-                {(inst === "OPTIONS" || inst === "FUTURES") && side === "SELL" ? "Margin blocked" : side === "BUY" ? "Total debit" : "Total credit"}
-              </span>
-              <span className={`font-mono font-bold ${displayDebit > 0 ? "text-destructive" : "text-success"}`}>
-                {displayDebit > 0 ? fmt(displayDebit) : fmt(displayCredit)}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Balance after</span>
-              <span className="font-mono font-semibold">{fmt(balAfter)}</span>
-            </div>
-            {(inst === "OPTIONS" || inst === "FUTURES") && side === "SELL" && (
-              <p className="text-[10px] text-warning/80 pt-1 border-t border-border">
-                ⚠️ If loss reaches margin, position auto squares off
-              </p>
-            )}
-            {inst === "OPTIONS" && side === "BUY" && (
-              <p className="text-[10px] text-muted-foreground pt-1 border-t border-border">
-                At expiry — worthless if OTM. P&L = (exit premium − entry premium) × {actualQty}
-              </p>
-            )}
-          </div>
-          )
-        })() : null}
-
-        <button type="submit" disabled={loading}
-          className={`w-full py-3 rounded-xl text-sm font-bold transition-colors disabled:opacity-60 flex items-center justify-center gap-2 ${
-            side === "BUY" ? "bg-success text-success-foreground hover:bg-success/90" : "bg-destructive text-destructive-foreground hover:bg-destructive/90"
-          }`}>
-          {loading
-            ? <div className="w-4 h-4 border-2 border-current/30 border-t-current rounded-full animate-spin" />
-            : inst === "OPTIONS"
-              ? `${side} ${qty} lot${qty > 1 ? "s" : ""} ${symbol} ${strike || ""}${optType}`
-              : `${side} ${inst === "EQUITY" ? `${qty} shares` : `${qty} lot${qty > 1 ? "s" : ""}`} of ${symbol}`
-          }
-        </button>
+          </>
+        )}
       </div>
-    </form>
+
+      {/* Today's bhav data */}
+      {todayRows.length > 0 && (
+        <div className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-border bg-muted/50">
+            <span className="text-xs font-bold text-foreground">{replaySym} Option Chain — {currentDate}</span>
+            <span className="text-[10px] text-muted-foreground ml-2">{todayRows.length} rows from Bhav Copy</span>
+          </div>
+          <div className="overflow-x-auto max-h-80">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-muted/30 sticky top-0">
+                  {["Expiry","Strike","CE LTP","CE OI","PE LTP","PE OI","CE IV","PE IV"].map(h => (
+                    <th key={h} className="px-3 py-2 text-right first:text-left text-[10px] font-semibold text-muted-foreground">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...todayRows].sort((a, b) => a.strike_price - b.strike_price).map((r, i) => (
+                  <tr key={i} className="border-t border-border/50 hover:bg-muted/30">
+                    <td className="px-3 py-2 font-mono text-muted-foreground">{r.expiry_date}</td>
+                    <td className="px-3 py-2 text-right font-mono font-bold">{fmtN(r.strike_price)}</td>
+                    <td className="px-3 py-2 text-right font-mono text-success">{r.ce_ltp != null ? fmtN(r.ce_ltp) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.ce_oi != null ? (r.ce_oi / 1000).toFixed(0) + "K" : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-destructive">{r.pe_ltp != null ? fmtN(r.pe_ltp) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.pe_oi != null ? (r.pe_oi / 1000).toFixed(0) + "K" : "—"}</td>
+                    <td className="px-3 py-2 text-right text-muted-foreground">{r.ce_iv != null ? r.ce_iv.toFixed(1) + "%" : "—"}</td>
+                    <td className="px-3 py-2 text-right text-muted-foreground">{r.pe_iv != null ? r.pe_iv.toFixed(1) + "%" : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {bhavData.length === 0 && !loading && (
+        <div className="bg-card border border-border rounded-xl p-10 text-center">
+          <Clock className="w-10 h-10 text-muted-foreground/30 mx-auto mb-3" />
+          <p className="text-sm font-semibold text-muted-foreground">Load historical bhav data to replay</p>
+          <p className="text-xs text-muted-foreground mt-1">Data available from Aug 2024 – May 2026</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FUTURE PLAYS (Black-Scholes + VIX forecasting)
+// ═════════════════════════════════════════════════════════════════════════════
+
+function FuturePlays({ spot, vix, symbol }: { spot: number; vix: number; symbol: string }) {
+  const [targetExpiry, setTargetExpiry] = useState("")
+  const [targetVIX, setTargetVIX] = useState(vix)
+  const [targetSpot, setTargetSpot] = useState(spot)
+  const expiryOptions = getWeeklyExpiries(symbol)
+  const interval = getStrikeInterval(symbol)
+  const atm = spot > 0 ? Math.round(spot / interval) * interval : 0
+
+  useEffect(() => {
+    if (expiryOptions.length > 0 && !targetExpiry) setTargetExpiry(expiryOptions[0])
+  }, [symbol])
+
+  useEffect(() => { setTargetVIX(vix) }, [vix])
+  useEffect(() => { setTargetSpot(spot) }, [spot])
+
+  const dte = targetExpiry ? daysToExpiry(targetExpiry) : 30
+  const currentMove = spot > 0 && vix > 0 ? expectedMove(spot, vix, dte) : null
+  const futureMove  = targetSpot > 0 ? expectedMove(targetSpot, targetVIX, dte) : null
+
+  // Generate strikes around ATM
+  const strikes = atm > 0 ? Array.from({ length: 11 }, (_, i) => atm - 5 * interval + i * interval).filter(s => s > 0) : []
+
+  // Current premiums
+  const currentPremiums = strikes.map(s => ({
+    strike: s,
+    ce: spot > 0 ? calcOptionPremium(spot, s, targetExpiry || expiryOptions[0], "CE", vix / 100) : 0,
+    pe: spot > 0 ? calcOptionPremium(spot, s, targetExpiry || expiryOptions[0], "PE", vix / 100) : 0,
+  }))
+
+  // Future premiums (what Black-Scholes says if spot/VIX change)
+  const futurePremiums = strikes.map(s => ({
+    strike: s,
+    ce: targetSpot > 0 ? calcOptionPremium(targetSpot, s, targetExpiry || expiryOptions[0], "CE", targetVIX / 100) : 0,
+    pe: targetSpot > 0 ? calcOptionPremium(targetSpot, s, targetExpiry || expiryOptions[0], "PE", targetVIX / 100) : 0,
+  }))
+
+  const vixLevel = targetVIX < 12 ? { label: "Calm", color: "text-success", bg: "bg-success/10" }
+    : targetVIX < 18 ? { label: "Low", color: "text-success", bg: "bg-success/10" }
+    : targetVIX < 25 ? { label: "Normal", color: "text-primary", bg: "bg-primary/10" }
+    : targetVIX < 35 ? { label: "Elevated", color: "text-warning", bg: "bg-warning/10" }
+    : { label: "High Fear", color: "text-destructive", bg: "bg-destructive/10" }
+
+  return (
+    <div className="space-y-4">
+      {/* Scenario builder */}
+      <div className="bg-card border border-border rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-4">
+          <Zap className="w-4 h-4 text-primary" />
+          <span className="text-sm font-bold text-foreground">Future Scenario Builder</span>
+          <span className="text-[11px] text-muted-foreground">Powered by Black-Scholes + VIX expected move</span>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Expiry */}
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1.5">Target Expiry</label>
+            <select value={targetExpiry} onChange={e => setTargetExpiry(e.target.value)}
+              className="w-full bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
+              {expiryOptions.map(e => <option key={e} value={e}>{formatExpiry(e)} · {Math.round(daysToExpiry(e))} days</option>)}
+            </select>
+          </div>
+          {/* Spot scenario */}
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1.5">
+              Spot Scenario: <span className="text-foreground font-mono">{fmtN(targetSpot)}</span>
+              {spot > 0 && <span className={`ml-2 text-[10px] font-bold ${targetSpot > spot ? "text-success" : targetSpot < spot ? "text-destructive" : "text-muted-foreground"}`}>
+                {targetSpot > spot ? "▲" : targetSpot < spot ? "▼" : "—"}{Math.abs(((targetSpot - spot) / spot) * 100).toFixed(1)}%
+              </span>}
+            </label>
+            <input type="range" min={spot > 0 ? spot * 0.85 : 20000} max={spot > 0 ? spot * 1.15 : 30000} step={interval}
+              value={targetSpot}
+              onChange={e => setTargetSpot(Number(e.target.value))}
+              className="w-full accent-primary" />
+            <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
+              <span>-15%</span><span>Current</span><span>+15%</span>
+            </div>
+          </div>
+          {/* VIX scenario */}
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1.5">
+              VIX Scenario: <span className={`font-mono font-bold ${vixLevel.color}`}>{targetVIX.toFixed(1)}</span>
+              <span className={`ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded ${vixLevel.bg} ${vixLevel.color}`}>{vixLevel.label}</span>
+            </label>
+            <input type="range" min={8} max={50} step={0.5}
+              value={targetVIX}
+              onChange={e => setTargetVIX(Number(e.target.value))}
+              className="w-full accent-primary" />
+            <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
+              <span>8 (calm)</span><span>Current: {vix.toFixed(1)}</span><span>50 (fear)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Expected move */}
+      {futureMove && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {currentMove && (
+            <div className="bg-card border border-border rounded-xl p-4">
+              <div className="text-xs font-bold text-muted-foreground mb-3 uppercase tracking-wide">Current Scenario (VIX {vix.toFixed(1)})</div>
+              <div className="space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Spot</span>
+                  <span className="font-mono font-bold">₹{fmtN(spot)}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-success">Upper bound (1σ)</span>
+                  <span className="font-mono font-bold text-success">₹{fmtN(currentMove.up)}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-destructive">Lower bound (1σ)</span>
+                  <span className="font-mono font-bold text-destructive">₹{fmtN(currentMove.down)}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Expected ±%</span>
+                  <span className="font-mono font-bold">±{currentMove.pct.toFixed(2)}%</span>
+                </div>
+              </div>
+            </div>
+          )}
+          <div className={`border rounded-xl p-4 ${vixLevel.bg} border-current/20`}>
+            <div className={`text-xs font-bold mb-3 uppercase tracking-wide ${vixLevel.color}`}>Your Scenario (VIX {targetVIX.toFixed(1)} · {vixLevel.label})</div>
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Spot</span>
+                <span className="font-mono font-bold">₹{fmtN(targetSpot)}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-success">Upper bound (1σ)</span>
+                <span className="font-mono font-bold text-success">₹{fmtN(futureMove.up)}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-destructive">Lower bound (1σ)</span>
+                <span className="font-mono font-bold text-destructive">₹{fmtN(futureMove.down)}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Expected ±%</span>
+                <span className={`font-mono font-bold ${vixLevel.color}`}>±{futureMove.pct.toFixed(2)}%</span>
+              </div>
+            </div>
+            <div className="mt-2 pt-2 border-t border-current/20 text-[10px] text-muted-foreground">
+              {targetVIX > vix + 3 ? "📈 Higher VIX → Options are more expensive → Better for buyers" :
+               targetVIX < vix - 3 ? "📉 Lower VIX → Options are cheaper → Better for sellers" :
+               "VIX similar to current — premiums roughly same"}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Premium comparison table */}
+      {strikes.length > 0 && (
+        <div className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-border bg-muted/50">
+            <span className="text-xs font-bold text-foreground">Premium Impact: Current vs Your Scenario</span>
+            <span className="text-[10px] text-muted-foreground ml-2">Δ = change in premium</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-muted/30">
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-foreground">Strike</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-success">CE Now</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-primary">CE Future</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-muted-foreground">CE Δ</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-destructive">PE Now</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-primary">PE Future</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-muted-foreground">PE Δ</th>
+                </tr>
+              </thead>
+              <tbody>
+                {strikes.map((s, i) => {
+                  const now = currentPremiums[i]
+                  const fut = futurePremiums[i]
+                  const ceDiff = fut.ce - now.ce
+                  const peDiff = fut.pe - now.pe
+                  const isATM = Math.abs(s - atm) < interval / 2
+                  return (
+                    <tr key={s} className={`border-t border-border/50 ${isATM ? "bg-primary/5 font-semibold" : ""}`}>
+                      <td className="px-3 py-2.5 text-center font-mono font-bold">
+                        {fmtN(s)}{isATM ? " ⬡" : ""}
+                      </td>
+                      <td className="px-3 py-2.5 text-center font-mono text-success">₹{fmtN(now.ce)}</td>
+                      <td className="px-3 py-2.5 text-center font-mono text-primary">₹{fmtN(fut.ce)}</td>
+                      <td className={`px-3 py-2.5 text-center font-mono font-bold ${ceDiff > 0 ? "text-success" : ceDiff < 0 ? "text-destructive" : "text-muted-foreground"}`}>
+                        {ceDiff > 0 ? "+" : ""}{fmtN(ceDiff)}
+                      </td>
+                      <td className="px-3 py-2.5 text-center font-mono text-destructive">₹{fmtN(now.pe)}</td>
+                      <td className="px-3 py-2.5 text-center font-mono text-primary">₹{fmtN(fut.pe)}</td>
+                      <td className={`px-3 py-2.5 text-center font-mono font-bold ${peDiff > 0 ? "text-success" : peDiff < 0 ? "text-destructive" : "text-muted-foreground"}`}>
+                        {peDiff > 0 ? "+" : ""}{fmtN(peDiff)}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="px-4 py-2 border-t border-border bg-muted/20 text-[10px] text-muted-foreground">
+            Formula: Black-Scholes · Risk-free rate 6.5% · IV = VIX scenario ÷ 100 · Time = days to expiry ÷ 365
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -1314,48 +1719,48 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [positions,  setPositions]  = useState<any[]>([])
   const [history,    setHistory]    = useState<any[]>([])
   const [profile,    setProfile]    = useState<{ full_name: string; mobile: string } | null>(null)
-  const [tab,        setTab]        = useState<"positions" | "history" | "ledger">("positions")
+  const [tab,        setTab]        = useState<Tab>("chain")
   const [loading,    setLoading]    = useState(true)
   const [closing,    setClosing]    = useState<string | null>(null)
-  // target exit prices: key = pos.id → target price (set by user per position)
   const [targetPrices, setTargetPrices] = useState<Record<string, number>>({})
-  const [targetInputs, setTargetInputs] = useState<Record<string, string>>({})  // raw input strings
-  // live prices: key = "SYMBOL__INSTRUMENT"
-  const [livePrices, setLivePrices] = useState<Record<string, number>>({})
-  const [priceTs,    setPriceTs]    = useState<Date | null>(null)   // last updated timestamp
-  const [fetching,   setFetching]   = useState(false)
+  const [targetInputs, setTargetInputs] = useState<Record<string, string>>({})
+  const [livePrices,   setLivePrices]   = useState<Record<string, number>>({})
+  const [priceTs,      setPriceTs]      = useState<Date | null>(null)
+  const [fetching,     setFetching]     = useState(false)
+  const [spot,         setSpot]         = useState(0)
+  const [vix,          setVix]          = useState(15)
+  const [chainSymbol,  setChainSymbol]  = useState("NIFTY")
+  const [chainExpiry,  setChainExpiry]  = useState(getThursdaysForNext3Months()[0] ?? "")
+  const [expiryPopup,  setExpiryPopup]  = useState<any[] | null>(null)
   const positionsRef    = useRef<any[]>([])
   const targetPricesRef = useRef<Record<string, number>>({})
-  // Keep ref in sync with state
+  const [autoPlayTimer, setAutoPlayTimer] = useState<NodeJS.Timeout | null>(null)
+  const [isAutoPlay, setIsAutoPlay] = useState(false)
+  const autoPlayRef = useRef(false)
+
   useEffect(() => { targetPricesRef.current = targetPrices }, [targetPrices])
 
   const load = useCallback(async () => {
     const [w, p, h, pr] = await Promise.all([
       supabase.from("wallets").select("balance").eq("user_id", userId).single(),
       supabase.from("positions").select("*").eq("user_id", userId).eq("status", "OPEN").order("opened_at", { ascending: false }),
-    supabase.from("trade_history")
-      .select("id,symbol,instrument,trade_type,quantity,price,total_value,charges,net_value,realized_pnl,margin_blocked,expiry,strike_price,option_type,executed_at,created_at")
-      .eq("user_id", userId)
-      .order("id", { ascending: false })
-      .limit(500),
+      supabase.from("trade_history")
+        .select("id,symbol,instrument,trade_type,quantity,price,total_value,charges,net_value,realized_pnl,margin_blocked,expiry,strike_price,option_type,executed_at,created_at")
+        .eq("user_id", userId).order("id", { ascending: false }).limit(500),
       supabase.from("profiles").select("full_name,mobile").eq("id", userId).single(),
     ])
-    if (w.data)  setBalance(w.data.balance)
-    if (p.data)  { setPositions(p.data); positionsRef.current = p.data }
-    if (h.data)  setHistory(h.data)
+    if (w.data) setBalance(w.data.balance)
+    if (p.data) { setPositions(p.data); positionsRef.current = p.data }
+    if (h.data) setHistory(h.data)
     if (pr.data) setProfile(pr.data)
     setLoading(false)
   }, [userId])
 
-  // ── Fetch live prices for all open positions ────────────────────────────────
-  // For OPTIONS: Yahoo returns spot price, not option premium.
-  // We fetch the underlying EQUITY spot, then recompute Black-Scholes premium live.
   const refreshLivePrices = useCallback(async () => {
     const pos = positionsRef.current
     if (pos.length === 0) return
     setFetching(true)
 
-    // Fetch underlying spot prices (EQUITY key) for all symbols
     const spotItems: { symbol: string; instrument: InstrumentType }[] = []
     const seen = new Set<string>()
     for (const p of pos) {
@@ -1370,14 +1775,12 @@ function TradingDashboard({ userId }: { userId: string }) {
     const spotPrices = await fetchLivePrices(spotItems)
     const allPrices: Record<string, number> = { ...spotPrices }
 
-    // Recompute live BS premium for each OPTIONS position
     for (const p of pos) {
       if (p.instrument === "OPTIONS") {
-        const spot = spotPrices[`${p.symbol}__EQUITY`]
-        if (spot && spot > 0 && p.strike_price && p.expiry && p.option_type) {
-          const livePremium = calcOptionPremium(spot, p.strike_price, p.expiry, p.option_type as OptionType)
+        const s = spotPrices[`${p.symbol}__EQUITY`]
+        if (s && s > 0 && p.strike_price && p.expiry && p.option_type) {
+          const livePremium = calcOptionPremium(s, p.strike_price, p.expiry, p.option_type as OptionType, vix / 100)
           allPrices[`${p.symbol}__OPTIONS`] = livePremium
-          // Persist so closePos uses latest premium
           await supabase.from("positions").update({ current_price: livePremium }).eq("id", p.id)
         }
       }
@@ -1386,17 +1789,14 @@ function TradingDashboard({ userId }: { userId: string }) {
     if (Object.keys(allPrices).length > 0) {
       setLivePrices(prev => ({ ...prev, ...allPrices }))
       setPriceTs(new Date())
-      // Persist EQUITY / FUTURES prices
-      await Promise.all(
-        pos.map((p: any) => {
-          if (p.instrument === "OPTIONS") return Promise.resolve()
-          const lp = allPrices[`${p.symbol}__${p.instrument}`]
-          if (lp) return supabase.from("positions").update({ current_price: lp }).eq("id", p.id)
-          return Promise.resolve()
-        })
-      )
-      // ── Check target prices: auto-exit when LTP crosses user-set target ──────
-      // Read targetPrices from ref so this callback has fresh data
+      await Promise.all(pos.map((p: any) => {
+        if (p.instrument === "OPTIONS") return Promise.resolve()
+        const lp = allPrices[`${p.symbol}__${p.instrument}`]
+        if (lp) return supabase.from("positions").update({ current_price: lp }).eq("id", p.id)
+        return Promise.resolve()
+      }))
+
+      // Target price auto-exit
       const currentTargets = targetPricesRef.current
       for (const p of pos) {
         const target = currentTargets[p.id]
@@ -1404,16 +1804,9 @@ function TradingDashboard({ userId }: { userId: string }) {
         const liveKey = `${p.symbol}__${p.instrument}`
         const ltp = allPrices[liveKey] ?? p.current_price
         if (!ltp) continue
-        // BUY position: exit when LTP >= target (take profit) or LTP <= target (stop loss)
-        // We treat target as a single exit trigger regardless of direction
         const entryP = p.avg_price ?? p.entry_price
-        const isProfit = p.trade_type === "BUY" ? target > entryP : target < entryP
-        const triggered = p.trade_type === "BUY"
-          ? ltp >= target   // BUY: exit when price reaches or exceeds target
-          : ltp <= target   // SELL: exit when price drops to target (take profit for short)
+        const triggered = p.trade_type === "BUY" ? ltp >= target : ltp <= target
         if (triggered) {
-          console.log(`Target hit for ${p.symbol} @ ₹${ltp} (target ₹${target}) — auto-exiting`)
-          // Remove target before closing to prevent double-trigger
           setTargetPrices(prev => { const n = {...prev}; delete n[p.id]; return n })
           setTargetInputs(prev => { const n = {...prev}; delete n[p.id]; return n })
           await closePos(p, ltp)
@@ -1421,183 +1814,147 @@ function TradingDashboard({ userId }: { userId: string }) {
       }
     }
     setFetching(false)
-  }, [])
+  }, [vix])
+
+  // Auto-fetch spot for option chain
+  async function fetchChainSpot() {
+    const p = await fetchLivePrice(chainSymbol, "EQUITY")
+    if (p) setSpot(p)
+    const v = await fetchVIXFromSupabase()
+    setVix(v)
+  }
 
   useEffect(() => {
     load().then(() => {
-      // After positions load, check for expired options and auto square-offs
-      setTimeout(() => {
-        checkExpiry()
-        checkSquareOff()
-      }, 1500)
+      setTimeout(() => { checkExpiry(); checkSquareOff() }, 1500)
     })
-  }, [load]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [load])
 
-  // Auto-refresh prices every 30s
   useEffect(() => {
-    // Initial fetch after positions load
     const init = setTimeout(() => refreshLivePrices(), 500)
     const interval = setInterval(() => refreshLivePrices(), 30_000)
     return () => { clearTimeout(init); clearInterval(interval) }
   }, [refreshLivePrices])
 
-  // Re-trigger price fetch when positions change (new trade placed)
-  const posLen = positions.length
   useEffect(() => {
-    if (posLen > 0) refreshLivePrices()
-  }, [posLen, refreshLivePrices])
+    if (positions.length > 0) refreshLivePrices()
+  }, [positions.length, refreshLivePrices])
+
+  // Fetch spot on symbol change
+  useEffect(() => { fetchChainSpot() }, [chainSymbol])
+
+  // Daily auto-play: check expiry at start of each "day"
+  function startAutoPlay() {
+    if (isAutoPlay) return
+    setIsAutoPlay(true)
+    autoPlayRef.current = true
+    const t = setInterval(async () => {
+      if (!autoPlayRef.current) { clearInterval(t); return }
+      await refreshLivePrices()
+      checkExpiry()
+      checkSquareOff()
+    }, 60_000) // check every minute for expiry
+    setAutoPlayTimer(t)
+  }
+
+  function stopAutoPlay() {
+    setIsAutoPlay(false)
+    autoPlayRef.current = false
+    if (autoPlayTimer) { clearInterval(autoPlayTimer); setAutoPlayTimer(null) }
+  }
 
   async function closePos(pos: any, forcePrice?: number) {
     setClosing(pos.id)
     const liveKey = `${pos.symbol}__${pos.instrument}`
-    // OPTIONS: Yahoo returns spot price, not option premium. Use stored current_price (last known premium).
-    // EQUITY/FUTURES: use live Yahoo price.
-    // For OPTIONS, livePrices[key] now holds the live BS-recalculated premium.
-    // Falls back to stored current_price (which refreshLivePrices also keeps updated).
     const lp = forcePrice !== undefined
       ? forcePrice
       : (livePrices[liveKey] ?? pos.current_price ?? pos.avg_price ?? pos.entry_price)
-    const entryP  = pos.avg_price ?? pos.entry_price
-    const qty     = pos.quantity
-    const margin  = pos.margin_blocked ?? 0
+    const entryP = pos.avg_price ?? pos.entry_price
+    const qty    = pos.quantity
+    const margin = pos.margin_blocked ?? 0
 
-    let walletCredit = 0
-    let realizedPnl  = 0
-    let exitValue    = 0
+    let walletCredit = 0, realizedPnl = 0, exitValue = 0
 
     if (pos.instrument === "EQUITY") {
-      // Standard: credit sell proceeds minus charges
-      const ch    = calcCharges(lp, qty, "EQUITY", "SELL")
-      exitValue   = lp * qty - ch
-      realizedPnl = (lp - entryP) * qty - ch
-      walletCredit = exitValue
+      const ch = calcCharges(lp, qty, "EQUITY", "SELL")
+      exitValue = lp * qty - ch; realizedPnl = (lp - entryP) * qty - ch; walletCredit = exitValue
     } else if (pos.instrument === "OPTIONS") {
       if (pos.trade_type === "BUY") {
-        // Credit exit premium × qty (minus charges)
-        const ch     = calcCharges(lp, qty, "OPTIONS", "SELL")
-        exitValue    = lp * qty - ch
-        realizedPnl  = (lp - entryP) * qty - ch
-        walletCredit = Math.max(exitValue, 0) // can't receive negative
+        const ch = calcCharges(lp, qty, "OPTIONS", "SELL")
+        exitValue = lp * qty - ch; realizedPnl = (lp - entryP) * qty - ch; walletCredit = Math.max(exitValue, 0)
       } else {
-        // SELL position: release margin + P&L
-        // P&L = (entry_premium − exit_premium) × qty  [seller profits when premium falls]
-        const ch     = calcCharges(lp, qty, "OPTIONS", "BUY")
-        realizedPnl  = (entryP - lp) * qty - ch
-        // Release margin adjusted by P&L
-        walletCredit = Math.max(margin + realizedPnl, 0)
-        exitValue    = lp * qty
+        const ch = calcCharges(lp, qty, "OPTIONS", "BUY")
+        realizedPnl = (entryP - lp) * qty - ch; walletCredit = Math.max(margin + realizedPnl, 0); exitValue = lp * qty
       }
     } else {
-      // FUTURES — same as options sell logic
-      const ch     = calcCharges(lp, qty, "FUTURES" as any, pos.trade_type === "BUY" ? "SELL" : "BUY")
-      if (pos.trade_type === "BUY") {
-        realizedPnl  = (lp - entryP) * qty - ch
-      } else {
-        realizedPnl  = (entryP - lp) * qty - ch
-      }
-      walletCredit = Math.max(margin + realizedPnl, 0)
-      exitValue    = lp * qty
+      const ch = calcCharges(lp, qty, "FUTURES" as any, pos.trade_type === "BUY" ? "SELL" : "BUY")
+      if (pos.trade_type === "BUY") realizedPnl = (lp - entryP) * qty - ch
+      else realizedPnl = (entryP - lp) * qty - ch
+      walletCredit = Math.max(margin + realizedPnl, 0); exitValue = lp * qty
     }
 
-    const isProfit = realizedPnl >= 0
-
-    await supabase.from("positions").update({
-      status:      "CLOSED",
-      closed_at:   new Date().toISOString(),
-      current_price: lp,
-      pnl:         realizedPnl,
-    }).eq("id", pos.id)
-
-    const { data: walletData } = await supabase
-      .from("wallets").select("balance").eq("user_id", userId).single()
+    await supabase.from("positions").update({ status: "CLOSED", closed_at: new Date().toISOString(), current_price: lp, pnl: realizedPnl }).eq("id", pos.id)
+    const { data: walletData } = await supabase.from("wallets").select("balance").eq("user_id", userId).single()
     const freshBal = walletData?.balance ?? balance
-
     await supabase.from("wallets").update({ balance: freshBal + walletCredit }).eq("user_id", userId)
 
     const exitNow = new Date().toISOString()
-    // Build insert — always include core columns; add optional ones so older DBs don't break
     const histRow: Record<string, any> = {
-      user_id:     userId,
-      symbol:      pos.symbol,
-      instrument:  pos.instrument,
-      trade_type:  pos.trade_type === "BUY" ? "SELL" : "BUY",
-      quantity:    qty,
-      price:       lp,
-      total_value: exitValue,
-      charges:     0,
-      net_value:   walletCredit,
+      user_id: userId, symbol: pos.symbol, instrument: pos.instrument,
+      trade_type: pos.trade_type === "BUY" ? "SELL" : "BUY",
+      quantity: qty, price: lp, total_value: exitValue, charges: 0, net_value: walletCredit,
+      realized_pnl: realizedPnl, margin_blocked: pos.margin_blocked ?? 0,
+      expiry: pos.expiry || null, strike_price: pos.strike_price || null, option_type: pos.option_type || null,
+      executed_at: exitNow, created_at: exitNow,
     }
-    // Optional columns — added by migration; safe to include; Supabase ignores unknown cols
-    try { histRow.realized_pnl  = realizedPnl  } catch {}
-    try { histRow.margin_blocked = pos.margin_blocked ?? 0 } catch {}
-    try { histRow.expiry        = pos.expiry || null       } catch {}
-    try { histRow.strike_price  = pos.strike_price || null } catch {}
-    try { histRow.option_type   = pos.option_type || null  } catch {}
-    try { histRow.executed_at   = exitNow                  } catch {}
-    try { histRow.created_at    = exitNow                  } catch {}
-    const { error: histErr } = await supabase.from("trade_history").insert(histRow)
-    if (histErr) console.error("trade_history insert failed:", histErr.message, histErr.details)
-
+    await supabase.from("trade_history").insert(histRow)
     setClosing(null)
-    await load()  // await so state is fresh before UI re-renders
+    await load()
+    return realizedPnl
   }
 
-  // ── Expiry settlement: options expire worthless (price=0); futures settle at live price ─────
   async function checkExpiry() {
     const today = new Date(); today.setHours(23, 59, 59, 999)
     const expired = positionsRef.current.filter(p =>
-      (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
-      p.expiry &&
-      new Date(p.expiry) <= today
+      (p.instrument === "OPTIONS" || p.instrument === "FUTURES") && p.expiry && new Date(p.expiry + "T00:00:00") <= today
     )
+    if (expired.length === 0) return
+    const settledPositions: any[] = []
     for (const pos of expired) {
-      if (pos.instrument === "OPTIONS") {
-        // Options expire worthless if not squared off
-        await closePos(pos, 0)
-      } else {
-        // Futures settle at last live price (or stored current_price)
-        const liveKey = `${pos.symbol}__${pos.instrument}`
-        const settlementPrice = livePrices[liveKey] ?? pos.current_price ?? pos.avg_price ?? pos.entry_price
-        await closePos(pos, settlementPrice)
-      }
+      const settlementPrice = pos.instrument === "OPTIONS" ? 0
+        : (livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price)
+      const pnl = await closePos(pos, settlementPrice)
+      settledPositions.push({ ...pos, realized_pnl: pnl })
     }
+    if (settledPositions.length > 0) setExpiryPopup(settledPositions)
   }
 
-  // ── Auto square-off: close sell positions if loss >= margin ────────────────
   async function checkSquareOff() {
     const sellPos = positionsRef.current.filter(p =>
-      (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
-      p.trade_type === "SELL" &&
-      p.margin_blocked > 0
+      (p.instrument === "OPTIONS" || p.instrument === "FUTURES") && p.trade_type === "SELL" && p.margin_blocked > 0
     )
     for (const pos of sellPos) {
       const liveKey = `${pos.symbol}__${pos.instrument}`
       const lp = livePrices[liveKey] ?? pos.current_price ?? pos.entry_price
       const entryP = pos.avg_price ?? pos.entry_price
-      const loss = (lp - entryP) * pos.quantity  // loss is positive when price rose
-      if (loss >= pos.margin_blocked) {
-        await closePos(pos, lp)
-      }
+      const loss = (lp - entryP) * pos.quantity
+      if (loss >= pos.margin_blocked) await closePos(pos, lp)
     }
   }
 
-  // For OPTIONS: live price from Yahoo is the SPOT price, not premium.
-  // We only use Yahoo prices for EQUITY and FUTURES. For OPTIONS, use stored current_price (premium).
   const getLivePrice = (pos: any) => {
-    if (pos.instrument === "OPTIONS") {
-      return pos.current_price ?? pos.avg_price ?? pos.entry_price
-    }
+    if (pos.instrument === "OPTIONS") return pos.current_price ?? pos.avg_price ?? pos.entry_price
     return livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price ?? pos.avg_price
   }
 
   const totalPnL = positions.reduce((s, p) => {
-    const entryP   = p.avg_price ?? p.entry_price
+    const entryP = p.avg_price ?? p.entry_price
     const curPrice = getLivePrice(p)
-    const raw = p.trade_type === "BUY"
-      ? (curPrice - entryP) * p.quantity
-      : (entryP - curPrice) * p.quantity
+    const raw = p.trade_type === "BUY" ? (curPrice - entryP) * p.quantity : (entryP - curPrice) * p.quantity
     return s + raw
   }, 0)
+
+  const realizedPnL = history.reduce((s, h) => s + (h.realized_pnl ?? 0), 0)
 
   if (loading) return (
     <div className="flex items-center justify-center py-24">
@@ -1605,557 +1962,381 @@ function TradingDashboard({ userId }: { userId: string }) {
     </div>
   )
 
+  const tabs: { key: Tab; label: string; icon: any; badge?: number }[] = [
+    { key: "chain",    label: "Option Chain", icon: BarChart2 },
+    { key: "strategy", label: "Strategy",     icon: Layers },
+    { key: "replay",   label: "Replay",       icon: Clock },
+    { key: "future",   label: "Future Plays", icon: Zap },
+    { key: "positions",label: "Positions",    icon: Target, badge: positions.length },
+    { key: "history",  label: "History",      icon: History, badge: history.length },
+    { key: "ledger",   label: "Ledger",       icon: BookOpen },
+  ]
+
+  // Build ledger from history + opening balance
+  const OPENING_BALANCE = 1_000_000
+  type LedgerEntry = {
+    id: string; date: Date; description: string; debit: number; credit: number; pnl: number | null
+    runningBalance: number; instrument?: string; tag?: string
+  }
+  const entries: LedgerEntry[] = (() => {
+    const list: LedgerEntry[] = []
+    let running = OPENING_BALANCE
+    list.push({ id: "opening", date: new Date(0), description: "Opening virtual wallet", debit: 0, credit: OPENING_BALANCE, pnl: null, runningBalance: OPENING_BALANCE })
+    const sorted = [...history].sort((a, b) => new Date(a.executed_at ?? a.created_at ?? 0).getTime() - new Date(b.executed_at ?? b.created_at ?? 0).getTime())
+    for (const h of sorted) {
+      const d = new Date(h.executed_at ?? h.created_at ?? 0)
+      const isBuy = h.trade_type === "BUY"
+      const pnl = h.realized_pnl ?? null
+      let debit = 0, credit = 0
+      if (h.instrument === "EQUITY") { if (isBuy) debit = h.net_value ?? h.total_value; else credit = h.net_value ?? h.total_value }
+      else { if (isBuy) debit = h.net_value ?? (h.margin_blocked ?? 0); else credit = h.net_value ?? 0 }
+      running = running - debit + credit
+      list.push({
+        id: h.id, date: d,
+        description: `${h.trade_type} ${h.instrument === "OPTIONS" ? `${h.symbol} ${h.strike_price}${h.option_type}` : h.symbol}`,
+        debit, credit, pnl, runningBalance: running, instrument: h.instrument,
+        tag: h.expiry && new Date(h.expiry + "T00:00:00") <= new Date() && h.instrument === "OPTIONS" ? "expiry" : undefined,
+      })
+    }
+    return list
+  })()
+
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-2">
+      {/* Expiry Popup */}
+      {expiryPopup && <ExpiryPnLPopup positions={expiryPopup} onClose={() => setExpiryPopup(null)} />}
+
+      {/* Top bar */}
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs bg-primary/10 text-primary px-2 py-1 rounded-full font-semibold">PAPER MONEY</span>
           {profile && <span className="text-xs text-muted-foreground hidden sm:block">{profile.full_name} · +91 {profile.mobile}</span>}
+          {/* Auto-play toggle */}
+          <button onClick={isAutoPlay ? stopAutoPlay : startAutoPlay}
+            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-semibold transition-colors ${
+              isAutoPlay ? "bg-success/15 text-success border border-success/30 animate-pulse" : "bg-muted text-muted-foreground border border-border hover:text-foreground"
+            }`}>
+            {isAutoPlay ? <><Pause className="w-3 h-3" />Auto-Play ON</> : <><Play className="w-3 h-3" />Auto-Play</>}
+          </button>
         </div>
-        <button onClick={() => supabase.auth.signOut().then(() => window.location.reload())}
-          className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-destructive transition-colors">
-          <LogOut className="w-3.5 h-3.5" /> Sign out
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={() => { load(); refreshLivePrices(); fetchChainSpot() }}
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground bg-muted rounded-lg px-2 py-1.5 transition-colors">
+            <RefreshCw className={`w-3.5 h-3.5 ${fetching ? "animate-spin text-primary" : ""}`} /> Refresh
+          </button>
+          <button onClick={() => supabase.auth.signOut().then(() => window.location.reload())}
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-destructive transition-colors">
+            <LogOut className="w-3.5 h-3.5" /> Sign out
+          </button>
+        </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <div className="bg-card border border-border rounded-xl p-4">
-          <div className="flex items-center gap-1.5 mb-1">
-            <Wallet className="w-3.5 h-3.5 text-primary" />
-            <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Available Cash</span>
-          </div>
-          <div className="font-mono text-lg font-bold text-foreground">{fmt(balance)}</div>
+      {/* Stats cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
+        <div className="bg-card border border-border rounded-xl p-3">
+          <div className="flex items-center gap-1.5 mb-1"><Wallet className="w-3.5 h-3.5 text-primary" /><span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Cash</span></div>
+          <div className="font-mono text-base font-bold text-foreground">{fmt(balance)}</div>
         </div>
-        <div className="bg-card border border-border rounded-xl p-4">
-          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Open Positions</p>
-          <p className="text-lg font-bold text-foreground">{positions.length}</p>
-        </div>
-        <div className={`border rounded-xl p-4 ${totalPnL >= 0 ? "bg-success/5 border-success/30" : "bg-destructive/5 border-destructive/30"}`}>
+        <div className={`border rounded-xl p-3 ${totalPnL >= 0 ? "bg-success/5 border-success/30" : "bg-destructive/5 border-destructive/30"}`}>
           <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Unrealised P&L</p>
-          <div className={`font-mono text-lg font-bold flex items-center gap-1 ${totalPnL >= 0 ? "text-success" : "text-destructive"}`}>
-            {totalPnL >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
+          <div className={`font-mono text-base font-bold flex items-center gap-1 ${totalPnL >= 0 ? "text-success" : "text-destructive"}`}>
+            {totalPnL >= 0 ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
             {totalPnL >= 0 ? "+" : ""}{fmt(totalPnL)}
           </div>
         </div>
-        <div className="bg-card border border-border rounded-xl p-4">
-          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Total Trades</p>
-          <p className="text-lg font-bold text-foreground">{history.length}</p>
+        <div className="bg-card border border-border rounded-xl p-3">
+          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Realised P&L</p>
+          <div className={`font-mono text-base font-bold ${realizedPnL >= 0 ? "text-success" : "text-destructive"}`}>
+            {realizedPnL >= 0 ? "+" : ""}{fmt(realizedPnL)}
+          </div>
+        </div>
+        <div className="bg-card border border-border rounded-xl p-3">
+          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Open Positions</p>
+          <p className="text-base font-bold text-foreground">{positions.length}</p>
+        </div>
+        <div className="bg-card border border-border rounded-xl p-3">
+          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">India VIX</p>
+          <div className="flex items-center gap-1.5">
+            <p className="text-base font-bold text-foreground font-mono">{vix.toFixed(2)}</p>
+            <span className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
+              vix < 15 ? "bg-success/10 text-success" : vix < 25 ? "bg-primary/10 text-primary" : "bg-destructive/10 text-destructive"
+            }`}>{vix < 15 ? "Low" : vix < 25 ? "Normal" : "High"}</span>
+          </div>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-6">
-        <TradeForm userId={userId} balance={balance} onDone={load} />
-        <div>
-          <div className="flex gap-1 bg-card border border-border p-1 rounded-xl mb-4 w-fit">
-            {([["positions","Positions",BarChart2],["history","History",History],["ledger","Ledger",BookOpen]] as const).map(([key, label, Icon]) => (
-              <button key={key} onClick={() => setTab(key as any)}
-                className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2 rounded-lg transition-colors ${tab === key ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
-                <Icon className="w-3.5 h-3.5" />
-                {label}
-                {key === "history" && history.length > 0 && (
-                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${tab === key ? "bg-primary-foreground/20 text-primary-foreground" : "bg-primary/10 text-primary"}`}>
-                    {history.length}
-                  </span>
-                )}
-              </button>
-            ))}
-            <button onClick={() => { load(); refreshLivePrices() }} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors" title="Refresh">
-              <RefreshCw className={`w-3.5 h-3.5 ${fetching ? "animate-spin text-primary" : ""}`} />
-            </button>
-          </div>
-          {/* Live price status */}
-          <div className="flex items-center gap-2 mb-3 text-[10px] text-muted-foreground">
-            <span className={`w-1.5 h-1.5 rounded-full ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
-            {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · Options LTP = live Black-Scholes · auto-refresh every 30s` : "Fetching prices…"}
-          </div>
+      {/* Tabs */}
+      <div className="flex gap-1 bg-muted/50 border border-border p-1 rounded-xl mb-5 overflow-x-auto">
+        {tabs.map(({ key, label, icon: Icon, badge }) => (
+          <button key={key} onClick={() => setTab(key)}
+            className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg transition-colors whitespace-nowrap ${tab === key ? "bg-card shadow-sm text-primary" : "text-muted-foreground hover:text-foreground"}`}>
+            <Icon className="w-3.5 h-3.5" />
+            {label}
+            {badge != null && badge > 0 && (
+              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${tab === key ? "bg-primary/10 text-primary" : "bg-muted-foreground/20 text-muted-foreground"}`}>{badge}</span>
+            )}
+          </button>
+        ))}
+      </div>
 
-          {tab === "positions" ? (
-            positions.length === 0 ? (
-              <div className="bg-card border border-border rounded-xl p-10 text-center">
-                <BarChart2 className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
-                <p className="text-sm font-semibold text-muted-foreground">No open positions</p>
-                <p className="text-xs text-muted-foreground mt-1">Place your first trade using the form</p>
+      {/* Live price status bar */}
+      <div className="flex items-center gap-2 mb-4 text-[10px] text-muted-foreground">
+        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
+        {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · auto-refresh every 30s` : "Click refresh to load prices"}
+        {isAutoPlay && <span className="ml-2 text-success font-semibold animate-pulse">● Auto-play active — daily expiry check running</span>}
+      </div>
+
+      {/* Tab content */}
+      {tab === "chain" && (
+        <OptionChain
+          userId={userId} balance={balance} positions={positions} onTrade={load}
+          spot={spot} vix={vix} symbol={chainSymbol} expiry={chainExpiry}
+          onExpiryChange={setChainExpiry} onSymbolChange={s => { setChainSymbol(s); setSpot(0) }}
+        />
+      )}
+
+      {tab === "strategy" && (
+        <StrategyBuilder userId={userId} balance={balance} spot={spot} vix={vix} symbol={chainSymbol} onTrade={load} />
+      )}
+
+      {tab === "replay" && (
+        <ReplayPanel symbol={chainSymbol} vix={vix} />
+      )}
+
+      {tab === "future" && (
+        <FuturePlays spot={spot} vix={vix} symbol={chainSymbol} />
+      )}
+
+      {tab === "positions" && (
+        positions.length === 0 ? (
+          <div className="bg-card border border-border rounded-xl p-10 text-center">
+            <Target className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
+            <p className="text-sm font-semibold text-muted-foreground">No open positions</p>
+            <p className="text-xs text-muted-foreground mt-1">Use the Option Chain or Strategy Builder to place trades</p>
+          </div>
+        ) : (
+          <div className="bg-card border border-border rounded-xl overflow-hidden">
+            {positions.some(p => p.instrument === "OPTIONS") && (
+              <div className="flex items-start gap-2 px-4 py-2.5 bg-warning/5 border-b border-warning/20 text-[10px] text-warning/90">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                <span>Options LTP is a Black-Scholes estimate using live spot + VIX {vix.toFixed(1)}%. Actual market premium may differ.</span>
               </div>
-            ) : (
-              <div className="bg-card border border-border rounded-xl overflow-hidden">
-                {positions.some(p => p.instrument === "OPTIONS") && (
-                  <div className="flex items-start gap-2 px-4 py-2.5 bg-warning/5 border-b border-warning/20 text-[10px] text-warning/90">
-                    <span className="mt-0.5">⚠️</span>
-                    <span>
-                      <strong>Options LTP is a Black-Scholes theoretical estimate</strong> — computed from live underlying spot price + 18% IV.
-                      Actual market premium may differ due to real IV, bid-ask spread, and liquidity.
-                      Target exit for options is also checked against the BS-calculated LTP.
-                    </span>
-                  </div>
-                )}
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead><tr className="bg-muted">
-                      {["Symbol","Type","B/S","Qty","Entry Avg","LTP","P&L","Target Exit","Action"].map(h => (
-                        <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
-                      ))}
-                    </tr></thead>
-                    <tbody>
-                      {positions.map((pos, i) => {
-                        const entryP  = pos.avg_price ?? pos.entry_price
-                        const liveKey = `${pos.symbol}__${pos.instrument}`
-                        // OPTIONS: Yahoo returns spot price, NOT option premium. Use stored current_price (premium).
-                        // EQUITY/FUTURES: use live price from Yahoo.
-                        // OPTIONS: livePrices[key] is now a live BS-recalculated premium (not spot).
-                        // Falls back to stored current_price (entry premium) if spot fetch failed.
-                        const ltp = livePrices[liveKey] ?? pos.current_price ?? entryP
-                        const hasLive = !!livePrices[liveKey]
-                        // P&L: buyers profit when premium rises, sellers profit when premium falls
-                        const pnl = pos.trade_type === "BUY"
-                          ? (ltp - entryP) * pos.quantity
-                          : (entryP - ltp) * pos.quantity
-                        const isProfit = pnl >= 0
-                        const pnlPct  = entryP > 0 ? pnl / (entryP * pos.quantity) * 100 : 0
-                        const marginBlocked = pos.margin_blocked ?? 0
-                        const lossNearMargin = pos.trade_type === "SELL" && marginBlocked > 0 && (-pnl) > marginBlocked * 0.8
-                        return (
-                          <tr key={pos.id} className={`border-t border-border ${lossNearMargin ? "bg-destructive/5" : i % 2 ? "bg-muted/30" : ""}`}>
-                            <td className="px-4 py-3">
-                              <div className="font-bold text-foreground">{pos.symbol}</div>
-                              {pos.instrument === "OPTIONS" && (
-                                <div className="text-[10px] text-muted-foreground">
-                                  {pos.strike_price} {pos.option_type} · {pos.expiry ? formatExpiry(pos.expiry) : ""}
-                                  {pos.trade_type === "SELL" && <span className="ml-1 text-warning">SHORT</span>}
-                                </div>
-                              )}
-                              {pos.instrument === "FUTURES" && (
-                                <div className="text-[10px] text-muted-foreground">
-                                  Fut · {pos.expiry ? formatExpiry(pos.expiry) : ""}
-                                  {pos.trade_type === "SELL" && <span className="ml-1 text-warning">SHORT</span>}
-                                </div>
-                              )}
-                              {pos.trade_type === "SELL" && marginBlocked > 0 && (
-                                <div className={`text-[9px] mt-0.5 ${lossNearMargin ? "text-destructive font-bold" : "text-muted-foreground"}`}>
-                                  {lossNearMargin ? "⚠️ Near auto sq-off" : `Margin: ₹${fmtN(marginBlocked)}`}
-                                </div>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                                pos.instrument === "EQUITY"  ? "bg-primary/10 text-primary" :
-                                pos.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
-                                "bg-warning/10 text-warning"}`}>
-                                {pos.instrument}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3">
-                              <span className={`font-bold ${pos.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{pos.trade_type}</span>
-                            </td>
-                            <td className="px-4 py-3 font-mono">{fmtN(pos.quantity)}</td>
-                            <td className="px-4 py-3 font-mono">₹{fmtN(entryP)}</td>
-                            <td className="px-4 py-3">
-                              <div className={`font-mono font-semibold ${hasLive ? "text-foreground" : "text-muted-foreground"}`}>
-                                ₹{fmtN(ltp)}
-                              </div>
-                              {pos.instrument === "OPTIONS"
-                                ? <div className="text-[9px] text-warning/80 font-medium">~BS estimate</div>
-                                : !hasLive && <div className="text-[9px] text-muted-foreground">last known</div>
-                              }
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className={`font-mono font-bold ${isProfit ? "text-success" : "text-destructive"}`}>
-                                {isProfit ? "+" : ""}₹{fmtN(Math.abs(pnl))}
-                              </div>
-                              <div className={`text-[10px] ${isProfit ? "text-success" : "text-destructive"}`}>
-                                {isProfit ? "▲" : "▼"}{Math.abs(pnlPct).toFixed(2)}%
-                              </div>
-                            </td>
-                            {/* Target Exit cell */}
-                            <td className="px-4 py-3">
-                              <div className="flex items-center gap-1">
-                                <input
-                                  type="number"
-                                  min="0"
-                                  step="0.5"
-                                  placeholder="₹ target"
-                                  value={targetInputs[pos.id] ?? ""}
-                                  onChange={e => setTargetInputs(prev => ({ ...prev, [pos.id]: e.target.value }))}
-                                  className="w-20 text-xs font-mono border border-border rounded-md px-2 py-1 bg-background text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const v = parseFloat(targetInputs[pos.id] ?? "")
-                                    if (v > 0) {
-                                      setTargetPrices(prev => ({ ...prev, [pos.id]: v }))
-                                    } else {
-                                      setTargetPrices(prev => { const n = {...prev}; delete n[pos.id]; return n })
-                                    }
-                                  }}
-                                  className="text-[10px] font-semibold px-2 py-1 rounded-md bg-primary/10 text-primary hover:bg-primary/20 transition-colors whitespace-nowrap"
-                                >
-                                  Set
-                                </button>
-                              </div>
-                              {targetPrices[pos.id] && (
-                                <div className="text-[9px] mt-0.5 text-primary font-semibold flex items-center gap-1">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse inline-block" />
-                                  Active: ₹{fmtN(targetPrices[pos.id])}
-                                  <button onClick={() => {
-                                    setTargetPrices(prev => { const n = {...prev}; delete n[pos.id]; return n })
-                                    setTargetInputs(prev => { const n = {...prev}; delete n[pos.id]; return n })
-                                  }} className="text-muted-foreground hover:text-destructive ml-1">✕</button>
-                                </div>
-                              )}
-                              {pos.instrument === "OPTIONS" && targetPrices[pos.id] && (
-                                <div className="text-[8px] text-muted-foreground">checked on BS refresh</div>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              <button
-                                onClick={() => closePos(pos)}
-                                disabled={closing === pos.id}
-                                title={`Exit at live price ₹${fmtN(ltp)}`}
-                                className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap ${lossNearMargin ? "bg-destructive text-destructive-foreground hover:bg-destructive/90" : "bg-destructive/10 hover:bg-destructive/20 text-destructive"}`}>
-                                {closing === pos.id
-                                  ? <div className="w-3 h-3 border border-destructive/30 border-t-destructive rounded-full animate-spin" />
-                                  : <X className="w-3 h-3" />}
-                                Exit @ ₹{fmtN(ltp)}
-                              </button>
-                            </td>
-                          </tr>
-                        )
-                      })}
-                    </tbody>
-                  </table>
+            )}
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead><tr className="bg-muted">
+                  {["Symbol","Type","B/S","Qty","Entry Avg","LTP","P&L","Target Exit","Action"].map(h => (
+                    <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {positions.map((pos, i) => {
+                    const entryP  = pos.avg_price ?? pos.entry_price
+                    const liveKey = `${pos.symbol}__${pos.instrument}`
+                    const ltp = livePrices[liveKey] ?? pos.current_price ?? entryP
+                    const hasLive = !!livePrices[liveKey]
+                    const pnl = pos.trade_type === "BUY" ? (ltp - entryP) * pos.quantity : (entryP - ltp) * pos.quantity
+                    const isProfit = pnl >= 0
+                    const pnlPct  = entryP > 0 ? pnl / (entryP * pos.quantity) * 100 : 0
+                    const marginBlocked = pos.margin_blocked ?? 0
+                    const lossNearMargin = pos.trade_type === "SELL" && marginBlocked > 0 && (-pnl) > marginBlocked * 0.8
+
+                    return (
+                      <tr key={pos.id} className={`border-t border-border ${lossNearMargin ? "bg-destructive/5" : i % 2 ? "bg-muted/30" : ""}`}>
+                        <td className="px-4 py-3">
+                          <div className="font-bold text-foreground">{pos.symbol}</div>
+                          {pos.instrument === "OPTIONS" && (
+                            <div className="text-[10px] text-muted-foreground">
+                              {pos.strike_price} {pos.option_type} · {pos.expiry ? formatExpiry(pos.expiry) : ""}
+                              {pos.trade_type === "SELL" && <span className="ml-1 text-warning">SHORT</span>}
+                            </div>
+                          )}
+                          {pos.instrument === "FUTURES" && (
+                            <div className="text-[10px] text-muted-foreground">Fut · {pos.expiry ? formatExpiry(pos.expiry) : ""}{pos.trade_type === "SELL" && <span className="ml-1 text-warning">SHORT</span>}</div>
+                          )}
+                          {pos.trade_type === "SELL" && marginBlocked > 0 && (
+                            <div className={`text-[9px] mt-0.5 ${lossNearMargin ? "text-destructive font-bold" : "text-muted-foreground"}`}>
+                              {lossNearMargin ? "⚠️ Near auto sq-off" : `Margin: ₹${fmtN(marginBlocked)}`}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                            pos.instrument === "EQUITY"  ? "bg-primary/10 text-primary" :
+                            pos.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+                            "bg-warning/10 text-warning"}`}>{pos.instrument}</span>
+                        </td>
+                        <td className="px-4 py-3"><span className={`font-bold ${pos.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{pos.trade_type}</span></td>
+                        <td className="px-4 py-3 font-mono">{fmtN(pos.quantity)}</td>
+                        <td className="px-4 py-3 font-mono">₹{fmtN(entryP)}</td>
+                        <td className="px-4 py-3">
+                          <div className={`font-mono font-semibold ${hasLive ? "text-foreground" : "text-muted-foreground"}`}>₹{fmtN(ltp)}</div>
+                          {!hasLive && <div className="text-[9px] text-muted-foreground">last known</div>}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className={`font-mono font-bold ${isProfit ? "text-success" : "text-destructive"}`}>
+                            {isProfit ? "+" : ""}₹{fmtN(Math.abs(pnl))}
+                          </div>
+                          <div className={`text-[10px] ${isProfit ? "text-success" : "text-destructive"}`}>{isProfit ? "▲" : "▼"}{Math.abs(pnlPct).toFixed(2)}%</div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1">
+                            <input type="number" min="0" step="0.5" placeholder="₹ target" value={targetInputs[pos.id] ?? ""}
+                              onChange={e => setTargetInputs(prev => ({ ...prev, [pos.id]: e.target.value }))}
+                              className="w-20 text-xs font-mono border border-border rounded-md px-2 py-1 bg-background focus:outline-none focus:ring-1 focus:ring-primary" />
+                            <button onClick={() => {
+                              const v = parseFloat(targetInputs[pos.id] ?? "")
+                              if (v > 0) setTargetPrices(prev => ({ ...prev, [pos.id]: v }))
+                              else setTargetPrices(prev => { const n = {...prev}; delete n[pos.id]; return n })
+                            }} className="text-[10px] font-semibold px-2 py-1 rounded-md bg-primary/10 text-primary hover:bg-primary/20">Set</button>
+                          </div>
+                          {targetPrices[pos.id] && (
+                            <div className="text-[9px] mt-0.5 text-primary font-semibold flex items-center gap-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse inline-block" />
+                              Active: ₹{fmtN(targetPrices[pos.id])}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <button onClick={() => closePos(pos)} disabled={closing === pos.id}
+                            className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-destructive/10 text-destructive hover:bg-destructive/20 disabled:opacity-50 whitespace-nowrap flex items-center gap-1">
+                            {closing === pos.id ? <div className="w-3 h-3 border border-destructive/30 border-t-destructive rounded-full animate-spin" /> : <X className="w-3 h-3" />}
+                            Close
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      )}
+
+      {tab === "history" && (
+        history.length === 0 ? (
+          <div className="bg-card border border-border rounded-xl p-10 text-center">
+            <History className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
+            <p className="text-sm font-semibold text-muted-foreground">No trade history yet</p>
+          </div>
+        ) : (
+          <div className="bg-card border border-border rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead><tr className="bg-muted">
+                  {["Date","Symbol","Type","B/S","Qty","Price","P&L","Charges","Net"].map(h => (
+                    <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {history.map((h, i) => {
+                    const pnl = h.realized_pnl
+                    const hasPnl = pnl !== null && pnl !== undefined
+                    return (
+                      <tr key={h.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
+                        <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap font-mono">
+                          {new Date(h.executed_at ?? h.created_at ?? 0).toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <div className="font-bold text-foreground">{h.symbol}</div>
+                          {h.instrument === "OPTIONS" && <div className="text-[10px] text-muted-foreground">{h.strike_price} {h.option_type}</div>}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                            h.instrument === "EQUITY" ? "bg-primary/10 text-primary" :
+                            h.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+                            "bg-warning/10 text-warning"}`}>{h.instrument}</span>
+                        </td>
+                        <td className="px-4 py-2.5"><span className={`font-bold ${h.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{h.trade_type}</span></td>
+                        <td className="px-4 py-2.5 font-mono">{fmtN(h.quantity)}</td>
+                        <td className="px-4 py-2.5 font-mono">₹{fmtN(h.price)}</td>
+                        <td className="px-4 py-2.5">
+                          {hasPnl ? <span className={`font-mono font-bold ${pnl >= 0 ? "text-success" : "text-destructive"}`}>{pnl >= 0 ? "+" : ""}₹{fmtN(Math.abs(pnl))}</span> : <span className="text-muted-foreground">—</span>}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono text-warning">{h.charges > 0 ? `₹${fmtN(h.charges)}` : "—"}</td>
+                        <td className="px-4 py-2.5 font-mono font-semibold">{fmt(h.net_value)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      )}
+
+      {tab === "ledger" && (() => {
+        return (
+          <div>
+            <div className="grid grid-cols-3 gap-4 mb-4">
+              <div className="bg-card border border-border rounded-xl p-4 text-center">
+                <div className="text-[11px] text-muted-foreground mb-1">Opening Balance</div>
+                <div className="font-mono font-bold text-foreground">{fmt(OPENING_BALANCE)}</div>
+              </div>
+              <div className="bg-card border border-border rounded-xl p-4 text-center">
+                <div className="text-[11px] text-muted-foreground mb-1">Current Balance</div>
+                <div className="font-mono font-bold text-foreground">{fmt(balance)}</div>
+              </div>
+              <div className={`border rounded-xl p-4 text-center ${(balance - OPENING_BALANCE) >= 0 ? "bg-success/5 border-success/30" : "bg-destructive/5 border-destructive/30"}`}>
+                <div className="text-[11px] text-muted-foreground mb-1">Net P&L</div>
+                <div className={`font-mono font-bold ${(balance - OPENING_BALANCE) >= 0 ? "text-success" : "text-destructive"}`}>
+                  {(balance - OPENING_BALANCE) >= 0 ? "+" : ""}{fmt(balance - OPENING_BALANCE)}
                 </div>
               </div>
-            )
-          ) : tab === "history" ? (
-            history.length === 0 ? (
-              <div className="bg-card border border-border rounded-xl p-10 text-center">
-                <History className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
-                <p className="text-sm text-muted-foreground font-semibold">No trade history yet</p>
-                <p className="text-xs text-muted-foreground mt-1">Your executed trades will appear here</p>
+            </div>
+            <div className="bg-card border border-border rounded-xl overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+                <h3 className="text-sm font-bold text-foreground">Account Ledger</h3>
+                <span className="text-[10px] text-muted-foreground">{entries.length} entries</span>
               </div>
-            ) : (
-              <div className="bg-card border border-border rounded-xl overflow-hidden">
-                {/* P&L summary bar */}
-                {(() => {
-                  const closed = history.filter(t => t.realized_pnl !== null && t.realized_pnl !== undefined)
-                  const totalRealized = closed.reduce((s: number, t: any) => s + (t.realized_pnl ?? 0), 0)
-                  const wins  = closed.filter((t: any) => (t.realized_pnl ?? 0) > 0).length
-                  const total = closed.length
-                  if (total === 0) return null
-                  return (
-                    <div className={`flex items-center justify-between px-4 py-3 border-b border-border text-xs ${totalRealized >= 0 ? "bg-success/5" : "bg-destructive/5"}`}>
-                      <div className="flex items-center gap-3">
-                        <span className="text-muted-foreground">Realised P&L</span>
-                        <span className={`font-mono font-bold ${totalRealized >= 0 ? "text-success" : "text-destructive"}`}>
-                          {totalRealized >= 0 ? "+" : ""}{fmt(totalRealized)}
-                        </span>
-                      </div>
-                      <span className="text-muted-foreground">{wins}/{total} profitable exits</span>
-                    </div>
-                  )
-                })()}
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead><tr className="bg-muted">
-                      {["Time","Symbol","Type","B/S","Qty","Price","P&L","Net"].map(h => (
-                        <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
-                      ))}
-                    </tr></thead>
-                    <tbody>
-                      {history.map((t, i) => {
-                        const hasPnl = t.realized_pnl !== null && t.realized_pnl !== undefined
-                        const pnl    = t.realized_pnl ?? 0
-                        return (
-                        <tr key={t.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
-                          <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap">
-                            {new Date(t.executed_at ?? t.created_at).toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
-                          </td>
-                          <td className="px-4 py-2.5">
-                            <div className="font-bold text-foreground">{t.symbol}</div>
-                            {t.instrument === "OPTIONS" && t.strike_price && (
-                              <div className="text-[9px] text-muted-foreground">
-                                {t.strike_price}{t.option_type} · {t.expiry ? formatExpiry(t.expiry) : ""}
-                              </div>
-                            )}
-                            {t.instrument === "FUTURES" && t.expiry && (
-                              <div className="text-[9px] text-muted-foreground">Fut · {formatExpiry(t.expiry)}</div>
-                            )}
-                            {t.instrument !== "EQUITY" && !t.strike_price && !t.expiry && (
-                              <div className="text-[9px] text-muted-foreground">{t.instrument}</div>
-                            )}
-                          </td>
-                          <td className="px-4 py-2.5">
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-semibold ${
-                              t.instrument === "EQUITY" ? "bg-primary/10 text-primary" :
-                              t.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead><tr className="bg-muted">
+                    {["Date","Description","Debit (−)","Credit (+)","P&L","Balance"].map(h => (
+                      <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {[...entries].reverse().map((e, i) => (
+                      <tr key={e.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
+                        <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap font-mono">
+                          {e.id === "opening" ? "—" : e.date.toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
+                        </td>
+                        <td className="px-4 py-2.5 max-w-[220px]">
+                          <div className="font-semibold text-foreground truncate">{e.description}</div>
+                          {e.instrument && (
+                            <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${
+                              e.instrument === "EQUITY"  ? "bg-primary/10 text-primary" :
+                              e.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
                               "bg-warning/10 text-warning"}`}>
-                              {t.instrument}
+                              {e.instrument}{e.tag === "expiry" && " · EXPIRED"}{e.tag === "sqoff" && " · SQ-OFF"}
                             </span>
-                          </td>
-                          <td className="px-4 py-2.5">
-                            <span className={`font-bold ${t.trade_type === "BUY" ? "text-success" : "text-destructive"}`}>{t.trade_type}</span>
-                          </td>
-                          <td className="px-4 py-2.5 font-mono">{fmtN(t.quantity)}</td>
-                          <td className="px-4 py-2.5 font-mono">₹{fmtN(t.price)}</td>
-                          <td className="px-4 py-2.5 font-mono font-semibold">
-                            {hasPnl ? (
-                              <span className={pnl >= 0 ? "text-success" : "text-destructive"}>
-                                {pnl >= 0 ? "+" : ""}₹{fmtN(Math.abs(pnl))}
-                              </span>
-                            ) : <span className="text-muted-foreground">—</span>}
-                          </td>
-                          <td className="px-4 py-2.5 font-mono font-semibold">₹{fmtN(t.net_value)}</td>
-                        </tr>
-                        )
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono">
+                          {e.debit > 0 ? <span className="text-destructive font-semibold">− {fmt(e.debit)}</span> : <span className="text-muted-foreground">—</span>}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono">
+                          {e.credit > 0 ? <span className="text-success font-semibold">+ {fmt(e.credit)}</span> : <span className="text-muted-foreground">—</span>}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-semibold">
+                          {e.pnl !== null ? <span className={e.pnl >= 0 ? "text-success" : "text-destructive"}>{e.pnl >= 0 ? "+" : ""}₹{fmtN(Math.abs(e.pnl))}</span> : <span className="text-muted-foreground">—</span>}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-bold text-foreground whitespace-nowrap">{fmt(e.runningBalance)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-            )
-          ) : (
-            /* ── LEDGER TAB ── */
-            (() => {
-              // Build ledger entries from trade history
-              // Each entry: date, description, debit, credit, running balance
-              const INITIAL_BALANCE = 1_000_000
-              // Sort ascending for running balance calc
-              const sorted = [...history].sort((a, b) =>
-                new Date(a.executed_at ?? a.created_at).getTime() - new Date(b.executed_at ?? b.created_at).getTime()
-              )
-
-              type LedgerEntry = {
-                id: string
-                date: Date
-                description: string
-                instrument: string
-                tradeType: string
-                debit: number
-                credit: number
-                runningBalance: number
-                pnl: number | null
-                tag: "open" | "close" | "expiry" | "sqoff"
-              }
-
-              let running = INITIAL_BALANCE
-              const entries: LedgerEntry[] = []
-
-              // Opening entry
-              entries.push({
-                id: "opening",
-                date: sorted.length > 0 ? new Date(sorted[0].executed_at ?? sorted[0].created_at) : new Date(),
-                description: "Virtual Wallet — Opening Balance",
-                instrument: "",
-                tradeType: "",
-                debit: 0,
-                credit: INITIAL_BALANCE,
-                runningBalance: INITIAL_BALANCE,
-                pnl: null,
-                tag: "open",
-              })
-
-              for (const t of sorted) {
-                const ts = new Date(t.executed_at ?? t.created_at)
-                const hasPnl = t.realized_pnl !== null && t.realized_pnl !== undefined
-                const sym = t.instrument === "OPTIONS" && t.strike_price
-                  ? `${t.symbol} ${t.strike_price}${t.option_type}${t.expiry ? " " + formatExpiry(t.expiry) : ""}`
-                  : t.instrument === "FUTURES" && t.expiry
-                  ? `${t.symbol} Fut ${formatExpiry(t.expiry)}`
-                  : t.symbol
-
-                // Determine debit / credit from net_value and margin_blocked
-                let debit = 0, credit = 0
-                const nv = t.net_value ?? 0
-                const mb = t.margin_blocked ?? 0
-
-                if (t.instrument === "EQUITY") {
-                  if (t.trade_type === "BUY") {
-                    debit = nv  // total cost
-                  } else {
-                    credit = nv  // proceeds
-                  }
-                } else if (t.instrument === "OPTIONS") {
-                  if (t.trade_type === "BUY" && !hasPnl) {
-                    // Opening buy — premium debited
-                    debit = nv
-                  } else if (t.trade_type === "SELL" && !hasPnl) {
-                    // Opening sell — margin blocked (debit)
-                    debit = mb > 0 ? mb : nv
-                  } else if (hasPnl) {
-                    // Closing / expiry
-                    credit = nv
-                  }
-                } else {
-                  // FUTURES
-                  if (!hasPnl) {
-                    // Opening — margin blocked
-                    debit = mb > 0 ? mb : nv
-                  } else {
-                    credit = nv
-                  }
-                }
-
-                running = running - debit + credit
-
-                const isExpiry = hasPnl && t.price === 0 && t.instrument === "OPTIONS"
-                const isSqOff  = hasPnl && t.realized_pnl !== null && (t.realized_pnl ?? 0) <= -(t.margin_blocked ?? 0) * 0.95 && (t.margin_blocked ?? 0) > 0
-
-                let desc = ""
-                if (hasPnl) {
-                  if (isExpiry) desc = `${sym} — Expired worthless`
-                  else desc = `${sym} — Position closed (${t.trade_type})`
-                } else if (t.instrument === "OPTIONS" && t.trade_type === "SELL") {
-                  desc = `${sym} — Sell (margin blocked)`
-                } else if ((t.instrument === "OPTIONS" || t.instrument === "FUTURES") && !hasPnl) {
-                  desc = `${sym} — ${t.trade_type} (margin blocked)`
-                } else {
-                  desc = `${sym} — ${t.trade_type}`
-                }
-
-                entries.push({
-                  id: t.id,
-                  date: ts,
-                  description: desc,
-                  instrument: t.instrument,
-                  tradeType: t.trade_type,
-                  debit,
-                  credit,
-                  runningBalance: running,
-                  pnl: hasPnl ? (t.realized_pnl ?? 0) : null,
-                  tag: isExpiry ? "expiry" : isSqOff ? "sqoff" : hasPnl ? "close" : "open",
-                })
-              }
-
-              // Summary stats
-              const totalDebits  = entries.slice(1).reduce((s, e) => s + e.debit, 0)
-              const totalCredits = entries.slice(1).reduce((s, e) => s + e.credit, 0)
-              const closedTrades = entries.filter(e => e.tag === "close" || e.tag === "expiry")
-              const totalRealizedPnl = history
-                .filter(t => t.realized_pnl !== null && t.realized_pnl !== undefined)
-                .reduce((s: number, t: any) => s + (t.realized_pnl ?? 0), 0)
-              const wins = history.filter(t => (t.realized_pnl ?? -1) > 0).length
-              const losses = history.filter(t => t.realized_pnl !== null && t.realized_pnl !== undefined && (t.realized_pnl ?? 0) < 0).length
-
-              return (
-                <div className="space-y-4">
-                  {/* Summary cards */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <div className="bg-card border border-border rounded-xl p-3">
-                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Current Balance</p>
-                      <p className="font-mono text-base font-bold text-foreground">{fmt(balance)}</p>
-                      <p className={`text-[10px] font-semibold mt-0.5 ${balance >= INITIAL_BALANCE ? "text-success" : "text-destructive"}`}>
-                        {balance >= INITIAL_BALANCE ? "▲" : "▼"} {fmt(Math.abs(balance - INITIAL_BALANCE))} vs start
-                      </p>
-                    </div>
-                    <div className={`border rounded-xl p-3 ${totalRealizedPnl >= 0 ? "bg-success/5 border-success/20" : "bg-destructive/5 border-destructive/20"}`}>
-                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Realised P&L</p>
-                      <p className={`font-mono text-base font-bold ${totalRealizedPnl >= 0 ? "text-success" : "text-destructive"}`}>
-                        {totalRealizedPnl >= 0 ? "+" : ""}{fmt(totalRealizedPnl)}
-                      </p>
-                      <p className="text-[10px] text-muted-foreground mt-0.5">{closedTrades.length} closed trades</p>
-                    </div>
-                    <div className="bg-card border border-border rounded-xl p-3">
-                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Win / Loss</p>
-                      <p className="text-base font-bold text-foreground">
-                        <span className="text-success">{wins}W</span>
-                        <span className="text-muted-foreground mx-1">/</span>
-                        <span className="text-destructive">{losses}L</span>
-                      </p>
-                      <p className="text-[10px] text-muted-foreground mt-0.5">
-                        {wins + losses > 0 ? `${Math.round(wins / (wins + losses) * 100)}% win rate` : "No closed trades"}
-                      </p>
-                    </div>
-                    <div className="bg-card border border-border rounded-xl p-3">
-                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">Total Charges</p>
-                      <p className="font-mono text-base font-bold text-warning">
-                        {fmt(history.reduce((s: number, t: any) => s + (t.charges ?? 0), 0))}
-                      </p>
-                      <p className="text-[10px] text-muted-foreground mt-0.5">Brokerage + STT</p>
-                    </div>
-                  </div>
-
-                  {/* Ledger table */}
-                  {entries.length <= 1 ? (
-                    <div className="bg-card border border-border rounded-xl p-10 text-center">
-                      <BookOpen className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
-                      <p className="text-sm text-muted-foreground font-semibold">No ledger entries yet</p>
-                      <p className="text-xs text-muted-foreground mt-1">Place a trade to see your ledger</p>
-                    </div>
-                  ) : (
-                    <div className="bg-card border border-border rounded-xl overflow-hidden">
-                      <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-                        <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
-                          <BookOpen className="w-4 h-4 text-primary" />
-                          Account Ledger
-                        </h3>
-                        <span className="text-[10px] text-muted-foreground">{entries.length} entries</span>
-                      </div>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-xs">
-                          <thead>
-                            <tr className="bg-muted">
-                              {["Date","Description","Debit (−)","Credit (+)","P&L","Balance"].map(h => (
-                                <th key={h} className="px-4 py-2.5 text-left text-[10px] font-bold text-muted-foreground uppercase tracking-wide whitespace-nowrap">{h}</th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {[...entries].reverse().map((e, i) => (
-                              <tr key={e.id} className={`border-t border-border ${i % 2 ? "bg-muted/30" : ""}`}>
-                                <td className="px-4 py-2.5 text-muted-foreground whitespace-nowrap">
-                                  {e.id === "opening" ? "—" : e.date.toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}
-                                </td>
-                                <td className="px-4 py-2.5 max-w-[220px]">
-                                  <div className="font-semibold text-foreground truncate">{e.description}</div>
-                                  {e.instrument && (
-                                    <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${
-                                      e.instrument === "EQUITY"  ? "bg-primary/10 text-primary" :
-                                      e.instrument === "OPTIONS" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400" :
-                                      "bg-warning/10 text-warning"}`}>
-                                      {e.instrument}
-                                      {e.tag === "expiry" && " · EXPIRED"}
-                                      {e.tag === "sqoff"  && " · SQ-OFF"}
-                                    </span>
-                                  )}
-                                </td>
-                                <td className="px-4 py-2.5 font-mono">
-                                  {e.debit > 0
-                                    ? <span className="text-destructive font-semibold">− {fmt(e.debit)}</span>
-                                    : <span className="text-muted-foreground">—</span>}
-                                </td>
-                                <td className="px-4 py-2.5 font-mono">
-                                  {e.credit > 0
-                                    ? <span className="text-success font-semibold">+ {fmt(e.credit)}</span>
-                                    : <span className="text-muted-foreground">—</span>}
-                                </td>
-                                <td className="px-4 py-2.5 font-mono font-semibold">
-                                  {e.pnl !== null ? (
-                                    <span className={e.pnl >= 0 ? "text-success" : "text-destructive"}>
-                                      {e.pnl >= 0 ? "+" : ""}₹{fmtN(Math.abs(e.pnl))}
-                                    </span>
-                                  ) : <span className="text-muted-foreground">—</span>}
-                                </td>
-                                <td className="px-4 py-2.5 font-mono font-bold text-foreground whitespace-nowrap">
-                                  {fmt(e.runningBalance)}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )
-            })()
-          )}
-        </div>
-      </div>
+            </div>
+          </div>
+        )
+      })()}
 
       <p className="text-[10px] text-muted-foreground text-center mt-8">
-        ⚠️ Virtual trading only. No real money. Options premium via Black-Scholes (IV 18%). Options BUY: only premium debited.
-        Options/Futures SELL: ~20% SPAN margin blocked; auto square-off if loss ≥ margin. Expired options settle worthless.
-        Equity/Futures live prices from Yahoo Finance (~15 min delay). Charges simulated (Zerodha model). Not SEBI registered.
+        ⚠️ Virtual trading only. No real money involved. Options premium via Black-Scholes (IV from India VIX). Bhav data from Supabase (nifty_options, banknifty_options, india_vix tables).
+        Auto square-off if loss ≥ margin. Not SEBI registered. Past performance does not guarantee future results.
       </p>
     </div>
   )
@@ -2171,64 +2352,31 @@ export default function VirtualTradePage() {
   const [isRecovery, setIsRecovery] = useState(false)
 
   useEffect(() => {
-    // IMPORTANT: Do NOT call getSession() first.
-    // onAuthStateChange fires INITIAL_SESSION immediately with the current
-    // session, AND fires PASSWORD_RECOVERY before SIGNED_IN when the user
-    // lands from a reset link. Letting it control everything avoids a race
-    // condition where getSession sets checked=true before recovery is detected.
     const { data: sub } = supabase.auth.onAuthStateChange(async (event, session) => {
-
       if (event === "INITIAL_SESSION") {
-        // Page just loaded normally — no recovery token in URL
         setUserId(session?.user?.id ?? null)
         setChecked(true)
-
       } else if (event === "PASSWORD_RECOVERY") {
-        // User clicked the forgot-password link in their email.
-        // Show the reset password form immediately.
-        setIsRecovery(true)
-        setUserId(null)
-        setChecked(true)
-
+        setIsRecovery(true); setUserId(null); setChecked(true)
       } else if (event === "USER_UPDATED") {
-        // User successfully saved their new password
-        setIsRecovery(false)
-        setUserId(session?.user?.id ?? null)
-
+        setIsRecovery(false); setUserId(session?.user?.id ?? null)
       } else if (event === "SIGNED_IN") {
-        // Skip SIGNED_IN if we are in recovery mode (it fires right after
-        // PASSWORD_RECOVERY — we don't want it to override the reset form)
         if (isRecovery) return
         const uid = session?.user?.id
         if (uid) {
-          // Ensure profile + wallet exist (handles email confirmation link flow)
-          const { data: prof } = await supabase
-            .from("profiles").select("id").eq("id", uid).maybeSingle()
+          const { data: prof } = await supabase.from("profiles").select("id").eq("id", uid).maybeSingle()
           if (!prof) {
             const meta = session?.user?.user_metadata ?? {}
-            await supabase.from("profiles").upsert({
-              id: uid,
-              email: session?.user?.email?.toLowerCase() ?? "",
-              mobile: meta.mobile ?? "",
-              full_name: meta.full_name ?? "",
-            })
+            await supabase.from("profiles").upsert({ id: uid, email: session?.user?.email?.toLowerCase() ?? "", mobile: meta.mobile ?? "", full_name: meta.full_name ?? "" })
           }
-          const { data: wal } = await supabase
-            .from("wallets").select("id").eq("user_id", uid).maybeSingle()
-          if (!wal) {
-            await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
-          }
+          const { data: wal } = await supabase.from("wallets").select("id").eq("user_id", uid).maybeSingle()
+          if (!wal) await supabase.from("wallets").insert({ user_id: uid, balance: 1000000 })
         }
-        setUserId(uid ?? null)
-        setChecked(true)
-
+        setUserId(uid ?? null); setChecked(true)
       } else if (event === "SIGNED_OUT") {
-        setUserId(null)
-        setIsRecovery(false)
-        setChecked(true)
+        setUserId(null); setIsRecovery(false); setChecked(true)
       }
     })
-
     return () => sub.subscription.unsubscribe()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -2239,9 +2387,12 @@ export default function VirtualTradePage() {
       <main className="flex-1">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6">
           <div className="mb-6">
-            <h1 className="text-2xl font-bold text-foreground">Virtual Trading</h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              Practice Nifty 50 Equity, Options & Futures with ₹10,00,000 virtual money — zero real risk
+            <div className="flex items-center gap-3 mb-1">
+              <h1 className="text-2xl font-bold text-foreground">Virtual Trading</h1>
+              <span className="text-[11px] bg-primary/10 text-primary px-2.5 py-1 rounded-full font-semibold border border-primary/20">v2.0</span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Practice with ₹10,00,000 virtual money · Option Chain · Strategy Builder · Historical Replay · Future Play with VIX forecasting
             </p>
           </div>
           {!checked ? (
