@@ -325,12 +325,8 @@ function pick(row: any, ...keys: string[]): any {
 //   B) Narrow row – one row per option contract, with option_type CE/PE
 //      (we call normaliseBhavRows which pairs them up)
 function normaliseWideRow(raw: any): NormRow {
-  const strike = n(pick(raw,
-    "strike_price","STRIKE_PR","strikeprice","strike","STRIKEPRICE","strike_pr",
-  )) ?? 0
-  const expiry = String(pick(raw,
-    "expiry_date","EXPIRY_DT","expirydate","expiry","EXPIRY","expiry_dt",
-  ) ?? "")
+  const strike = n(pick(raw, "strike_price","STRIKE_PR","strikeprice","strike","STRIKEPRICE","strike_pr")) ?? 0
+  const expiry = String(pick(raw, "expiry_date","EXPIRY_DT","expirydate","expiry","EXPIRY","expiry_dt") ?? "")
 
   return {
     strike_price: strike,
@@ -488,114 +484,129 @@ async function fetchVIXFromSupabase(): Promise<number> {
 }
 
 // ─── Main bhav option chain fetcher ──────────────────────────────────────────
+// Fixes vs old version:
+//  1. Removed .in(strikeCol, strikes) — DB stores strikes as strings; type mismatch silently returns 0 rows
+//  2. Fetch ALL strikes for the expiry, sort and return; caller displays all or slices to ATM±N
+//  3. Better expiry matching: 7 format variants + ilike fallback + year-verification
+//  4. Detailed debug info passed back so UI can show what went wrong
 async function fetchBhavOptionChain(
   symbol: string,
-  expiry: string,        // YYYY-MM-DD format
-  spot: number
+  expiry: string,   // YYYY-MM-DD
+  _spot: number     // kept for API compat; no longer used for strike filtering
 ): Promise<NormRow[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-  const interval  = getStrikeInterval(symbol)
-  const atm       = Math.round(spot / interval) * interval
-  // 10 strikes each side of ATM = 21 total
-  const strikes   = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
 
-  // We don't know the exact column name for strike_price or expiry_date up front.
-  // Strategy: fetch a small probe row first, detect schema, then run main query.
+  // ── Step 1: probe schema ────────────────────────────────────────────────────
+  const { data: probe, error: probeErr } = await supabase.from(tableName).select("*").limit(3)
+  if (probeErr || !probe || probe.length === 0) return []
 
-  // ── Step 1: probe to detect schema variant ──────────────────────────────────
-  const { data: probe } = await supabase.from(tableName).select("*").limit(2)
-  if (!probe || probe.length === 0) return []
+  const sample = probe[0]
+  const keys   = Object.keys(sample)
+  const strikeCol = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
+  const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
 
-  const sampleRow = probe[0]
-  const keys = Object.keys(sampleRow)
-
-  // Detect the actual column names in this table
-  const strikeCol  = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
-  const expiryCol  = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
-
-  // Also check: does the expiry in DB have different format? (DD-MMM-YYYY, YYYY-MM-DD, etc.)
-  // Probe what the actual expiry value looks like for the first row
-  const probeExpiry = String(sampleRow[expiryCol] ?? "")
-
-  // Convert our YYYY-MM-DD expiry to match DB format
-  function convertExpiry(isoDate: string): string[] {
-    const d = new Date(isoDate + "T00:00:00")
-    const dd  = String(d.getDate()).padStart(2, "0")
-    const mon3 = d.toLocaleDateString("en-US", { month: "short" }).toUpperCase()
-    const yyyy = d.getFullYear()
-    const yy   = String(yyyy).slice(2)
+  // ── Step 2: build all expiry format variants ────────────────────────────────
+  function allExpiryVariants(iso: string): string[] {
+    const d    = new Date(iso + "T00:00:00")
+    const dd   = String(d.getDate()).padStart(2, "0")
+    const mm   = String(d.getMonth() + 1).padStart(2, "0")
+    const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
+    const yyyy = String(d.getFullYear())
+    const yy   = yyyy.slice(2)
     return [
-      isoDate,                          // YYYY-MM-DD
-      `${dd}-${mon3}-${yyyy}`,          // DD-MMM-YYYY  (NSE standard)
-      `${dd}-${mon3}-${yy}`,            // DD-MMM-YY
-      `${yyyy}/${String(d.getMonth()+1).padStart(2,"0")}/${dd}`, // YYYY/MM/DD
-      `${dd}/${String(d.getMonth()+1).padStart(2,"0")}/${yyyy}`, // DD/MM/YYYY
+      iso,                     // 2025-05-29
+      `${dd}-${mon3}-${yyyy}`, // 29-MAY-2025  ← NSE standard
+      `${dd}-${mon3}-${yy}`,   // 29-MAY-25
+      `${dd}/${mm}/${yyyy}`,   // 29/05/2025
+      `${yyyy}/${mm}/${dd}`,   // 2025/05/29
+      `${dd}-${mm}-${yyyy}`,   // 29-05-2025
+      `${yyyy}${mm}${dd}`,     // 20250529
     ]
   }
 
-  const expiryVariants = convertExpiry(expiry)
+  const variants = allExpiryVariants(expiry)
 
-  // Try each expiry variant until we get results
-  for (const ev of expiryVariants) {
+  // ── Step 3: try exact match for each variant ────────────────────────────────
+  for (const ev of variants) {
     const { data, error } = await supabase
       .from(tableName)
       .select("*")
       .eq(expiryCol, ev)
-      .in(strikeCol, strikes)
       .order(strikeCol, { ascending: true })
-      .limit(500)
+      .limit(2000)
 
-    if (error || !data || data.length === 0) continue
-
-    // Detect format and normalise
-    if (isNarrowFormat(data)) {
-      return normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
-    } else {
-      return data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
+    if (!error && data && data.length > 0) {
+      return isNarrowFormat(data)
+        ? normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
+        : data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
     }
   }
 
-  // Nothing found for this expiry — return empty (caller will use BS fallback)
+  // ── Step 4: ilike fallback — partial day+month match ───────────────────────
+  const d    = new Date(expiry + "T00:00:00")
+  const dd   = String(d.getDate()).padStart(2, "0")
+  const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
+  const yyyy = String(d.getFullYear())
+  const yy   = yyyy.slice(2)
+
+  const patterns = [`${dd}-${mon3}%`, `%${dd}-${mon3}%`, `%-${yy}`, `%${yy}`]
+  for (const pat of patterns) {
+    const { data, error } = await supabase
+      .from(tableName)
+      .select("*")
+      .ilike(expiryCol, pat)
+      .order(strikeCol, { ascending: true })
+      .limit(2000)
+
+    if (!error && data && data.length > 0) {
+      const firstExpiry = String((data[0] as any)[expiryCol] ?? "")
+      if (firstExpiry.includes(yyyy) || firstExpiry.includes(yy)) {
+        return isNarrowFormat(data)
+          ? normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
+          : data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
+      }
+    }
+  }
+
   return []
 }
 
 // ─── Fetch all available expiry dates from bhav tables ───────────────────────
+// Normalises every date format the DB might store to YYYY-MM-DD
+function normaliseDateStr(v: string): string {
+  const MON: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
+  // DD-MMM-YYYY  e.g. "25-JAN-2025"
+  const m1 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+  if (m1) { const mm = MON[m1[2].toUpperCase()]; if (mm) return `${m1[3]}-${mm}-${m1[1].padStart(2,"0")}` }
+  // DD-MMM-YY  e.g. "25-JAN-25"
+  const m2 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/)
+  if (m2) { const mm = MON[m2[2].toUpperCase()]; if (mm) return `20${m2[3]}-${mm}-${m2[1].padStart(2,"0")}` }
+  // YYYY-MM-DD already
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v
+  // YYYYMMDD
+  if (/^\d{8}$/.test(v)) return `${v.slice(0,4)}-${v.slice(4,6)}-${v.slice(6,8)}`
+  return v
+}
+
 async function fetchBhavExpiries(symbol: string): Promise<string[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-  // Probe schema first to find expiry column
+
+  // Probe schema
   const { data: probe } = await supabase.from(tableName).select("*").limit(1)
   if (!probe || !probe.length) return []
   const keys = Object.keys(probe[0])
   const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
 
+  // Fetch only the expiry column, limited to avoid huge payloads
+  // Supabase doesn't support DISTINCT natively, so fetch 5000 rows and dedupe in JS
   const { data } = await supabase
     .from(tableName)
     .select(expiryCol)
-    .order(expiryCol, { ascending: true })
+    .limit(5000)
   if (!data) return []
 
   const raw = [...new Set(data.map((r: any) => String(r[expiryCol] ?? "").trim()))].filter(Boolean)
-  // Normalise all to YYYY-MM-DD
-  return raw.map(v => {
-    // Try DD-MMM-YYYY  e.g. "25-JAN-2025"
-    const m1 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
-    if (m1) {
-      const months: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
-      const mm = months[m1[2].toUpperCase()]
-      if (mm) return `${m1[3]}-${mm}-${m1[1].padStart(2,"0")}`
-    }
-    // Try DD-MMM-YY  e.g. "25-JAN-25"
-    const m2 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/)
-    if (m2) {
-      const months: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
-      const mm = months[m2[2].toUpperCase()]
-      const year = `20${m2[3]}`
-      if (mm) return `${year}-${mm}-${m2[1].padStart(2,"0")}`
-    }
-    // YYYY-MM-DD already
-    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v
-    return v // leave as-is if unrecognised
-  }).sort()
+  return raw.map(normaliseDateStr).filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
 }
 
 // ─── Fetch all dates available in bhav (for replay) ──────────────────────────
@@ -1032,10 +1043,27 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
       setChainData(enriched)
       setDataSource("bhav")
       const hasOI = enriched.some(r => r.ce_oi != null || r.pe_oi != null)
-      setDebugMsg(`📊 Live Bhav data — ${enriched.length} strikes${hasOI ? " · OI + Volume available" : " · no OI column in table"}`)
+      setDebugMsg(`📊 Bhav data — ${enriched.length} strikes · expiry ${expiry}${hasOI ? " · OI ✓" : ""}`)
     } else {
-      // ── 2. Fall back to Black-Scholes when no bhav data ───────────────────
-      if (spot <= 0) { setLoading(false); setDataSource("none"); setDebugMsg("⚠ Enter or fetch spot price first"); return }
+      // ── 2. Diagnose: show what expiries actually exist in the table ────────
+      const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+      const { data: diagProbe } = await supabase.from(tableName).select("*").limit(2)
+      let diagMsg = `⚠ No bhav data for ${symbol} expiry=${expiry}.`
+      if (diagProbe && diagProbe.length > 0) {
+        const keys = Object.keys(diagProbe[0])
+        const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
+        const { data: sampleExpiries } = await supabase.from(tableName).select(expiryCol).limit(200)
+        if (sampleExpiries && sampleExpiries.length > 0) {
+          const uniq = [...new Set(sampleExpiries.map((r: any) => String(r[expiryCol] ?? "")))].slice(0, 8)
+          diagMsg += ` DB has expiry col="${expiryCol}", sample values: [${uniq.join(" | ")}]. Check format mismatch.`
+        }
+      } else {
+        diagMsg += " Table empty or unreachable."
+      }
+      setDebugMsg(diagMsg)
+
+      // ── 3. Fall back to Black-Scholes ─────────────────────────────────────
+      if (spot <= 0) { setLoading(false); setDataSource("none"); return }
       const strikes = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
       const synthetic: NormRow[] = strikes.map(strike => ({
         strike_price: strike,
@@ -1048,7 +1076,6 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
       }))
       setChainData(synthetic)
       setDataSource("bs")
-      setDebugMsg("~Black-Scholes estimates (no bhav match for this expiry — check expiry date format in DB)")
     }
     setLoading(false)
   }
