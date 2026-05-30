@@ -873,7 +873,7 @@ function AuthSection({ onAuth, initialMode = "login" }: { onAuth: () => void; in
 // EXPIRY P&L POPUP
 // ═════════════════════════════════════════════════════════════════════════════
 
-function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () => void }) {
+function ExpiryPnLPopup({ positions, onClose, onNewSession }: { positions: any[]; onClose: () => void; onNewSession?: () => void }) {
   const totalPnL = positions.reduce((s, p) => s + (p.realized_pnl ?? 0), 0)
   const profitable = positions.filter(p => (p.realized_pnl ?? 0) >= 0)
   const losing = positions.filter(p => (p.realized_pnl ?? 0) < 0)
@@ -890,7 +890,7 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
               </div>
               <div>
                 <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Expiry Settlement</div>
-                <div className="text-sm font-bold text-foreground">Today's Expired Positions</div>
+                <div className="text-sm font-bold text-foreground">Session Expired · Final P&amp;L</div>
               </div>
             </div>
             <button onClick={onClose} className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center hover:bg-muted/80">
@@ -901,7 +901,7 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
             <div className="text-3xl font-bold font-mono mb-1" style={{ color: totalPnL >= 0 ? "var(--success)" : "var(--destructive)" }}>
               {totalPnL >= 0 ? "+" : ""}{fmt(totalPnL)}
             </div>
-            <div className="text-sm text-muted-foreground">Net P&L from expiry</div>
+            <div className="text-sm text-muted-foreground">Net P&amp;L from expiry</div>
           </div>
           {/* Win/Loss summary */}
           <div className="grid grid-cols-3 gap-3 mt-4">
@@ -920,7 +920,7 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
           </div>
         </div>
         {/* Positions list */}
-        <div className="p-4 max-h-64 overflow-y-auto">
+        <div className="p-4 max-h-56 overflow-y-auto">
           <div className="space-y-2">
             {positions.map((p, i) => {
               const pnl = p.realized_pnl ?? 0
@@ -942,9 +942,16 @@ function ExpiryPnLPopup({ positions, onClose }: { positions: any[]; onClose: () 
             })}
           </div>
         </div>
-        <div className="p-4 pt-0">
-          <button onClick={onClose} className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors">
-            Got it! Continue Trading
+        <div className="p-4 pt-0 space-y-2">
+          {onNewSession && (
+            <button onClick={onNewSession}
+              className="w-full bg-primary text-primary-foreground font-semibold py-3 rounded-xl text-sm hover:bg-primary/90 transition-colors flex items-center justify-center gap-2">
+              <RefreshCw className="w-4 h-4" /> Start New Session (Reset ₹10L)
+            </button>
+          )}
+          <button onClick={onClose}
+            className="w-full bg-muted text-muted-foreground font-semibold py-2.5 rounded-xl text-sm hover:bg-muted/80 transition-colors">
+            Continue with current balance
           </button>
         </div>
       </div>
@@ -1746,7 +1753,11 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
     }
   }
 
+  const currentIdxRef = useRef(0)
+
   function stepTo(date: string) {
+    const idx = allDates.indexOf(date)
+    currentIdxRef.current = idx >= 0 ? idx : currentIdxRef.current
     setCurrentDate(date)
     loadDateRows(date)
   }
@@ -1756,16 +1767,19 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
       if (intervalRef.current) clearInterval(intervalRef.current)
       setIsPlaying(false)
     } else {
+      // Sync ref to current state before starting
+      currentIdxRef.current = allDates.indexOf(currentDate)
       setIsPlaying(true)
-      let idx = allDates.indexOf(currentDate)
       intervalRef.current = setInterval(() => {
-        idx++
-        if (idx >= allDates.length) {
+        currentIdxRef.current++
+        if (currentIdxRef.current >= allDates.length) {
           if (intervalRef.current) clearInterval(intervalRef.current)
           setIsPlaying(false)
           return
         }
-        stepTo(allDates[idx])
+        const nextDate = allDates[currentIdxRef.current]
+        setCurrentDate(nextDate)
+        loadDateRows(nextDate)
       }, speed)
     }
   }
@@ -2130,10 +2144,11 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [vix,          setVix]          = useState(15)
   const [chainSymbol,  setChainSymbol]  = useState("NIFTY")
   const [chainExpiry,  setChainExpiry]  = useState(getThursdaysForNext3Months()[0] ?? "")
-  const [expiryPopup,  setExpiryPopup]  = useState<any[] | null>(null)
+  const [expiryPopup,          setExpiryPopup]          = useState<any[] | null>(null)
+  const [autoPlayShowNewSession, setAutoPlayShowNewSession] = useState(false)
   const positionsRef    = useRef<any[]>([])
   const targetPricesRef = useRef<Record<string, number>>({})
-  const [autoPlayTimer, setAutoPlayTimer] = useState<NodeJS.Timeout | null>(null)
+  const [autoPlayTimer, setAutoPlayTimer] = useState<ReturnType<typeof setTimeout> | null>(null)
   const [isAutoPlay, setIsAutoPlay] = useState(false)
   const autoPlayRef = useRef(false)
 
@@ -2219,12 +2234,16 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [showSchema,   setShowSchema]   = useState(false)
   const [manualSpot,   setManualSpot]   = useState("")
 
-  // Auto-fetch spot for option chain
+  // Auto-fetch spot for option chain — fully wrapped so a CORS/network failure never crashes the component
   async function fetchChainSpot() {
-    const p = await fetchLivePrice(chainSymbol, "EQUITY")
-    if (p) { setSpot(p); setManualSpot(String(p)) }
-    const v = await fetchVIXFromSupabase()
-    setVix(v)
+    try {
+      const p = await fetchLivePrice(chainSymbol, "EQUITY")
+      if (p && p > 0) { setSpot(p); setManualSpot(String(p)) }
+    } catch {}
+    try {
+      const v = await fetchVIXFromSupabase()
+      if (v > 0) setVix(v)
+    } catch {}
   }
 
   // Schema probe — shows exactly what columns are in your bhav tables
@@ -2244,8 +2263,11 @@ function TradingDashboard({ userId }: { userId: string }) {
 
   useEffect(() => {
     load().then(() => {
-      setTimeout(() => { checkExpiry(); checkSquareOff() }, 1500)
-    })
+      setTimeout(() => {
+        try { checkExpiry() } catch {}
+        try { checkSquareOff() } catch {}
+      }, 1500)
+    }).catch(() => {})
   }, [load])
 
   useEffect(() => {
@@ -2259,26 +2281,87 @@ function TradingDashboard({ userId }: { userId: string }) {
   }, [positions.length, refreshLivePrices])
 
   // Fetch spot on symbol change
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchChainSpot() }, [chainSymbol])
 
-  // Daily auto-play: check expiry at start of each "day"
+  // ─── AutoPlay: simulate one trading day at a time through bhav replay ────────
+  // When the expiry date of an open position is reached, settle it, show popup,
+  // then automatically reset the virtual wallet and start a new session.
+  const autoPlayDatesRef  = useRef<string[]>([])
+  const autoPlayIdxRef    = useRef(0)
+  const autoPlaySpeedRef  = useRef(1500) // ms per simulated day
+
+  async function resetSession() {
+    // Close all open positions at 0 (expired worthless), then reset wallet to ₹10L
+    for (const pos of positionsRef.current) {
+      await supabase.from("positions").update({ status: "CLOSED", closed_at: new Date().toISOString(), pnl: 0 }).eq("id", pos.id)
+    }
+    await supabase.from("wallets").update({ balance: 1_000_000 }).eq("user_id", userId)
+    await load()
+  }
+
   function startAutoPlay() {
     if (isAutoPlay) return
-    setIsAutoPlay(true)
-    autoPlayRef.current = true
-    const t = setInterval(async () => {
-      if (!autoPlayRef.current) { clearInterval(t); return }
-      await refreshLivePrices()
-      checkExpiry()
-      checkSquareOff()
-    }, 60_000) // check every minute for expiry
-    setAutoPlayTimer(t)
+    // Load all bhav dates for current symbol for the replay
+    fetchBhavDates(["NIFTY","BANKNIFTY"].includes(chainSymbol) ? chainSymbol : "NIFTY").then(dates => {
+      if (dates.length === 0) return
+      autoPlayDatesRef.current = dates
+      autoPlayIdxRef.current = 0
+      setIsAutoPlay(true)
+      autoPlayRef.current = true
+
+      const tick = async () => {
+        if (!autoPlayRef.current) return
+        const idx = autoPlayIdxRef.current
+        const allDates = autoPlayDatesRef.current
+        if (idx >= allDates.length) {
+          stopAutoPlay(); return
+        }
+
+        const simDate = allDates[idx]
+        autoPlayIdxRef.current = idx + 1
+
+        // Check if any open position expires on or before this date
+        const expired = positionsRef.current.filter(p =>
+          (p.instrument === "OPTIONS" || p.instrument === "FUTURES") &&
+          p.expiry && simDate >= p.expiry
+        )
+
+        if (expired.length > 0) {
+          // Settle expired positions
+          const settled: any[] = []
+          for (const pos of expired) {
+            const settlementPrice = pos.instrument === "OPTIONS" ? 0
+              : (livePrices[`${pos.symbol}__${pos.instrument}`] ?? pos.current_price ?? pos.entry_price)
+            const pnl = await closePos(pos, settlementPrice)
+            settled.push({ ...pos, realized_pnl: pnl })
+          }
+          autoPlayRef.current = false
+          setIsAutoPlay(false)
+          setExpiryPopup(settled)
+          setAutoPlayShowNewSession(true)
+          return
+        }
+
+        // Refresh live prices
+        try { await refreshLivePrices() } catch {}
+        try { await checkSquareOff() } catch {}
+
+        if (autoPlayRef.current) {
+          const t = setTimeout(tick, autoPlaySpeedRef.current)
+          setAutoPlayTimer(t)
+        }
+      }
+
+      const t = setTimeout(tick, autoPlaySpeedRef.current)
+      setAutoPlayTimer(t)
+    })
   }
 
   function stopAutoPlay() {
     setIsAutoPlay(false)
     autoPlayRef.current = false
-    if (autoPlayTimer) { clearInterval(autoPlayTimer); setAutoPlayTimer(null) }
+    if (autoPlayTimer) { clearTimeout(autoPlayTimer); setAutoPlayTimer(null) }
   }
 
   async function closePos(pos: any, forcePrice?: number) {
@@ -2422,7 +2505,17 @@ function TradingDashboard({ userId }: { userId: string }) {
   return (
     <div>
       {/* Expiry Popup */}
-      {expiryPopup && <ExpiryPnLPopup positions={expiryPopup} onClose={() => setExpiryPopup(null)} />}
+      {expiryPopup && (
+        <ExpiryPnLPopup
+          positions={expiryPopup}
+          onClose={() => { setExpiryPopup(null); setAutoPlayShowNewSession(false) }}
+          onNewSession={autoPlayShowNewSession ? async () => {
+            setExpiryPopup(null)
+            setAutoPlayShowNewSession(false)
+            await resetSession()
+          } : undefined}
+        />
+      )}
 
       {/* Schema debug modal */}
       {showSchema && (
@@ -2546,7 +2639,11 @@ function TradingDashboard({ userId }: { userId: string }) {
       <div className="flex items-center gap-2 mb-4 text-[10px] text-muted-foreground">
         <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
         {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · auto-refresh every 30s` : "Click refresh to load prices"}
-        {isAutoPlay && <span className="ml-2 text-success font-semibold animate-pulse">● Auto-play active — daily expiry check running</span>}
+        {isAutoPlay && (
+          <span className="ml-2 text-success font-semibold animate-pulse">
+            ● Auto-play active · simulating day {autoPlayIdxRef.current} of {autoPlayDatesRef.current.length} · expiry check running
+          </span>
+        )}
       </div>
 
       {/* Tab content */}
