@@ -327,7 +327,7 @@ function pick(row: any, ...keys: string[]): any {
 function normaliseWideRow(raw: any): NormRow {
   const strike = n(pick(raw,
     "strike_price","STRIKE_PR","strikeprice","strike","STRIKEPRICE","strike_pr",
-    ) ?? 0
+  )) ?? 0
   const expiry = String(pick(raw,
     "expiry_date","EXPIRY_DT","expirydate","expiry","EXPIRY","expiry_dt",
   ) ?? "")
