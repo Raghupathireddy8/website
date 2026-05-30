@@ -33,7 +33,6 @@
 //   );
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const dynamic = "force-dynamic"
 
 import { useState, useEffect, useCallback, useRef } from "react"
 import { supabase } from "@/lib/supabase"
@@ -492,7 +491,7 @@ async function fetchVIXFromSupabase(): Promise<number> {
 async function fetchBhavOptionChain(
   symbol: string,
   expiry: string,   // YYYY-MM-DD
-  _spot: number     // kept for API compat; no longer used for strike filtering
+  spot: number      // kept for API compat; ATM context but no longer used for strike filtering
 ): Promise<NormRow[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
 
