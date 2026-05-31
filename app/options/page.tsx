@@ -597,11 +597,38 @@ const _schemaCache: Record<string, { dateCol: string; strikeCol: string; expiryC
 
 async function getBhavSchema(tableName: string) {
   if (_schemaCache[tableName]) return _schemaCache[tableName]
-  const { data: probe } = await supabase.from(tableName).select("*").limit(1)
+  const { data: probe, error: probeErr } = await supabase.from(tableName).select("*").limit(1)
+
+  if (probeErr) {
+    // Surface the real Supabase error so it propagates up
+    const msg = probeErr.message ?? JSON.stringify(probeErr)
+    throw new Error(`Supabase error on "${tableName}": ${msg}`)
+  }
+
   if (!probe || !probe.length) return { dateCol: "date", strikeCol: "strike_price", expiryCol: "expiry_date" }
   const keys = Object.keys(probe[0])
+  const sampleRow = probe[0]
+
+  // ── date column: broad regex first, then value-based fallback ─────────────
+  let dateCol = keys.find(k =>
+    /^(date|trade_date|timestamp|trading_date|trd_dt|trd_date|bhav_date|record_date|mkt_date|dt|exch_date|series_date|data_dt|data_date)$/i.test(k)
+  )
+  // If the strict regex didn't find it, try any key whose value looks like a date
+  if (!dateCol) {
+    dateCol = keys.find(k => {
+      const v = String(sampleRow[k] ?? "")
+      return /^\d{4}-\d{2}-\d{2}/.test(v) ||  // YYYY-MM-DD
+             /^\d{1,2}-[A-Za-z]{3}-\d{2,4}$/.test(v) ||  // DD-MMM-YYYY
+             /^\d{2}\/\d{2}\/\d{4}$/.test(v)   // DD/MM/YYYY
+    })
+  }
+  // Last resort: pick anything with "date" or "dt" in the name
+  if (!dateCol) {
+    dateCol = keys.find(k => /date|dt$/i.test(k))
+  }
+
   const schema = {
-    dateCol:   keys.find(k => /^(date|trade_date|timestamp|trading_date|trd_dt)$/i.test(k)) ?? "date",
+    dateCol:   dateCol ?? "date",
     strikeCol: keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price",
     expiryCol: keys.find(k => /expiry/i.test(k)) ?? "expiry_date",
   }
@@ -622,40 +649,82 @@ function normDateStr(v: string): string {
 }
 
 // ─── Fetch all UNIQUE trading dates — fast path first, paged fallback ────────
-async function fetchBhavDates(symbol: string): Promise<string[]> {
+// Returns { dates, error } so callers can show the real Supabase error
+async function fetchBhavDates(symbol: string): Promise<{ dates: string[]; error: string | null }> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-  const { dateCol } = await getBhavSchema(tableName)
 
-  // Fast path: try Postgres DISTINCT via RPC (requires a simple SQL function in Supabase)
-  // CREATE OR REPLACE FUNCTION distinct_dates(tbl text, col text)
-  // RETURNS TABLE(d text) LANGUAGE sql STABLE AS
-  // $$ SELECT DISTINCT col::text FROM nifty_options ORDER BY 1 $$;
-  // If that RPC doesn't exist yet we fall through to the paginated approach.
+  let schema: { dateCol: string; strikeCol: string; expiryCol: string }
+  try {
+    schema = await getBhavSchema(tableName)
+  } catch (e: any) {
+    return { dates: [], error: e.message ?? String(e) }
+  }
+  const { dateCol } = schema
+
+  // Fast path: try Postgres DISTINCT via RPC (optional — only if the function exists)
   try {
     const rpcName = tableName === "nifty_options" ? "nifty_distinct_dates" : "banknifty_distinct_dates"
     const { data: rpcData, error: rpcErr } = await supabase.rpc(rpcName)
     if (!rpcErr && rpcData && rpcData.length > 0) {
-      return [...new Set((rpcData as any[]).map((r: any) => normDateStr(String(r.d ?? r[dateCol] ?? r[Object.keys(r)[0]] ?? ""))))]
+      const dates = [...new Set((rpcData as any[]).map((r: any) => normDateStr(String(r.d ?? r[dateCol] ?? r[Object.keys(r)[0]] ?? ""))))]
         .filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+      return { dates, error: null }
     }
   } catch {}
 
-  // Medium path: select distinct using Supabase .select() with a small limit per page
-  // Works well when the table has an index on dateCol
+  // Medium path: paginated select
   const allRaw: string[] = []
   let page = 0
   const PAGE = 5000
+  let lastError: string | null = null
   while (true) {
     const { data, error } = await supabase
       .from(tableName).select(dateCol)
       .order(dateCol, { ascending: true })
       .range(page * PAGE, (page + 1) * PAGE - 1)
-    if (error || !data || data.length === 0) break
+    if (error) { lastError = `Column "${dateCol}" query failed: ${error.message}`; break }
+    if (!data || data.length === 0) break
     for (const r of data) allRaw.push(String((r as any)[dateCol] ?? ""))
     if (data.length < PAGE) break
     page++
   }
-  return [...new Set(allRaw.map(normDateStr))].filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+
+  if (allRaw.length === 0) {
+    // The dateCol guess may be wrong — probe table and try to find the real date column by value
+    try {
+      const { data: sample, error: sampleErr } = await supabase.from(tableName).select("*").limit(5)
+      if (sampleErr) return { dates: [], error: `Table "${tableName}" unreachable (RLS or wrong name): ${sampleErr.message}` }
+      if (!sample || sample.length === 0) return { dates: [], error: `Table "${tableName}" exists but is empty. Upload bhav data first.` }
+
+      const keys = Object.keys(sample[0])
+      let foundCol: string | null = null
+      for (const k of keys) {
+        const v = String(sample[0][k] ?? "")
+        if (/^\d{4}-\d{2}-\d{2}/.test(v) || /^\d{1,2}-[A-Za-z]{3}-\d{2,4}$/.test(v) || /^\d{2}\/\d{2}\/\d{4}$/.test(v)) {
+          foundCol = k; break
+        }
+      }
+      if (!foundCol) {
+        const sampleValues = keys.map(k => `${k}=${JSON.stringify(sample[0][k])}`).join(", ")
+        return { dates: [], error: `No date column found in "${tableName}". Columns & sample values: ${sampleValues}` }
+      }
+
+      // Re-cache with corrected column
+      _schemaCache[tableName] = { ...schema, dateCol: foundCol }
+
+      const { data: d2, error: e2 } = await supabase.from(tableName).select(foundCol)
+        .order(foundCol, { ascending: true }).limit(PAGE)
+      if (e2 || !d2) return { dates: [], error: `Failed to read "${foundCol}": ${e2?.message}` }
+      const fallbackDates = [...new Set(d2.map((r: any) => normDateStr(String(r[foundCol!] ?? ""))))]
+        .filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+      return { dates: fallbackDates, error: fallbackDates.length === 0 ? `Column "${foundCol}" found but no valid dates parsed.` : null }
+    } catch (e2: any) {
+      return { dates: [], error: e2.message ?? String(e2) }
+    }
+  }
+
+  const dates = [...new Set(allRaw.map(normDateStr))].filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+  return { dates, error: dates.length === 0 ? (lastError ?? `No valid date values found in column "${dateCol}"`) : null }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1783,6 +1852,7 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
   const [replaySpot, setReplaySpot] = useState(0)
   const [loading, setLoading] = useState(false)
   const [loadMsg, setLoadMsg] = useState("")
+  const [debugInfo, setDebugInfo] = useState<string | null>(null)
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
   const prefetchCache = useRef<Record<string, NormRow[]>>({})
   const replaySym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
@@ -1827,12 +1897,27 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
     setLoadMsg("")
     prefetchCache.current = {}
 
-    const dates = await fetchBhavDates(replaySym)
+    const { dates, error: fetchError } = await fetchBhavDates(replaySym)
+
+    // Show schema debug info for troubleshooting
+    const cachedSchema = _schemaCache[tableName]
+    if (cachedSchema) {
+      setDebugInfo(`Table: ${tableName} | dateCol: "${cachedSchema.dateCol}" | strikeCol: "${cachedSchema.strikeCol}" | expiryCol: "${cachedSchema.expiryCol}"`)
+    }
+
+    if (fetchError && dates.length === 0) {
+      setLoadMsg(`⚠ ${fetchError}`)
+      setLoading(false); return
+    }
+
     const filteredDates = dates.filter(d => d >= fromDate)
 
     if (filteredDates.length === 0) {
-      if (dates.length === 0) { setLoadMsg(`⚠ Table "${tableName}" empty or unreachable. Check Supabase RLS.`) }
-      else { setLoadMsg(`⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]}`) }
+      if (dates.length === 0) {
+        setLoadMsg(fetchError ?? `Table "${tableName}" returned no dates. Check Supabase RLS / table name.`)
+      } else {
+        setLoadMsg(`⚠ No dates from ${fromDate}. Earliest available in DB: ${dates[0]}`)
+      }
       setLoading(false); return
     }
 
@@ -1927,6 +2012,12 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
           </button>
           {loadMsg && !loading && <p className={`text-xs self-end ${loadMsg.startsWith("✅") ? "text-success" : "text-warning"}`}>{loadMsg}</p>}
         </div>
+
+        {debugInfo && !loading && (
+          <div className="mb-2 px-3 py-1.5 bg-muted/50 border border-border/50 rounded-lg text-[10px] font-mono text-muted-foreground break-all">
+            🔍 {debugInfo}
+          </div>
+        )}
 
         {allDates.length > 0 && (
           <>
