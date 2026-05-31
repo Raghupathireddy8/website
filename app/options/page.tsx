@@ -483,145 +483,162 @@ async function fetchVIXFromSupabase(): Promise<number> {
 }
 
 // ─── Main bhav option chain fetcher ──────────────────────────────────────────
-// Fixes vs old version:
-//  1. Removed .in(strikeCol, strikes) — DB stores strikes as strings; type mismatch silently returns 0 rows
-//  2. Fetch ALL strikes for the expiry, sort and return; caller displays all or slices to ATM±N
-//  3. Better expiry matching: 7 format variants + ilike fallback + year-verification
-//  4. Detailed debug info passed back so UI can show what went wrong
 async function fetchBhavOptionChain(
   symbol: string,
-  expiry: string,   // YYYY-MM-DD
-  spot: number      // kept for API compat; ATM context but no longer used for strike filtering
+  expiry: string,        // YYYY-MM-DD format
+  spot: number
 ): Promise<NormRow[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+  const interval  = getStrikeInterval(symbol)
+  const atm       = Math.round(spot / interval) * interval
+  // 10 strikes each side of ATM = 21 total
+  const strikes   = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
 
-  // ── Step 1: probe schema ────────────────────────────────────────────────────
-  const { data: probe, error: probeErr } = await supabase.from(tableName).select("*").limit(3)
-  if (probeErr || !probe || probe.length === 0) return []
+  // We don't know the exact column name for strike_price or expiry_date up front.
+  // Strategy: fetch a small probe row first, detect schema, then run main query.
 
-  const sample = probe[0]
-  const keys   = Object.keys(sample)
-  const strikeCol = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
-  const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
+  // ── Step 1: probe to detect schema variant ──────────────────────────────────
+  const { data: probe } = await supabase.from(tableName).select("*").limit(2)
+  if (!probe || probe.length === 0) return []
 
-  // ── Step 2: build all expiry format variants ────────────────────────────────
-  function allExpiryVariants(iso: string): string[] {
-    const d    = new Date(iso + "T00:00:00")
-    const dd   = String(d.getDate()).padStart(2, "0")
-    const mm   = String(d.getMonth() + 1).padStart(2, "0")
-    const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
-    const yyyy = String(d.getFullYear())
-    const yy   = yyyy.slice(2)
+  const sampleRow = probe[0]
+  const keys = Object.keys(sampleRow)
+
+  // Detect the actual column names in this table
+  const strikeCol  = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
+  const expiryCol  = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
+
+  // Also check: does the expiry in DB have different format? (DD-MMM-YYYY, YYYY-MM-DD, etc.)
+  // Probe what the actual expiry value looks like for the first row
+  const probeExpiry = String(sampleRow[expiryCol] ?? "")
+
+  // Convert our YYYY-MM-DD expiry to match DB format
+  function convertExpiry(isoDate: string): string[] {
+    const d = new Date(isoDate + "T00:00:00")
+    const dd  = String(d.getDate()).padStart(2, "0")
+    const mon3 = d.toLocaleDateString("en-US", { month: "short" }).toUpperCase()
+    const yyyy = d.getFullYear()
+    const yy   = String(yyyy).slice(2)
     return [
-      iso,                     // 2025-05-29
-      `${dd}-${mon3}-${yyyy}`, // 29-MAY-2025  ← NSE standard
-      `${dd}-${mon3}-${yy}`,   // 29-MAY-25
-      `${dd}/${mm}/${yyyy}`,   // 29/05/2025
-      `${yyyy}/${mm}/${dd}`,   // 2025/05/29
-      `${dd}-${mm}-${yyyy}`,   // 29-05-2025
-      `${yyyy}${mm}${dd}`,     // 20250529
+      isoDate,                          // YYYY-MM-DD
+      `${dd}-${mon3}-${yyyy}`,          // DD-MMM-YYYY  (NSE standard)
+      `${dd}-${mon3}-${yy}`,            // DD-MMM-YY
+      `${yyyy}/${String(d.getMonth()+1).padStart(2,"0")}/${dd}`, // YYYY/MM/DD
+      `${dd}/${String(d.getMonth()+1).padStart(2,"0")}/${yyyy}`, // DD/MM/YYYY
     ]
   }
 
-  const variants = allExpiryVariants(expiry)
+  const expiryVariants = convertExpiry(expiry)
 
-  // ── Step 3: try exact match for each variant ────────────────────────────────
-  for (const ev of variants) {
+  // Try each expiry variant until we get results
+  for (const ev of expiryVariants) {
     const { data, error } = await supabase
       .from(tableName)
       .select("*")
       .eq(expiryCol, ev)
       .order(strikeCol, { ascending: true })
-      .limit(2000)
+      .limit(500)
 
-    if (!error && data && data.length > 0) {
-      return isNarrowFormat(data)
-        ? normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
-        : data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
+    if (error || !data || data.length === 0) continue
+
+    // Detect format and normalise
+    if (isNarrowFormat(data)) {
+      return normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
+    } else {
+      return data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
     }
   }
 
-  // ── Step 4: ilike fallback — partial day+month match ───────────────────────
-  const d    = new Date(expiry + "T00:00:00")
-  const dd   = String(d.getDate()).padStart(2, "0")
-  const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
-  const yyyy = String(d.getFullYear())
-  const yy   = yyyy.slice(2)
-
-  const patterns = [`${dd}-${mon3}%`, `%${dd}-${mon3}%`, `%-${yy}`, `%${yy}`]
-  for (const pat of patterns) {
-    const { data, error } = await supabase
-      .from(tableName)
-      .select("*")
-      .ilike(expiryCol, pat)
-      .order(strikeCol, { ascending: true })
-      .limit(2000)
-
-    if (!error && data && data.length > 0) {
-      const firstExpiry = String((data[0] as any)[expiryCol] ?? "")
-      if (firstExpiry.includes(yyyy) || firstExpiry.includes(yy)) {
-        return isNarrowFormat(data)
-          ? normaliseNarrowRows(data).sort((a, b) => a.strike_price - b.strike_price)
-          : data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
-      }
-    }
-  }
-
+  // Nothing found for this expiry — return empty (caller will use BS fallback)
   return []
 }
 
 // ─── Fetch all available expiry dates from bhav tables ───────────────────────
-// Normalises every date format the DB might store to YYYY-MM-DD
-function normaliseDateStr(v: string): string {
-  const MON: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
-  // DD-MMM-YYYY  e.g. "25-JAN-2025"
-  const m1 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
-  if (m1) { const mm = MON[m1[2].toUpperCase()]; if (mm) return `${m1[3]}-${mm}-${m1[1].padStart(2,"0")}` }
-  // DD-MMM-YY  e.g. "25-JAN-25"
-  const m2 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/)
-  if (m2) { const mm = MON[m2[2].toUpperCase()]; if (mm) return `20${m2[3]}-${mm}-${m2[1].padStart(2,"0")}` }
-  // YYYY-MM-DD already
-  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v
-  // YYYYMMDD
-  if (/^\d{8}$/.test(v)) return `${v.slice(0,4)}-${v.slice(4,6)}-${v.slice(6,8)}`
-  return v
-}
-
 async function fetchBhavExpiries(symbol: string): Promise<string[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-
-  // Probe schema
+  // Probe schema first to find expiry column
   const { data: probe } = await supabase.from(tableName).select("*").limit(1)
   if (!probe || !probe.length) return []
   const keys = Object.keys(probe[0])
   const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
 
-  // Fetch only the expiry column, limited to avoid huge payloads
-  // Supabase doesn't support DISTINCT natively, so fetch 5000 rows and dedupe in JS
   const { data } = await supabase
     .from(tableName)
     .select(expiryCol)
-    .limit(5000)
+    .order(expiryCol, { ascending: true })
   if (!data) return []
 
   const raw = [...new Set(data.map((r: any) => String(r[expiryCol] ?? "").trim()))].filter(Boolean)
-  return raw.map(normaliseDateStr).filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+  // Normalise all to YYYY-MM-DD
+  return raw.map(v => {
+    // Try DD-MMM-YYYY  e.g. "25-JAN-2025"
+    const m1 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+    if (m1) {
+      const months: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
+      const mm = months[m1[2].toUpperCase()]
+      if (mm) return `${m1[3]}-${mm}-${m1[1].padStart(2,"0")}`
+    }
+    // Try DD-MMM-YY  e.g. "25-JAN-25"
+    const m2 = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/)
+    if (m2) {
+      const months: Record<string,string> = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" }
+      const mm = months[m2[2].toUpperCase()]
+      const year = `20${m2[3]}`
+      if (mm) return `${year}-${mm}-${m2[1].padStart(2,"0")}`
+    }
+    // YYYY-MM-DD already
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v
+    return v // leave as-is if unrecognised
+  }).sort()
 }
 
-// ─── Fetch all dates available in bhav (for replay) ──────────────────────────
+// ─── Schema cache + date normaliser ──────────────────────────────────────────
+const _schemaCache: Record<string, { dateCol: string; strikeCol: string; expiryCol: string }> = {}
+
+async function getBhavSchema(tableName: string) {
+  if (_schemaCache[tableName]) return _schemaCache[tableName]
+  const { data: probe } = await supabase.from(tableName).select("*").limit(1)
+  if (!probe || !probe.length) return { dateCol: "date", strikeCol: "strike_price", expiryCol: "expiry_date" }
+  const keys = Object.keys(probe[0])
+  const schema = {
+    dateCol:   keys.find(k => /^(date|trade_date|timestamp|trading_date|trd_dt)$/i.test(k)) ?? "date",
+    strikeCol: keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price",
+    expiryCol: keys.find(k => /expiry/i.test(k)) ?? "expiry_date",
+  }
+  _schemaCache[tableName] = schema
+  return schema
+}
+
+function normDateStr(v: string): string {
+  const s = String(v ?? "").trim()
+  const MON: Record<string,string> = {JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12"}
+  const m1 = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
+  if (m1) { const mm = MON[m1[2].toUpperCase()]; if (mm) return `${m1[3]}-${mm}-${m1[1].padStart(2,"0")}` }
+  const m2 = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/)
+  if (m2) { const mm = MON[m2[2].toUpperCase()]; if (mm) return `20${m2[3]}-${mm}-${m2[1].padStart(2,"0")}` }
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10)
+  if (/^\d{8}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`
+  return s.slice(0,10)
+}
+
+// ─── Fetch all UNIQUE trading dates (paged to avoid timeout) ─────────────────
 async function fetchBhavDates(symbol: string): Promise<string[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-  const { data: probe } = await supabase.from(tableName).select("*").limit(1)
-  if (!probe || !probe.length) return []
-  const keys = Object.keys(probe[0])
-  const dateCol = keys.find(k => /^date$|^trade_date$|^timestamp$/i.test(k)) ?? "date"
-
-  const { data } = await supabase
-    .from(tableName)
-    .select(dateCol)
-    .order(dateCol, { ascending: true })
-  if (!data) return []
-  return [...new Set(data.map((r: any) => String(r[dateCol] ?? "").slice(0, 10)))].filter(Boolean).sort()
+  const { dateCol } = await getBhavSchema(tableName)
+  const allRaw: string[] = []
+  let page = 0
+  const PAGE = 5000
+  while (true) {
+    const { data, error } = await supabase
+      .from(tableName).select(dateCol)
+      .order(dateCol, { ascending: true })
+      .range(page * PAGE, (page + 1) * PAGE - 1)
+    if (error || !data || data.length === 0) break
+    for (const r of data) allRaw.push(String((r as any)[dateCol] ?? ""))
+    if (data.length < PAGE) break
+    page++
+  }
+  return [...new Set(allRaw.map(normDateStr))].filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1042,27 +1059,10 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
       setChainData(enriched)
       setDataSource("bhav")
       const hasOI = enriched.some(r => r.ce_oi != null || r.pe_oi != null)
-      setDebugMsg(`📊 Bhav data — ${enriched.length} strikes · expiry ${expiry}${hasOI ? " · OI ✓" : ""}`)
+      setDebugMsg(`📊 Live Bhav data — ${enriched.length} strikes${hasOI ? " · OI + Volume available" : " · no OI column in table"}`)
     } else {
-      // ── 2. Diagnose: show what expiries actually exist in the table ────────
-      const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
-      const { data: diagProbe } = await supabase.from(tableName).select("*").limit(2)
-      let diagMsg = `⚠ No bhav data for ${symbol} expiry=${expiry}.`
-      if (diagProbe && diagProbe.length > 0) {
-        const keys = Object.keys(diagProbe[0])
-        const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
-        const { data: sampleExpiries } = await supabase.from(tableName).select(expiryCol).limit(200)
-        if (sampleExpiries && sampleExpiries.length > 0) {
-          const uniq = [...new Set(sampleExpiries.map((r: any) => String(r[expiryCol] ?? "")))].slice(0, 8)
-          diagMsg += ` DB has expiry col="${expiryCol}", sample values: [${uniq.join(" | ")}]. Check format mismatch.`
-        }
-      } else {
-        diagMsg += " Table empty or unreachable."
-      }
-      setDebugMsg(diagMsg)
-
-      // ── 3. Fall back to Black-Scholes ─────────────────────────────────────
-      if (spot <= 0) { setLoading(false); setDataSource("none"); return }
+      // ── 2. Fall back to Black-Scholes when no bhav data ───────────────────
+      if (spot <= 0) { setLoading(false); setDataSource("none"); setDebugMsg("⚠ Enter or fetch spot price first"); return }
       const strikes = Array.from({ length: 21 }, (_, i) => atm - 10 * interval + i * interval).filter(s => s > 0)
       const synthetic: NormRow[] = strikes.map(strike => ({
         strike_price: strike,
@@ -1075,6 +1075,7 @@ function OptionChain({ userId, balance, positions, onTrade, spot, vix, symbol, e
       }))
       setChainData(synthetic)
       setDataSource("bs")
+      setDebugMsg("~Black-Scholes estimates (no bhav match for this expiry — check expiry date format in DB)")
     }
     setLoading(false)
   }
@@ -1482,8 +1483,17 @@ const PRESET_STRATEGIES = [
   },
 ]
 
-function StrategyBuilder({ userId, balance, spot, vix, symbol, onTrade }: {
-  userId: string; balance: number; spot: number; vix: number; symbol: string; onTrade: () => void
+// Wrapper that exposes current legs to parent for live payoff chart
+function StrategyBuilderWithLegs({ onLegsChange, ...props }: {
+  userId: string; balance: number; spot: number; vix: number; symbol: string
+  onTrade: () => void; onLegsChange: (legs: StrategyLeg[]) => void
+}) {
+  return <StrategyBuilder {...props} onLegsChange={onLegsChange} />
+}
+
+function StrategyBuilder({ userId, balance, spot, vix, symbol, onTrade, onLegsChange }: {
+  userId: string; balance: number; spot: number; vix: number; symbol: string
+  onTrade: () => void; onLegsChange?: (legs: StrategyLeg[]) => void
 }) {
   const [legs, setLegs] = useState<StrategyLeg[]>([])
   const [expiry, setExpiry] = useState(getWeeklyExpiries(symbol)[0] ?? "")
@@ -1495,6 +1505,9 @@ function StrategyBuilder({ userId, balance, spot, vix, symbol, onTrade }: {
   const lotSize = LOT_SIZES[symbol] ?? 75
   const dte = expiry ? daysToExpiry(expiry) : 30
   const move = spot > 0 && vix > 0 ? expectedMove(spot, vix, dte) : null
+
+  // Keep parent in sync for live payoff chart
+  useEffect(() => { onLegsChange?.(legs) }, [legs])
 
   function addLeg() {
     setLegs(prev => [...prev, {
@@ -1743,7 +1756,8 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
     const filteredDates = dates.filter(d => d >= fromDate)
 
     if (filteredDates.length === 0) {
-      setLoadMsg("⚠ No data found from this date. Check table name and date column.")
+      if (dates.length === 0) { setLoadMsg(`⚠ Table "${tableName}" empty or unreachable. Check Supabase RLS.`) }
+      else { setLoadMsg(`⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]}`) }
       setLoading(false); return
     }
 
@@ -1756,26 +1770,31 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
   }
 
   async function loadDateRows(date: string) {
-    // Probe schema to find actual date column name
-    const { data: probe } = await supabase.from(tableName).select("*").limit(1)
-    if (!probe || !probe.length) return
-    const keys = Object.keys(probe[0])
-    const dateCol   = keys.find(k => /^date$|^trade_date$|^timestamp$/i.test(k)) ?? "date"
-    const strikeCol = keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price"
+    const { dateCol, strikeCol } = await getBhavSchema(tableName)
+    const d = new Date(date + "T00:00:00")
+    const dd = String(d.getDate()).padStart(2,"0")
+    const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
+    const dateVariants = [date, date.replace(/-/g,""), `${dd}-${mon3}-${d.getFullYear()}`]
 
-    const { data } = await supabase
-      .from(tableName)
-      .select("*")
-      .eq(dateCol, date)
-      .order(strikeCol, { ascending: true })
-      .limit(500)
-
-    if (!data || data.length === 0) { setNormRows([]); return }
-
-    if (isNarrowFormat(data)) {
-      setNormRows(normaliseNarrowRows(data))
+    let rows: any[] | null = null
+    for (const dv of dateVariants) {
+      const { data, error } = await supabase
+        .from(tableName).select("*")
+        .eq(dateCol, dv)
+        .order(strikeCol, { ascending: true })
+        .limit(1000)
+      if (!error && data && data.length > 0) { rows = data; break }
+    }
+    if (!rows || rows.length === 0) {
+      const { data } = await supabase.from(tableName).select("*")
+        .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(1000)
+      rows = data && data.length > 0 ? data : null
+    }
+    if (!rows || rows.length === 0) { setNormRows([]); return }
+    if (isNarrowFormat(rows)) {
+      setNormRows(normaliseNarrowRows(rows))
     } else {
-      setNormRows(data.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price))
+      setNormRows(rows.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price))
     }
   }
 
@@ -2153,6 +2172,228 @@ function FuturePlays({ spot, vix, symbol }: { spot: number; vix: number; symbol:
 // TRADING DASHBOARD
 // ═════════════════════════════════════════════════════════════════════════════
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PAYOFF CHART  – SVG payoff diagram at expiry
+// ═════════════════════════════════════════════════════════════════════════════
+function PayoffChart({ legs, spot, vix, lotSize }: {
+  legs: StrategyLeg[]; spot: number; vix: number; lotSize: number
+}) {
+  if (legs.length === 0 || spot <= 0) return (
+    <div className="flex flex-col items-center justify-center h-full text-muted-foreground/50 gap-2">
+      <BarChart2 className="w-10 h-10 opacity-30" />
+      <p className="text-xs">Add legs to see payoff</p>
+    </div>
+  )
+
+  const interval = spot * 0.005  // 0.5% increments
+  const lo = spot * 0.85, hi = spot * 1.15
+  const pts: { x: number; y: number }[] = []
+
+  for (let s = lo; s <= hi; s += interval) {
+    let pnl = 0
+    for (const leg of legs) {
+      const intrinsic = leg.type === "CE" ? Math.max(0, s - leg.strike) : Math.max(0, leg.strike - s)
+      const sign = leg.action === "BUY" ? 1 : -1
+      pnl += sign * (intrinsic - leg.premium) * leg.lots * lotSize
+    }
+    pts.push({ x: s, y: pnl })
+  }
+
+  if (pts.length === 0) return null
+  const W = 400, H = 200, PAD = { t: 16, r: 16, b: 32, l: 60 }
+  const cW = W - PAD.l - PAD.r, cH = H - PAD.t - PAD.b
+  const minX = pts[0].x, maxX = pts[pts.length - 1].x
+  const pnls = pts.map(p => p.y)
+  const minY = Math.min(...pnls), maxY = Math.max(...pnls)
+  const rangeY = maxY - minY || 1
+
+  const toSvgX = (x: number) => PAD.l + ((x - minX) / (maxX - minX)) * cW
+  const toSvgY = (y: number) => PAD.t + ((maxY - y) / rangeY) * cH
+  const zeroY = toSvgY(0)
+
+  // Build path, split into profit (green) and loss (red) segments
+  const pathPts = pts.map(p => `${toSvgX(p.x).toFixed(1)},${toSvgY(p.y).toFixed(1)}`).join(" L ")
+  const spotX = toSvgX(spot)
+
+  // X axis labels
+  const xTicks = [lo, spot * 0.9, spot, spot * 1.1, hi]
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full" preserveAspectRatio="xMidYMid meet">
+      {/* Zero line */}
+      <line x1={PAD.l} x2={W - PAD.r} y1={zeroY} y2={zeroY} stroke="currentColor" strokeOpacity="0.15" strokeDasharray="4,3" />
+      {/* Payoff area fill */}
+      <defs>
+        <linearGradient id="profitGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#22c55e" stopOpacity="0.25" />
+          <stop offset="100%" stopColor="#22c55e" stopOpacity="0.0" />
+        </linearGradient>
+        <linearGradient id="lossGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#ef4444" stopOpacity="0.0" />
+          <stop offset="100%" stopColor="#ef4444" stopOpacity="0.25" />
+        </linearGradient>
+        <clipPath id="aboveZero"><rect x={PAD.l} y={PAD.t} width={cW} height={zeroY - PAD.t} /></clipPath>
+        <clipPath id="belowZero"><rect x={PAD.l} y={zeroY} width={cW} height={H - PAD.b - zeroY} /></clipPath>
+      </defs>
+      {/* Profit fill */}
+      <polyline points={`${PAD.l},${zeroY} ${pathPts} ${W - PAD.r},${zeroY}`}
+        fill="url(#profitGrad)" stroke="none" clipPath="url(#aboveZero)" />
+      {/* Loss fill */}
+      <polyline points={`${PAD.l},${zeroY} ${pathPts} ${W - PAD.r},${zeroY}`}
+        fill="url(#lossGrad)" stroke="none" clipPath="url(#belowZero)" />
+      {/* Main line – profit part */}
+      <polyline points={pathPts} fill="none" stroke="#22c55e" strokeWidth="2" clipPath="url(#aboveZero)" />
+      {/* Main line – loss part */}
+      <polyline points={pathPts} fill="none" stroke="#ef4444" strokeWidth="2" clipPath="url(#belowZero)" />
+      {/* Spot vertical */}
+      <line x1={spotX} x2={spotX} y1={PAD.t} y2={H - PAD.b} stroke="#6366f1" strokeWidth="1.5" strokeDasharray="3,3" />
+      <text x={spotX} y={PAD.t - 3} textAnchor="middle" fontSize="8" fill="#6366f1" fontWeight="bold">{Math.round(spot)}</text>
+      {/* X-axis ticks */}
+      {xTicks.map((v, i) => (
+        <g key={i}>
+          <text x={toSvgX(v)} y={H - PAD.b + 10} textAnchor="middle" fontSize="7.5" fill="currentColor" fillOpacity="0.5">{Math.round(v / 100) * 100}</text>
+        </g>
+      ))}
+      {/* Y-axis — max profit / max loss */}
+      <text x={PAD.l - 4} y={PAD.t + 4} textAnchor="end" fontSize="7.5" fill="#22c55e">{maxY >= 0 ? "+" : ""}{Math.round(maxY / 1000)}K</text>
+      <text x={PAD.l - 4} y={H - PAD.b} textAnchor="end" fontSize="7.5" fill="#ef4444">{Math.round(minY / 1000)}K</text>
+    </svg>
+  )
+}
+
+// ─── Right-panel: Payoff + MTM + greeks summary ───────────────────────────────
+function RightPanel({ legs, spot, vix, symbol, positions, livePrices, balance }: {
+  legs: StrategyLeg[]; spot: number; vix: number; symbol: string
+  positions: any[]; livePrices: Record<string, number>; balance: number
+}) {
+  const lotSize   = LOT_SIZES[symbol] ?? 75
+  const interval  = getStrikeInterval(symbol)
+  const atm       = spot > 0 ? Math.round(spot / interval) * interval : 0
+  const expiry    = legs[0]?.expiry ?? ""
+  const dte       = expiry ? daysToExpiry(expiry) : 30
+
+  // Net premium
+  const netPremium = legs.reduce((s, l) => {
+    const sign = l.action === "BUY" ? -1 : 1
+    return s + sign * l.premium * l.lots * lotSize
+  }, 0)
+
+  // Portfolio Greeks
+  const netDelta = legs.reduce((s, l) => {
+    if (!l.type || l.type === "FUTURES") return s
+    const g = calcGreeks(spot, l.strike, dte / 365, 0.065, vix / 100, l.type as OptionType)
+    return s + (l.action === "BUY" ? 1 : -1) * g.delta * l.lots * lotSize
+  }, 0)
+  const netTheta = legs.reduce((s, l) => {
+    if (!l.type || l.type === "FUTURES") return s
+    const g = calcGreeks(spot, l.strike, dte / 365, 0.065, vix / 100, l.type as OptionType)
+    return s + (l.action === "BUY" ? 1 : -1) * g.theta * l.lots * lotSize
+  }, 0)
+  const netVega = legs.reduce((s, l) => {
+    if (!l.type || l.type === "FUTURES") return s
+    const g = calcGreeks(spot, l.strike, dte / 365, 0.065, vix / 100, l.type as OptionType)
+    return s + (l.action === "BUY" ? 1 : -1) * g.vega * l.lots * lotSize
+  }, 0)
+
+  // Live MTM of open positions
+  const totalPnL = positions.reduce((s, p) => {
+    const entryP = p.avg_price ?? p.entry_price
+    const ltp = livePrices[`${p.symbol}__${p.instrument}`] ?? p.current_price ?? entryP
+    const raw = p.trade_type === "BUY" ? (ltp - entryP) * p.quantity : (entryP - ltp) * p.quantity
+    return s + raw
+  }, 0)
+
+  // Expected move
+  const move = spot > 0 && vix > 0 ? expectedMove(spot, vix, dte) : null
+
+  return (
+    <div className="flex flex-col gap-3 h-full">
+      {/* Payoff chart */}
+      <div className="bg-card border border-border rounded-xl p-3 flex-shrink-0">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs font-bold text-foreground flex items-center gap-1.5">
+            <BarChart2 className="w-3.5 h-3.5 text-primary" /> Payoff at Expiry
+          </span>
+          {legs.length > 0 && (
+            <span className={`text-[11px] font-mono font-bold ${netPremium >= 0 ? "text-success" : "text-destructive"}`}>
+              {netPremium >= 0 ? "Credit" : "Debit"}: {fmt(Math.abs(netPremium))}
+            </span>
+          )}
+        </div>
+        <div className="h-44 text-foreground">
+          <PayoffChart legs={legs} spot={spot} vix={vix} lotSize={lotSize} />
+        </div>
+        {move && (
+          <div className="flex items-center justify-center gap-2 mt-1 text-[10px] text-muted-foreground">
+            <span>Expected range:</span>
+            <span className="font-mono text-destructive">{fmtN(move.down)}</span>
+            <span className="font-mono text-muted-foreground">↔</span>
+            <span className="font-mono text-success">{fmtN(move.up)}</span>
+            <span className="text-primary font-semibold">±{move.pct.toFixed(1)}%</span>
+          </div>
+        )}
+      </div>
+
+      {/* Live MTM */}
+      <div className={`border rounded-xl p-3 flex-shrink-0 ${totalPnL >= 0 ? "bg-success/5 border-success/30" : "bg-destructive/5 border-destructive/30"}`}>
+        <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-1 flex items-center gap-1.5">
+          <Activity className="w-3 h-3" /> Live MTM (Open Positions)
+        </div>
+        <div className={`text-2xl font-mono font-bold flex items-center gap-2 ${totalPnL >= 0 ? "text-success" : "text-destructive"}`}>
+          {totalPnL >= 0 ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
+          {totalPnL >= 0 ? "+" : ""}{fmt(totalPnL)}
+        </div>
+        <div className="text-[10px] text-muted-foreground mt-1">{positions.length} open position{positions.length !== 1 ? "s" : ""} · Cash: {fmt(balance)}</div>
+      </div>
+
+      {/* Greeks summary */}
+      {legs.length > 0 && (
+        <div className="bg-card border border-border rounded-xl p-3 flex-shrink-0">
+          <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-2">Strategy Greeks</div>
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { label: "Δ Delta", value: netDelta.toFixed(2), color: Math.abs(netDelta) > 50 ? "text-warning" : "text-foreground" },
+              { label: "Θ Theta/d", value: fmt(netTheta), color: netTheta < 0 ? "text-destructive" : "text-success" },
+              { label: "ν Vega", value: netVega.toFixed(1), color: "text-foreground" },
+            ].map(g => (
+              <div key={g.label} className="bg-muted rounded-lg p-2 text-center">
+                <div className="text-[10px] text-muted-foreground">{g.label}</div>
+                <div className={`font-mono font-bold text-sm ${g.color}`}>{g.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Position summary cards */}
+      {positions.length > 0 && (
+        <div className="bg-card border border-border rounded-xl p-3 flex-1 overflow-y-auto min-h-0">
+          <div className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-2">Open Positions</div>
+          <div className="space-y-1.5">
+            {positions.map(p => {
+              const entryP = p.avg_price ?? p.entry_price
+              const ltp = livePrices[`${p.symbol}__${p.instrument}`] ?? p.current_price ?? entryP
+              const pnl = p.trade_type === "BUY" ? (ltp - entryP) * p.quantity : (entryP - ltp) * p.quantity
+              return (
+                <div key={p.id} className={`flex items-center justify-between rounded-lg px-2.5 py-2 ${pnl >= 0 ? "bg-success/5 border border-success/20" : "bg-destructive/5 border border-destructive/20"}`}>
+                  <div>
+                    <div className="text-[11px] font-bold text-foreground">{p.symbol} {p.instrument === "OPTIONS" ? `${p.strike_price}${p.option_type}` : p.instrument}</div>
+                    <div className="text-[9px] text-muted-foreground">{p.trade_type} · {fmtN(p.quantity)} qty · ₹{fmtN(entryP)} avg</div>
+                  </div>
+                  <div className={`font-mono font-bold text-xs ${pnl >= 0 ? "text-success" : "text-destructive"}`}>
+                    {pnl >= 0 ? "+" : ""}{fmt(pnl)}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function TradingDashboard({ userId }: { userId: string }) {
   const [balance,    setBalance]    = useState(0)
   const [positions,  setPositions]  = useState<any[]>([])
@@ -2170,6 +2411,7 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [vix,          setVix]          = useState(15)
   const [chainSymbol,  setChainSymbol]  = useState("NIFTY")
   const [chainExpiry,  setChainExpiry]  = useState(getThursdaysForNext3Months()[0] ?? "")
+  const [strategyLegs,  setStrategyLegs]  = useState<StrategyLeg[]>([])
   const [expiryPopup,          setExpiryPopup]          = useState<any[] | null>(null)
   const [autoPlayShowNewSession, setAutoPlayShowNewSession] = useState(false)
   const positionsRef    = useRef<any[]>([])
@@ -2647,51 +2889,70 @@ function TradingDashboard({ userId }: { userId: string }) {
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="flex gap-1 bg-muted/50 border border-border p-1 rounded-xl mb-5 overflow-x-auto">
-        {tabs.map(({ key, label, icon: Icon, badge }) => (
-          <button key={key} onClick={() => setTab(key)}
-            className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg transition-colors whitespace-nowrap ${tab === key ? "bg-card shadow-sm text-primary" : "text-muted-foreground hover:text-foreground"}`}>
-            <Icon className="w-3.5 h-3.5" />
-            {label}
-            {badge != null && badge > 0 && (
-              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${tab === key ? "bg-primary/10 text-primary" : "bg-muted-foreground/20 text-muted-foreground"}`}>{badge}</span>
-            )}
-          </button>
-        ))}
+      {/* ── Main split layout ── */}
+      {/* Left panel tabs: chain / strategy / replay / future */}
+      {/* Right panel: always visible payoff + MTM + greeks  */}
+
+      {/* Tab bar — only for left-panel tabs */}
+      <div className="flex items-center gap-1 mb-3 overflow-x-auto">
+        <div className="flex gap-1 bg-muted/50 border border-border p-1 rounded-xl">
+          {tabs.filter(t => ["chain","strategy","replay","future"].includes(t.key)).map(({ key, label, icon: Icon }) => (
+            <button key={key} onClick={() => setTab(key)}
+              className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg transition-colors whitespace-nowrap ${tab === key ? "bg-card shadow-sm text-primary" : "text-muted-foreground hover:text-foreground"}`}>
+              <Icon className="w-3.5 h-3.5" />{label}
+            </button>
+          ))}
+        </div>
+        {/* Right-side tabs: positions / history / ledger */}
+        <div className="flex gap-1 bg-muted/50 border border-border p-1 rounded-xl ml-auto">
+          {tabs.filter(t => ["positions","history","ledger"].includes(t.key)).map(({ key, label, icon: Icon, badge }) => (
+            <button key={key} onClick={() => setTab(key)}
+              className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg transition-colors whitespace-nowrap ${tab === key ? "bg-card shadow-sm text-primary" : "text-muted-foreground hover:text-foreground"}`}>
+              <Icon className="w-3.5 h-3.5" />{label}
+              {badge != null && badge > 0 && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">{badge}</span>}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Live price status bar */}
-      <div className="flex items-center gap-2 mb-4 text-[10px] text-muted-foreground">
+      <div className="flex items-center gap-2 mb-3 text-[10px] text-muted-foreground">
         <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${fetching ? "bg-warning animate-pulse" : priceTs ? "bg-success" : "bg-muted-foreground"}`} />
-        {fetching ? "Fetching live prices…" : priceTs ? `Prices updated ${priceTs.toLocaleTimeString("en-IN")} · auto-refresh every 30s` : "Click refresh to load prices"}
-        {isAutoPlay && (
-          <span className="ml-2 text-success font-semibold animate-pulse">
-            ● Auto-play active · simulating day {autoPlayIdxRef.current} of {autoPlayDatesRef.current.length} · expiry check running
-          </span>
-        )}
+        {fetching ? "Fetching…" : priceTs ? `Updated ${priceTs.toLocaleTimeString("en-IN")}` : "Click refresh"}
+        {isAutoPlay && <span className="ml-2 text-success font-semibold animate-pulse">● Auto-play day {autoPlayIdxRef.current}/{autoPlayDatesRef.current.length}</span>}
       </div>
 
-      {/* Tab content */}
-      {tab === "chain" && (
-        <OptionChain
-          userId={userId} balance={balance} positions={positions} onTrade={load}
-          spot={spot} vix={vix} symbol={chainSymbol} expiry={chainExpiry}
-          onExpiryChange={setChainExpiry} onSymbolChange={s => { setChainSymbol(s); setSpot(0) }}
-        />
-      )}
+      {/* ── SPLIT SCREEN: left content + right payoff panel ── */}
+      {["chain","strategy","replay","future"].includes(tab) ? (
+        <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4 items-start">
+          {/* LEFT: active tab content */}
+          <div className="min-w-0">
+            {tab === "chain" && (
+              <OptionChain
+                userId={userId} balance={balance} positions={positions} onTrade={load}
+                spot={spot} vix={vix} symbol={chainSymbol} expiry={chainExpiry}
+                onExpiryChange={setChainExpiry} onSymbolChange={s => { setChainSymbol(s); setSpot(0) }}
+              />
+            )}
+            {tab === "strategy" && (
+              <StrategyBuilderWithLegs
+                userId={userId} balance={balance} spot={spot} vix={vix}
+                symbol={chainSymbol} onTrade={load} onLegsChange={setStrategyLegs}
+              />
+            )}
+            {tab === "replay" && <ReplayPanel symbol={chainSymbol} vix={vix} />}
+            {tab === "future" && <FuturePlays spot={spot} vix={vix} symbol={chainSymbol} />}
+          </div>
 
-      {tab === "strategy" && (
-        <StrategyBuilder userId={userId} balance={balance} spot={spot} vix={vix} symbol={chainSymbol} onTrade={load} />
-      )}
-
-      {tab === "replay" && (
-        <ReplayPanel symbol={chainSymbol} vix={vix} />
-      )}
-
-      {tab === "future" && (
-        <FuturePlays spot={spot} vix={vix} symbol={chainSymbol} />
-      )}
+          {/* RIGHT: always-on payoff + MTM */}
+          <div className="xl:sticky xl:top-4">
+            <RightPanel
+              legs={strategyLegs} spot={spot} vix={vix} symbol={chainSymbol}
+              positions={positions} livePrices={livePrices} balance={balance}
+            />
+          </div>
+        </div>
+      ) : null}
 
       {tab === "positions" && (
         positions.length === 0 ? (
