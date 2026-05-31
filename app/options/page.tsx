@@ -597,40 +597,50 @@ const _schemaCache: Record<string, { dateCol: string; strikeCol: string; expiryC
 
 async function getBhavSchema(tableName: string) {
   if (_schemaCache[tableName]) return _schemaCache[tableName]
-  const { data: probe, error: probeErr } = await supabase.from(tableName).select("*").limit(1)
+  const { data: probe, error: probeErr } = await supabase.from(tableName).select("*").limit(3)
 
   if (probeErr) {
-    // Surface the real Supabase error so it propagates up
-    const msg = probeErr.message ?? JSON.stringify(probeErr)
-    throw new Error(`Supabase error on "${tableName}": ${msg}`)
+    throw new Error(`Supabase error on "${tableName}": ${probeErr.message ?? JSON.stringify(probeErr)}`)
   }
-
   if (!probe || !probe.length) return { dateCol: "date", strikeCol: "strike_price", expiryCol: "expiry_date" }
+
   const keys = Object.keys(probe[0])
   const sampleRow = probe[0]
 
-  // ── date column: broad regex first, then value-based fallback ─────────────
-  let dateCol = keys.find(k =>
-    /^(date|trade_date|timestamp|trading_date|trd_dt|trd_date|bhav_date|record_date|mkt_date|dt|exch_date|series_date|data_dt|data_date)$/i.test(k)
-  )
-  // If the strict regex didn't find it, try any key whose value looks like a date
+  // ── expiry column first (so we can EXCLUDE it from date search) ─────────────
+  const expiryCol = keys.find(k => /expiry/i.test(k)) ?? "expiry_date"
+
+  // ── date column: MUST NOT be the expiry column ──────────────────────────────
+  // Priority 1: exact well-known trading-date names
+  const KNOWN_DATE_COLS = /^(date|trade_date|trd_date|trd_dt|trading_date|bhav_date|record_date|mkt_date|exch_date|data_date|data_dt|timestamp|created_at)$/i
+  let dateCol = keys.filter(k => k !== expiryCol).find(k => KNOWN_DATE_COLS.test(k))
+
+  // Priority 2: any key (not expiry) whose sample VALUE looks like a trading date
+  // We look across multiple probe rows and pick the one where values are DIFFERENT
+  // (expiry dates repeat a lot; trading dates change every row on the 2nd+ row)
   if (!dateCol) {
-    dateCol = keys.find(k => {
-      const v = String(sampleRow[k] ?? "")
-      return /^\d{4}-\d{2}-\d{2}/.test(v) ||  // YYYY-MM-DD
-             /^\d{1,2}-[A-Za-z]{3}-\d{2,4}$/.test(v) ||  // DD-MMM-YYYY
-             /^\d{2}\/\d{2}\/\d{4}$/.test(v)   // DD/MM/YYYY
-    })
+    const candidateCols = keys.filter(k => k !== expiryCol)
+    for (const k of candidateCols) {
+      const vals = probe.map(r => String(r[k] ?? ""))
+      // Must look like a date
+      if (!/^\d{4}-\d{2}-\d{2}/.test(vals[0]) && !/^\d{1,2}-[A-Za-z]{3}-\d{2,4}$/.test(vals[0])) continue
+      // If multiple probe rows, the trading-date col should have DIFFERENT values per row (since rows span different dates)
+      // But bhav is per-expiry-per-strike so actually trading date IS the same for all rows of one day.
+      // Just pick first date-looking non-expiry col.
+      dateCol = k
+      break
+    }
   }
-  // Last resort: pick anything with "date" or "dt" in the name
+
+  // Priority 3: anything with "date" or "dt" NOT containing "expiry"
   if (!dateCol) {
-    dateCol = keys.find(k => /date|dt$/i.test(k))
+    dateCol = keys.filter(k => k !== expiryCol).find(k => /date|_dt$/i.test(k) && !/expiry/i.test(k))
   }
 
   const schema = {
     dateCol:   dateCol ?? "date",
     strikeCol: keys.find(k => /strike/i.test(k) && !/no|num/i.test(k)) ?? "strike_price",
-    expiryCol: keys.find(k => /expiry/i.test(k)) ?? "expiry_date",
+    expiryCol,
   }
   _schemaCache[tableName] = schema
   return schema
@@ -1844,49 +1854,73 @@ const REPLAY_START_DATES: Record<string, string> = {
   BANKNIFTY: "2025-01-02",
 }
 
-function ReplayPanel({ symbol, vix, onReplayStep }: {
+// ─── Replay trade type ────────────────────────────────────────────────────────
+type ReplayPosition = {
+  id: string
+  strike: number
+  optType: "CE" | "PE"
+  action: "BUY" | "SELL"
+  lots: number
+  entryPremium: number
+  entryDate: string
+  expiry: string
+  currentPremium: number
+}
+
+function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
   symbol: string
   vix: number
   onReplayStep: (rows: NormRow[], date: string, spot: number) => void
+  userId: string
 }) {
-  // Independent symbol switcher — NIFTY or BANKNIFTY regardless of chain selector
-  const initSym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
-  const [replaySym, setReplaySym] = useState<"NIFTY"|"BANKNIFTY">(initSym as "NIFTY"|"BANKNIFTY")
-  const [fromDate, setFromDate] = useState(REPLAY_START_DATES[initSym])
+  const initSym = (["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY") as "NIFTY"|"BANKNIFTY"
+  const [replaySym,   setReplaySym]   = useState<"NIFTY"|"BANKNIFTY">(initSym)
+  const [fromDate,    setFromDate]    = useState(REPLAY_START_DATES[initSym])
   const [currentDate, setCurrentDate] = useState(REPLAY_START_DATES[initSym])
-  const [isPlaying, setIsPlaying] = useState(false)
-  const [speed, setSpeed] = useState(1000)
-  const [allDates, setAllDates] = useState<string[]>([])
-  const [normRows, setNormRows] = useState<NormRow[]>([])
-  const [replaySpot, setReplaySpot] = useState(0)
-  const [loading, setLoading] = useState(false)
-  const [loadMsg, setLoadMsg] = useState("")
-  const [debugInfo, setDebugInfo] = useState<string | null>(null)
-  const intervalRef = useRef<NodeJS.Timeout | null>(null)
-  const prefetchCache = useRef<Record<string, NormRow[]>>({})
+  const [isPlaying,   setIsPlaying]   = useState(false)
+  const [speed,       setSpeed]       = useState(1200)
+  const [allDates,    setAllDates]    = useState<string[]>([])
+  const [normRows,    setNormRows]    = useState<NormRow[]>([])
+  const [replaySpot,  setReplaySpot]  = useState(0)
+  const [replayVix,   setReplayVix]   = useState(liveVix || 15)
+  const [loading,     setLoading]     = useState(false)
+  const [loadMsg,     setLoadMsg]     = useState("")
+  const [debugInfo,   setDebugInfo]   = useState<string | null>(null)
+  const [selectedExpiry, setSelectedExpiry] = useState("")
+  const [expiries,    setExpiries]    = useState<string[]>([])
+  const [positions,   setPositions]   = useState<ReplayPosition[]>([])
+  const [closedPnl,   setClosedPnl]   = useState(0)
+  const [tradeMsg,    setTradeMsg]    = useState("")
+  const intervalRef     = useRef<NodeJS.Timeout | null>(null)
+  const prefetchCache   = useRef<Record<string, NormRow[]>>({})
+  const allDatesRef     = useRef<string[]>([])
+  const currentIdxRef   = useRef(0)
   const tableName = replaySym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+  const lotSize   = LOT_SIZES[replaySym] ?? 75
+  const interval  = getStrikeInterval(replaySym)
 
-  // When symbol switcher changes, reset state and update default start date
   function switchReplaySym(sym: "NIFTY"|"BANKNIFTY") {
     if (intervalRef.current) clearInterval(intervalRef.current)
     setIsPlaying(false)
     setReplaySym(sym)
     setFromDate(REPLAY_START_DATES[sym])
     setCurrentDate(REPLAY_START_DATES[sym])
-    setAllDates([])
-    setNormRows([])
-    setReplaySpot(0)
-    setLoadMsg("")
-    setDebugInfo(null)
+    setAllDates([]); allDatesRef.current = []
+    setNormRows([]); setReplaySpot(0)
+    setLoadMsg(""); setDebugInfo(null)
+    setExpiries([]); setSelectedExpiry("")
+    setPositions([]); setClosedPnl(0)
     prefetchCache.current = {}
     delete _schemaCache[sym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"]
   }
 
+  // ── Data fetching ────────────────────────────────────────────────────────
   async function fetchRowsForDate(date: string): Promise<NormRow[]> {
-    // Return from prefetch cache if available
     if (prefetchCache.current[date]) return prefetchCache.current[date]
+    let schema: { dateCol: string; strikeCol: string; expiryCol: string }
+    try { schema = await getBhavSchema(tableName) } catch { return [] }
+    const { dateCol, strikeCol } = schema
 
-    const { dateCol, strikeCol } = await getBhavSchema(tableName)
     const d = new Date(date + "T00:00:00")
     const dd = String(d.getDate()).padStart(2,"0")
     const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
@@ -1894,265 +1928,455 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
 
     let rows: any[] | null = null
     for (const dv of dateVariants) {
-      const { data, error } = await supabase
-        .from(tableName).select("*")
-        .eq(dateCol, dv)
-        .order(strikeCol, { ascending: true })
-        .limit(1000)
+      const { data, error } = await supabase.from(tableName).select("*")
+        .eq(dateCol, dv).order(strikeCol, { ascending: true }).limit(2000)
       if (!error && data && data.length > 0) { rows = data; break }
     }
     if (!rows || rows.length === 0) {
       const { data } = await supabase.from(tableName).select("*")
-        .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(1000)
+        .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(2000)
       rows = data && data.length > 0 ? data : null
     }
     if (!rows || rows.length === 0) return []
 
     const normalised = isNarrowFormat(rows)
       ? normaliseNarrowRows(rows)
-      : rows.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
-
+      : rows.map(normaliseWideRow).sort((a,b) => a.strike_price - b.strike_price)
     prefetchCache.current[date] = normalised
     return normalised
   }
 
   async function loadBhav() {
-    setLoading(true)
-    setLoadMsg("")
-    prefetchCache.current = {}
+    setLoading(true); setLoadMsg(""); prefetchCache.current = {}
+    delete _schemaCache[tableName]
 
-    const { dates, error: fetchError } = await fetchBhavDates(replaySym)
-
-    // Show schema debug info for troubleshooting
-    const cachedSchema = _schemaCache[tableName]
-    if (cachedSchema) {
-      setDebugInfo(`Table: ${tableName} | dateCol: "${cachedSchema.dateCol}" | strikeCol: "${cachedSchema.strikeCol}" | expiryCol: "${cachedSchema.expiryCol}"`)
+    // ── Step 1: probe table to confirm access + detect schema ──────────────
+    let schema: { dateCol: string; strikeCol: string; expiryCol: string }
+    try {
+      schema = await getBhavSchema(tableName)
+    } catch (e: any) {
+      setLoadMsg(`⚠ ${e.message}`)
+      setLoading(false); return
     }
+    setDebugInfo(`Table: ${tableName} | dateCol: "${schema.dateCol}" | expiryCol: "${schema.expiryCol}" | strikeCol: "${schema.strikeCol}"`)
 
+    // ── Step 2: get all unique trading dates ────────────────────────────────
+    const { dates, error: fetchError } = await fetchBhavDates(replaySym)
     if (fetchError && dates.length === 0) {
-      // Give actionable RLS fix instructions
-      const isRLS = fetchError.toLowerCase().includes("rls") || fetchError.toLowerCase().includes("row") || fetchError.toLowerCase().includes("policy") || fetchError.includes("empty")
-      if (isRLS || fetchError.includes("empty")) {
-        setLoadMsg(`⚠ ${fetchError} → In Supabase: go to Table Editor → "${tableName}" → RLS → Add Policy → SELECT → USING (true)`)
-      } else {
-        setLoadMsg(`⚠ ${fetchError}`)
-      }
+      setLoadMsg(`⚠ ${fetchError}`)
       setLoading(false); return
     }
 
     const filteredDates = dates.filter(d => d >= fromDate)
-
     if (filteredDates.length === 0) {
-      if (dates.length === 0) {
-        setLoadMsg(fetchError ?? `Table "${tableName}" returned no dates. Fix RLS: Supabase → Table Editor → "${tableName}" → RLS → Add SELECT policy → USING (true)`)
-      } else {
-        setLoadMsg(`⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]} — try changing Start Date`)
-      }
+      setLoadMsg(dates.length === 0
+        ? `⚠ No dates found in table. Check RLS policy on "${tableName}".`
+        : `⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]} — change Start Date`)
       setLoading(false); return
     }
 
-    setAllDates(filteredDates)
+    setAllDates(filteredDates); allDatesRef.current = filteredDates
+
+    // ── Step 3: load first date & derive expiries ───────────────────────────
     const firstDate = filteredDates[0]
+    currentIdxRef.current = 0
     setCurrentDate(firstDate)
-    await loadDateRows(firstDate)
-    setLoadMsg(`✅ Loaded ${filteredDates.length} trading days`)
+    const rows = await fetchRowsForDate(firstDate)
+    applyDateRows(rows, firstDate)
+
+    // derive available expiries from data
+    const expirySet = [...new Set(rows.map(r => r.expiry_date).filter(Boolean))].sort()
+    setExpiries(expirySet)
+    if (expirySet.length > 0 && !selectedExpiry) setSelectedExpiry(expirySet[0])
+
+    setLoadMsg(`✅ Loaded ${filteredDates.length} trading days (${firstDate} → ${filteredDates[filteredDates.length-1]})`)
     setLoading(false)
   }
 
-  async function loadDateRows(date: string) {
-    const rows = await fetchRowsForDate(date)
+  function applyDateRows(rows: NormRow[], date: string) {
     const spot = deriveSpotFromRows(rows, replaySym)
     setNormRows(rows)
     setReplaySpot(spot)
     onReplayStep(rows, date, spot)
 
-    // Prefetch next 3 dates silently in background
-    const idx = allDates.indexOf(date)
-    for (let i = 1; i <= 3; i++) {
-      const nextDate = allDates[idx + i]
-      if (nextDate && !prefetchCache.current[nextDate]) {
-        fetchRowsForDate(nextDate).catch(() => {})
-      }
+    // Update positions with current premiums
+    if (rows.length > 0) {
+      setPositions(prev => prev.map(pos => {
+        const row = rows.find(r => r.strike_price === pos.strike)
+        const curPrem = pos.optType === "CE" ? row?.ce_ltp : row?.pe_ltp
+        return { ...pos, currentPremium: curPrem ?? pos.currentPremium }
+      }))
     }
   }
 
-  const currentIdxRef = useRef(0)
-
-  function stepTo(date: string) {
-    const idx = allDates.indexOf(date)
-    currentIdxRef.current = idx >= 0 ? idx : currentIdxRef.current
+  async function stepTo(date: string) {
+    const idx = allDatesRef.current.indexOf(date)
+    if (idx >= 0) currentIdxRef.current = idx
     setCurrentDate(date)
-    loadDateRows(date)
+    const rows = await fetchRowsForDate(date)
+    applyDateRows(rows, date)
+    // Prefetch next 3
+    for (let i = 1; i <= 3; i++) {
+      const nd = allDatesRef.current[idx + i]
+      if (nd && !prefetchCache.current[nd]) fetchRowsForDate(nd).catch(() => {})
+    }
   }
 
   function togglePlay() {
     if (isPlaying) {
       if (intervalRef.current) clearInterval(intervalRef.current)
       setIsPlaying(false)
-    } else {
-      currentIdxRef.current = allDates.indexOf(currentDate)
-      setIsPlaying(true)
-      intervalRef.current = setInterval(() => {
-        currentIdxRef.current++
-        if (currentIdxRef.current >= allDates.length) {
-          if (intervalRef.current) clearInterval(intervalRef.current)
-          setIsPlaying(false)
-          return
-        }
-        const nextDate = allDates[currentIdxRef.current]
-        setCurrentDate(nextDate)
-        loadDateRows(nextDate)
-      }, speed)
+      return
     }
+    currentIdxRef.current = allDatesRef.current.indexOf(currentDate)
+    setIsPlaying(true)
+    intervalRef.current = setInterval(async () => {
+      currentIdxRef.current++
+      const dates = allDatesRef.current
+      if (currentIdxRef.current >= dates.length) {
+        clearInterval(intervalRef.current!); setIsPlaying(false); return
+      }
+      // Auto-stop at expiry
+      if (selectedExpiry && dates[currentIdxRef.current] > selectedExpiry) {
+        clearInterval(intervalRef.current!); setIsPlaying(false)
+        setTradeMsg("⏹ Reached expiry date — auto-play stopped")
+        return
+      }
+      const nd = dates[currentIdxRef.current]
+      setCurrentDate(nd)
+      const rows = await fetchRowsForDate(nd)
+      applyDateRows(rows, nd)
+    }, speed)
   }
 
-  useEffect(() => {
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
-  }, [])
+  useEffect(() => () => { if (intervalRef.current) clearInterval(intervalRef.current) }, [])
 
+  // ── Greeks helper (BS) ───────────────────────────────────────────────────
+  function getGreeks(strike: number, optType: "CE"|"PE", expiry: string) {
+    if (replaySpot <= 0 || !expiry) return { delta: 0, theta: 0, iv: replayVix/100 }
+    const T = Math.max((new Date(expiry+"T15:30:00").getTime() - new Date(currentDate+"T09:15:00").getTime()) / (365*24*3600*1000), 0)
+    const iv = replayVix > 0 ? replayVix/100 : 0.15
+    return calcGreeks(replaySpot, strike, T, 0.065, iv, optType)
+  }
+
+  // ── Premium helper: bhav first, fallback to BS ────────────────────────────
+  function getPremium(row: NormRow, optType: "CE"|"PE"): number {
+    const raw = optType === "CE" ? row.ce_ltp : row.pe_ltp
+    if (raw != null && raw > 0) return raw
+    const g = getGreeks(row.strike_price, optType, selectedExpiry || row.expiry_date)
+    return calcOptionPremium(replaySpot, row.strike_price, selectedExpiry || row.expiry_date, optType, g.iv)
+  }
+
+  // ── Trade helpers ────────────────────────────────────────────────────────
+  function placeTrade(row: NormRow, optType: "CE"|"PE", action: "BUY"|"SELL") {
+    if (!selectedExpiry) { setTradeMsg("⚠ Select an expiry first"); return }
+    const premium = getPremium(row, optType)
+    if (premium <= 0) { setTradeMsg("⚠ No premium available"); return }
+    const pos: ReplayPosition = {
+      id: `${Date.now()}_${row.strike_price}_${optType}`,
+      strike: row.strike_price, optType, action, lots: 1,
+      entryPremium: premium, entryDate: currentDate,
+      expiry: selectedExpiry, currentPremium: premium,
+    }
+    setPositions(prev => [...prev, pos])
+    setTradeMsg(`✅ ${action} ${row.strike_price}${optType} @ ₹${fmtN(premium)}`)
+    setTimeout(() => setTradeMsg(""), 2500)
+  }
+
+  function closePosition(pos: ReplayPosition) {
+    const row = normRows.find(r => r.strike_price === pos.strike)
+    const exitPremium = row ? getPremium(row, pos.optType) : pos.currentPremium
+    const diff = pos.action === "BUY" ? exitPremium - pos.entryPremium : pos.entryPremium - exitPremium
+    const pnl = Math.round(diff * pos.lots * lotSize * 100) / 100
+    setClosedPnl(prev => prev + pnl)
+    setPositions(prev => prev.filter(p => p.id !== pos.id))
+    setTradeMsg(`${pnl >= 0 ? "✅" : "🔴"} Closed ${pos.strike}${pos.optType}: P&L ₹${fmtN(pnl)}`)
+    setTimeout(() => setTradeMsg(""), 3000)
+  }
+
+  // ── Computed values ──────────────────────────────────────────────────────
   const currentIdx = allDates.indexOf(currentDate)
+  const atm = replaySpot > 0 ? Math.round(replaySpot / interval) * interval : 0
+  const daysLeft = selectedExpiry
+    ? Math.max(0, Math.round((new Date(selectedExpiry+"T00:00:00").getTime() - new Date(currentDate+"T00:00:00").getTime()) / (86400000)))
+    : 0
+
+  // Filter rows by selected expiry and show ±10 strikes around ATM
+  const displayRows = normRows.filter(r => !selectedExpiry || !r.expiry_date || r.expiry_date === selectedExpiry || normDateStr(r.expiry_date) === selectedExpiry)
+  const nearATM = atm > 0
+    ? displayRows.filter(r => Math.abs(r.strike_price - atm) <= 10 * interval)
+    : displayRows.slice(0, 21)
+  const rowsToShow = nearATM.length > 0 ? nearATM : displayRows.slice(0, 21)
+
+  // Open P&L
+  const openPnl = positions.reduce((sum, pos) => {
+    const diff = pos.action === "BUY" ? pos.currentPremium - pos.entryPremium : pos.entryPremium - pos.currentPremium
+    return sum + diff * pos.lots * lotSize
+  }, 0)
+  const totalPnl = openPnl + closedPnl
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
+      {/* ── Header: symbol switcher + controls ── */}
       <div className="bg-card border border-border rounded-xl p-4">
-        <div className="flex items-center gap-2 mb-3">
-          <Clock className="w-4 h-4 text-primary" />
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
+          <Clock className="w-4 h-4 text-primary shrink-0" />
           <span className="text-sm font-bold text-foreground">Historical Replay</span>
-          {/* Independent NIFTY / BANKNIFTY switcher */}
-          <div className="flex gap-1 ml-2">
+          <div className="flex gap-1">
             {(["NIFTY","BANKNIFTY"] as const).map(sym => (
               <button key={sym} onClick={() => switchReplaySym(sym)}
                 className={`text-[11px] px-2.5 py-0.5 rounded-full font-semibold transition-colors ${
-                  replaySym === sym
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:bg-muted/80"
-                }`}>
-                {sym}
-              </button>
+                  replaySym === sym ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:bg-muted/80"
+                }`}>{sym}</button>
             ))}
           </div>
-          <span className="text-[10px] text-muted-foreground ml-auto">
-            {replaySym === "NIFTY" ? "Aug 2024 – present" : "Jan 2025 – present"}
-          </span>
+          {replayVix > 0 && (
+            <span className="ml-auto text-[11px] bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400 px-2 py-0.5 rounded-full font-semibold">
+              VIX {replayVix.toFixed(1)}
+            </span>
+          )}
         </div>
-        <div className="flex flex-wrap gap-3 items-end mb-4">
+
+        <div className="flex flex-wrap gap-3 items-end">
           <div>
             <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Start Date</label>
             <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
-              min={REPLAY_START_DATES[replaySym]} max="2026-05-29"
+              min={REPLAY_START_DATES[replaySym]} max="2026-05-30"
               className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary" />
+          </div>
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Expiry</label>
+            <select value={selectedExpiry} onChange={e => setSelectedExpiry(e.target.value)}
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary min-w-[130px]">
+              <option value="">All expiries</option>
+              {expiries.map(e => <option key={e} value={e}>{normDateStr(e)}{daysLeft > 0 && e === selectedExpiry ? ` (${daysLeft}d)` : ""}</option>)}
+            </select>
           </div>
           <div>
             <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Speed</label>
             <select value={speed} onChange={e => setSpeed(Number(e.target.value))}
               className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary">
-              <option value={2000}>0.5x (slow)</option>
-              <option value={1000}>1x (normal)</option>
-              <option value={500}>2x (fast)</option>
-              <option value={200}>5x (very fast)</option>
+              <option value={2000}>0.5x</option>
+              <option value={1200}>1x</option>
+              <option value={600}>2x</option>
+              <option value={250}>5x</option>
             </select>
           </div>
           <button onClick={loadBhav} disabled={loading}
             className="flex items-center gap-1.5 px-4 py-2 bg-primary text-primary-foreground text-xs font-semibold rounded-lg hover:bg-primary/90">
             {loading ? <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <><Search className="w-3.5 h-3.5" />Load Data</>}
           </button>
-          {loadMsg && !loading && <p className={`text-xs self-end ${loadMsg.startsWith("✅") ? "text-success" : "text-warning"}`}>{loadMsg}</p>}
         </div>
 
-        {debugInfo && !loading && (
-          <div className="mb-2 px-3 py-1.5 bg-muted/50 border border-border/50 rounded-lg text-[10px] font-mono text-muted-foreground break-all">
-            🔍 {debugInfo}
+        {loadMsg && <p className={`mt-2 text-xs ${loadMsg.startsWith("✅") ? "text-success" : "text-warning"}`}>{loadMsg}</p>}
+        {debugInfo && <p className="mt-1 text-[10px] font-mono text-muted-foreground break-all">🔍 {debugInfo}</p>}
+
+        {/* RLS guide */}
+        {loadMsg && (loadMsg.includes("RLS") || loadMsg.includes("empty") || loadMsg.includes("unreachable")) && (
+          <div className="mt-2 p-3 bg-warning/5 border border-warning/30 rounded-xl text-xs space-y-1">
+            <p className="font-bold text-warning">Fix Supabase RLS:</p>
+            <p className="text-muted-foreground">Dashboard → Table Editor → <strong>{tableName}</strong> → RLS → Add Policy → SELECT → <code className="bg-muted px-1 rounded">USING (true)</code> → Save. Repeat for <code className="bg-muted px-1 rounded">banknifty_options</code> &amp; <code className="bg-muted px-1 rounded">india_vix</code>.</p>
           </div>
-        )}
-
-        {/* RLS helper — shown when error references empty/RLS */}
-        {loadMsg && loadMsg.includes("empty") && !loading && (
-          <div className="mb-3 p-3 bg-warning/5 border border-warning/30 rounded-xl text-xs space-y-1.5">
-            <p className="font-bold text-warning">📋 Fix Supabase RLS in 3 steps:</p>
-            <ol className="space-y-1 text-muted-foreground list-decimal list-inside">
-              <li>Open <strong>Supabase Dashboard</strong> → <strong>Table Editor</strong></li>
-              <li>Click <strong>{tableName}</strong> → <strong>RLS</strong> tab → <strong>Add Policy</strong></li>
-              <li>Choose <strong>SELECT</strong> → set <code className="bg-muted px-1 rounded">USING (true)</code> → Save</li>
-            </ol>
-            <p className="text-muted-foreground">Repeat for <code className="bg-muted px-1 rounded">banknifty_options</code> and <code className="bg-muted px-1 rounded">india_vix</code> tables.</p>
-          </div>
-        )}
-
-        {allDates.length > 0 && (
-          <>
-            {/* Date progress */}
-            <div className="mb-3">
-              <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
-                <span>{allDates[0]}</span>
-                <span className="font-bold text-foreground">📅 {currentDate}</span>
-                <span>{allDates[allDates.length - 1]}</span>
-              </div>
-              <input type="range" min={0} max={allDates.length - 1} value={currentIdx >= 0 ? currentIdx : 0}
-                onChange={e => stepTo(allDates[parseInt(e.target.value)])}
-                className="w-full accent-primary" />
-              <div className="text-center text-[11px] text-muted-foreground mt-1">
-                Day {currentIdx + 1} of {allDates.length}
-              </div>
-            </div>
-
-            {/* Playback controls */}
-            <div className="flex items-center justify-center gap-2">
-              <button onClick={() => { if (currentIdx > 0) stepTo(allDates[currentIdx - 1]) }}
-                className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center hover:bg-muted/80 disabled:opacity-40" disabled={currentIdx <= 0}>
-                <SkipBack className="w-4 h-4" />
-              </button>
-              <button onClick={togglePlay}
-                className="w-12 h-12 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90">
-                {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
-              </button>
-              <button onClick={() => { if (currentIdx < allDates.length - 1) stepTo(allDates[currentIdx + 1]) }}
-                className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center hover:bg-muted/80 disabled:opacity-40" disabled={currentIdx >= allDates.length - 1}>
-                <SkipForward className="w-4 h-4" />
-              </button>
-            </div>
-          </>
         )}
       </div>
 
-      {/* Normalised bhav data for current replay date */}
+      {/* ── Timeline + Playback ── */}
+      {allDates.length > 0 && (
+        <div className="bg-card border border-border rounded-xl p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <span className="text-xs font-bold text-foreground">📅 {currentDate}</span>
+              {replaySpot > 0 && <span className="ml-3 text-xs font-mono text-primary font-bold">Spot ₹{fmtN(replaySpot)}</span>}
+              {selectedExpiry && <span className="ml-3 text-[11px] text-muted-foreground">{daysLeft}d to expiry</span>}
+            </div>
+            <span className="text-[11px] text-muted-foreground">Day {currentIdx + 1}/{allDates.length}</span>
+          </div>
+          <input type="range" min={0} max={allDates.length - 1} value={currentIdx >= 0 ? currentIdx : 0}
+            onChange={e => stepTo(allDates[parseInt(e.target.value)])}
+            className="w-full accent-primary mb-3" />
+          <div className="flex items-center justify-center gap-3">
+            <button onClick={() => currentIdx > 0 && stepTo(allDates[currentIdx - 1])} disabled={currentIdx <= 0}
+              className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center hover:bg-muted/80 disabled:opacity-30">
+              <SkipBack className="w-4 h-4" />
+            </button>
+            <button onClick={togglePlay}
+              className="w-14 h-14 rounded-2xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90 shadow-lg">
+              {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6 ml-0.5" />}
+            </button>
+            <button onClick={() => currentIdx < allDates.length-1 && stepTo(allDates[currentIdx+1])} disabled={currentIdx >= allDates.length-1}
+              className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center hover:bg-muted/80 disabled:opacity-30">
+              <SkipForward className="w-4 h-4" />
+            </button>
+          </div>
+          {isPlaying && <p className="text-center text-[11px] text-primary mt-2 animate-pulse">● Playing day-by-day{selectedExpiry ? ` → auto-stops at ${normDateStr(selectedExpiry)}` : ""}</p>}
+        </div>
+      )}
+
+      {/* ── P&L Summary ── */}
+      {(positions.length > 0 || closedPnl !== 0) && (
+        <div className={`border rounded-xl p-3 ${totalPnl >= 0 ? "bg-success/5 border-success/30" : "bg-destructive/5 border-destructive/30"}`}>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex gap-4">
+              <div><div className="text-[10px] text-muted-foreground">Open P&L</div>
+                <div className={`font-mono font-bold text-sm ${openPnl >= 0 ? "text-success" : "text-destructive"}`}>{openPnl >= 0?"+":""}{fmt(openPnl)}</div></div>
+              <div><div className="text-[10px] text-muted-foreground">Realised P&L</div>
+                <div className={`font-mono font-bold text-sm ${closedPnl >= 0 ? "text-success" : "text-destructive"}`}>{closedPnl >= 0?"+":""}{fmt(closedPnl)}</div></div>
+              <div><div className="text-[10px] text-muted-foreground">Total P&L</div>
+                <div className={`font-mono font-bold text-sm ${totalPnl >= 0 ? "text-success" : "text-destructive"}`}>{totalPnl >= 0?"+":""}{fmt(totalPnl)}</div></div>
+            </div>
+            <button onClick={() => { setPositions([]); setClosedPnl(0) }}
+              className="text-[10px] px-2 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/80">Reset</button>
+          </div>
+          {tradeMsg && <p className={`mt-1.5 text-xs font-semibold ${tradeMsg.startsWith("✅") ? "text-success" : tradeMsg.startsWith("🔴") ? "text-destructive" : "text-warning"}`}>{tradeMsg}</p>}
+        </div>
+      )}
+      {tradeMsg && positions.length === 0 && closedPnl === 0 && (
+        <p className={`text-xs font-semibold px-1 ${tradeMsg.startsWith("✅") ? "text-success" : "text-warning"}`}>{tradeMsg}</p>
+      )}
+
+      {/* ── Open Positions ── */}
+      {positions.length > 0 && (
+        <div className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="px-4 py-2.5 border-b border-border bg-muted/40 flex items-center gap-2">
+            <Activity className="w-3.5 h-3.5 text-primary" />
+            <span className="text-xs font-bold">Open Positions ({positions.length})</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead><tr className="bg-muted/30">
+                {["Strike","Type","B/S","Lots","Entry","Current","P&L",""].map(h => (
+                  <th key={h} className="px-3 py-2 text-left text-[10px] font-bold text-muted-foreground">{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {positions.map(pos => {
+                  const diff = pos.action === "BUY" ? pos.currentPremium - pos.entryPremium : pos.entryPremium - pos.currentPremium
+                  const pnl = diff * pos.lots * lotSize
+                  return (
+                    <tr key={pos.id} className="border-t border-border/50">
+                      <td className="px-3 py-2 font-mono font-bold">{fmtN(pos.strike)}</td>
+                      <td className="px-3 py-2">
+                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${pos.optType==="CE"?"bg-success/10 text-success":"bg-destructive/10 text-destructive"}`}>{pos.optType}</span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={`text-[10px] font-bold ${pos.action==="BUY"?"text-success":"text-destructive"}`}>{pos.action}</span>
+                      </td>
+                      <td className="px-3 py-2 font-mono">{pos.lots}</td>
+                      <td className="px-3 py-2 font-mono text-muted-foreground">₹{fmtN(pos.entryPremium)}</td>
+                      <td className="px-3 py-2 font-mono">₹{fmtN(pos.currentPremium)}</td>
+                      <td className="px-3 py-2 font-mono font-bold">
+                        <span className={pnl>=0?"text-success":"text-destructive"}>{pnl>=0?"+":""}{fmt(pnl)}</span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <button onClick={() => closePosition(pos)}
+                          className="text-[10px] px-2 py-0.5 rounded bg-destructive/10 text-destructive hover:bg-destructive/20 font-semibold">Exit</button>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ── Option Chain with Buy/Sell buttons ── */}
       {normRows.length > 0 && (
         <div className="bg-card border border-border rounded-xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-border bg-muted/50 flex items-center gap-2">
-            <span className="text-xs font-bold text-foreground">{replaySym} Option Chain — {currentDate}</span>
-            <span className="text-[10px] text-muted-foreground ml-2">{normRows.length} strikes</span>
-            {normRows.some(r => r.ce_oi != null) && <span className="text-[10px] bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 px-2 py-0.5 rounded-full font-semibold ml-auto">OI ✓</span>}
+          <div className="px-4 py-3 border-b border-border bg-muted/50 flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-bold">{replaySym} — {currentDate}</span>
+            {selectedExpiry && <span className="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-full font-semibold">{normDateStr(selectedExpiry)}</span>}
+            {replaySpot > 0 && <span className="text-[10px] font-mono font-bold text-primary ml-auto">ATM {fmtN(atm)}</span>}
           </div>
-          <div className="overflow-x-auto max-h-80">
+
+          {/* Legend */}
+          <div className="px-4 py-1.5 border-b border-border/50 bg-muted/20 flex items-center gap-3 text-[10px] text-muted-foreground">
+            <span className="text-success font-bold">█ CE (Call)</span>
+            <span className="text-destructive font-bold">█ PE (Put)</span>
+            <span>Delta · Theta (Black-Scholes)</span>
+            {replayVix > 0 && <span className="ml-auto text-orange-500">VIX {replayVix.toFixed(1)} → IV {(replayVix/100*100).toFixed(0)}%</span>}
+          </div>
+
+          <div className="overflow-x-auto max-h-[420px]">
             <table className="w-full text-xs">
               <thead>
-                <tr className="bg-muted/30 sticky top-0">
-                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-muted-foreground">Expiry</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">Strike</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-bold text-success">CE LTP</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">CE OI</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">CE Vol</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-bold text-destructive">PE LTP</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">PE OI</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">PE Vol</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">CE IV</th>
-                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-muted-foreground">PE IV</th>
+                <tr className="bg-muted/30 sticky top-0 z-10">
+                  <th colSpan={5} className="px-3 py-2 text-center text-[10px] font-bold text-success border-r border-border">CALLS (CE)</th>
+                  <th className="px-3 py-2 text-center text-[10px] font-bold text-foreground bg-muted">Strike</th>
+                  <th colSpan={5} className="px-3 py-2 text-center text-[10px] font-bold text-destructive border-l border-border">PUTS (PE)</th>
+                </tr>
+                <tr className="bg-muted/20 sticky top-[33px] z-10">
+                  {/* CE side */}
+                  <th className="px-2 py-1.5 text-right text-[9px] text-muted-foreground">Sell</th>
+                  <th className="px-2 py-1.5 text-right text-[9px] text-muted-foreground">Buy</th>
+                  <th className="px-2 py-1.5 text-right text-[9px] text-success">LTP</th>
+                  <th className="px-2 py-1.5 text-right text-[9px] text-muted-foreground">Δ Delta</th>
+                  <th className="px-2 py-1.5 text-right text-[9px] text-muted-foreground border-r border-border">Θ Theta</th>
+                  {/* Strike */}
+                  <th className="px-2 py-1.5 text-center text-[9px] font-bold text-foreground bg-muted">STRIKE</th>
+                  {/* PE side */}
+                  <th className="px-2 py-1.5 text-left text-[9px] text-muted-foreground border-l border-border">Θ Theta</th>
+                  <th className="px-2 py-1.5 text-left text-[9px] text-muted-foreground">Δ Delta</th>
+                  <th className="px-2 py-1.5 text-left text-[9px] text-destructive">LTP</th>
+                  <th className="px-2 py-1.5 text-left text-[9px] text-muted-foreground">Buy</th>
+                  <th className="px-2 py-1.5 text-left text-[9px] text-muted-foreground">Sell</th>
                 </tr>
               </thead>
               <tbody>
-                {normRows.map((r, i) => (
-                  <tr key={i} className="border-t border-border/50 hover:bg-muted/30">
-                    <td className="px-3 py-2 font-mono text-muted-foreground text-[10px]">{r.expiry_date || "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono font-bold">{fmtN(r.strike_price)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-success font-semibold">{r.ce_ltp != null ? fmtN(r.ce_ltp) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.ce_oi != null ? (r.ce_oi >= 1000 ? (r.ce_oi/1000).toFixed(0)+"K" : r.ce_oi) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.ce_volume != null ? (r.ce_volume >= 1000 ? (r.ce_volume/1000).toFixed(0)+"K" : r.ce_volume) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-destructive font-semibold">{r.pe_ltp != null ? fmtN(r.pe_ltp) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.pe_oi != null ? (r.pe_oi >= 1000 ? (r.pe_oi/1000).toFixed(0)+"K" : r.pe_oi) : "—"}</td>
-                    <td className="px-3 py-2 text-right font-mono text-muted-foreground">{r.pe_volume != null ? (r.pe_volume >= 1000 ? (r.pe_volume/1000).toFixed(0)+"K" : r.pe_volume) : "—"}</td>
-                    <td className="px-3 py-2 text-right text-muted-foreground">{r.ce_iv != null ? r.ce_iv.toFixed(1)+"%" : "—"}</td>
-                    <td className="px-3 py-2 text-right text-muted-foreground">{r.pe_iv != null ? r.pe_iv.toFixed(1)+"%" : "—"}</td>
-                  </tr>
-                ))}
+                {rowsToShow.map((r, i) => {
+                  const isATM = atm > 0 && r.strike_price === atm
+                  const isITM_CE = replaySpot > 0 && r.strike_price < replaySpot
+                  const isITM_PE = replaySpot > 0 && r.strike_price > replaySpot
+                  const ceLTP = getPremium(r, "CE")
+                  const peLTP = getPremium(r, "PE")
+                  const expForGreeks = selectedExpiry || r.expiry_date || ""
+                  const ceG = calcGreeks(replaySpot, r.strike_price, Math.max((new Date(expForGreeks+"T15:30:00").getTime() - new Date(currentDate+"T09:15:00").getTime())/(365*24*3600*1000),0), 0.065, replayVix>0?replayVix/100:0.15, "CE")
+                  const peG = calcGreeks(replaySpot, r.strike_price, Math.max((new Date(expForGreeks+"T15:30:00").getTime() - new Date(currentDate+"T09:15:00").getTime())/(365*24*3600*1000),0), 0.065, replayVix>0?replayVix/100:0.15, "PE")
+                  return (
+                    <tr key={i} className={`border-t border-border/40 ${isATM ? "bg-primary/5 font-bold" : isITM_CE ? "bg-success/3" : ""}`}>
+                      {/* CE Sell */}
+                      <td className="px-1.5 py-1">
+                        <button onClick={() => placeTrade(r, "CE", "SELL")}
+                          className="w-full text-[9px] font-bold px-1.5 py-0.5 rounded bg-destructive/10 text-destructive hover:bg-destructive/20 whitespace-nowrap">SELL</button>
+                      </td>
+                      {/* CE Buy */}
+                      <td className="px-1.5 py-1">
+                        <button onClick={() => placeTrade(r, "CE", "BUY")}
+                          className="w-full text-[9px] font-bold px-1.5 py-0.5 rounded bg-success/10 text-success hover:bg-success/20 whitespace-nowrap">BUY</button>
+                      </td>
+                      {/* CE LTP */}
+                      <td className={`px-2 py-1.5 text-right font-mono font-semibold ${isITM_CE ? "text-success" : "text-foreground"}`}>
+                        {ceLTP > 0 ? fmtN(ceLTP) : "—"}
+                      </td>
+                      {/* CE Delta */}
+                      <td className="px-2 py-1.5 text-right font-mono text-[10px] text-muted-foreground">{ceG.delta.toFixed(2)}</td>
+                      {/* CE Theta */}
+                      <td className="px-2 py-1.5 text-right font-mono text-[10px] text-orange-500 border-r border-border">{ceG.theta.toFixed(2)}</td>
+                      {/* Strike */}
+                      <td className={`px-2 py-1.5 text-center font-mono font-bold text-[11px] bg-muted/40 ${isATM ? "text-primary" : "text-foreground"}`}>
+                        {fmtN(r.strike_price)}{isATM && <span className="ml-1 text-[8px] text-primary">ATM</span>}
+                      </td>
+                      {/* PE Theta */}
+                      <td className="px-2 py-1.5 text-left font-mono text-[10px] text-orange-500 border-l border-border">{peG.theta.toFixed(2)}</td>
+                      {/* PE Delta */}
+                      <td className="px-2 py-1.5 text-left font-mono text-[10px] text-muted-foreground">{peG.delta.toFixed(2)}</td>
+                      {/* PE LTP */}
+                      <td className={`px-2 py-1.5 text-left font-mono font-semibold ${isITM_PE ? "text-destructive" : "text-foreground"}`}>
+                        {peLTP > 0 ? fmtN(peLTP) : "—"}
+                      </td>
+                      {/* PE Buy */}
+                      <td className="px-1.5 py-1">
+                        <button onClick={() => placeTrade(r, "PE", "BUY")}
+                          className="w-full text-[9px] font-bold px-1.5 py-0.5 rounded bg-success/10 text-success hover:bg-success/20 whitespace-nowrap">BUY</button>
+                      </td>
+                      {/* PE Sell */}
+                      <td className="px-1.5 py-1">
+                        <button onClick={() => placeTrade(r, "PE", "SELL")}
+                          className="w-full text-[9px] font-bold px-1.5 py-0.5 rounded bg-destructive/10 text-destructive hover:bg-destructive/20 whitespace-nowrap">SELL</button>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -2162,9 +2386,8 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
       {allDates.length === 0 && !loading && (
         <div className="bg-card border border-border rounded-xl p-10 text-center">
           <Clock className="w-10 h-10 text-muted-foreground/30 mx-auto mb-3" />
-          <p className="text-sm font-semibold text-muted-foreground">Load historical bhav data to replay</p>
-          <p className="text-xs text-muted-foreground mt-1">Data available from Aug 2024 – May 2026</p>
-          {loadMsg && <p className="text-xs text-warning mt-2">{loadMsg}</p>}
+          <p className="text-sm font-semibold text-muted-foreground">Select symbol, pick a start date, then click Load Data</p>
+          <p className="text-[11px] text-muted-foreground mt-1">NIFTY: Aug 2024–present · BANKNIFTY: Jan 2025–present</p>
         </div>
       )}
     </div>
@@ -3217,7 +3440,7 @@ function TradingDashboard({ userId }: { userId: string }) {
                 symbol={chainSymbol} onTrade={load} onLegsChange={setStrategyLegs}
               />
             )}
-            {tab === "replay" && <ReplayPanel symbol={chainSymbol} vix={vix} onReplayStep={(rows, date, rSpot) => {
+            {tab === "replay" && <ReplayPanel symbol={chainSymbol} vix={vix} userId={userId} onReplayStep={(rows, date, rSpot) => {
               setReplayRows(rows)
               setReplayDate(date)
               setReplaySpot(rSpot > 0 ? rSpot : spot)
