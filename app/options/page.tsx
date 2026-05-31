@@ -1830,11 +1830,12 @@ function StrategyBuilder({ userId, balance, spot, vix, symbol, onTrade, onLegsCh
 // REPLAY / AUTOPLAY
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ─── Derive implied spot from ATM row in bhav data ───────────────────────────
+// ─── Derive implied spot from ATM row in bhav data with better fallback ───────
 function deriveSpotFromRows(rows: NormRow[], symbol: string): number {
   if (rows.length === 0) return 0
   const interval = getStrikeInterval(symbol)
-  // Find the row where CE ≈ PE (that's ATM by put-call parity)
+  
+  // Strategy 1: Find row where CE ≈ PE (put-call parity at ATM)
   let bestRow = rows[0]
   let bestDiff = Infinity
   for (const r of rows) {
@@ -1842,10 +1843,24 @@ function deriveSpotFromRows(rows: NormRow[], symbol: string): number {
     const diff = Math.abs(r.ce_ltp - r.pe_ltp)
     if (diff < bestDiff) { bestDiff = diff; bestRow = r }
   }
-  // Spot ≈ strike + CE_LTP - PE_LTP  (put-call parity approximation)
-  const ce = bestRow.ce_ltp ?? 0
-  const pe = bestRow.pe_ltp ?? 0
-  return Math.round((bestRow.strike_price + ce - pe) / interval) * interval
+  
+  // If we found a good ATM row, use it
+  if (bestDiff < Infinity && bestDiff < 100) {
+    const ce = bestRow.ce_ltp ?? 0
+    const pe = bestRow.pe_ltp ?? 0
+    return Math.round((bestRow.strike_price + ce - pe) / interval) * interval
+  }
+  
+  // Strategy 2: Find middle strike in dataset (rough approximation of ATM)
+  const sorted = [...rows].sort((a, b) => a.strike_price - b.strike_price)
+  if (sorted.length > 0) {
+    const midIdx = Math.floor(sorted.length / 2)
+    const midStrike = sorted[midIdx].strike_price
+    // Rough assumption: middle strike is probably near ATM
+    return midStrike
+  }
+  
+  return 0
 }
 
 // Default start dates per symbol (earliest available bhav data)
@@ -1876,6 +1891,7 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
   const initSym = (["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY") as "NIFTY"|"BANKNIFTY"
   const [replaySym,   setReplaySym]   = useState<"NIFTY"|"BANKNIFTY">(initSym)
   const [fromDate,    setFromDate]    = useState(REPLAY_START_DATES[initSym])
+  const [toDate,      setToDate]      = useState("2026-05-31")
   const [currentDate, setCurrentDate] = useState(REPLAY_START_DATES[initSym])
   const [isPlaying,   setIsPlaying]   = useState(false)
   const [speed,       setSpeed]       = useState(1200)
@@ -1891,6 +1907,7 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
   const [positions,   setPositions]   = useState<ReplayPosition[]>([])
   const [closedPnl,   setClosedPnl]   = useState(0)
   const [tradeMsg,    setTradeMsg]    = useState("")
+  const [vixByDate,   setVixByDate]   = useState<Record<string, number>>({})
   const intervalRef     = useRef<NodeJS.Timeout | null>(null)
   const prefetchCache   = useRef<Record<string, NormRow[]>>({})
   const allDatesRef     = useRef<string[]>([])
@@ -1904,12 +1921,14 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     setIsPlaying(false)
     setReplaySym(sym)
     setFromDate(REPLAY_START_DATES[sym])
+    setToDate("2026-05-31")
     setCurrentDate(REPLAY_START_DATES[sym])
     setAllDates([]); allDatesRef.current = []
     setNormRows([]); setReplaySpot(0)
     setLoadMsg(""); setDebugInfo(null)
     setExpiries([]); setSelectedExpiry("")
     setPositions([]); setClosedPnl(0)
+    setVixByDate({})
     prefetchCache.current = {}
     delete _schemaCache[sym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"]
   }
@@ -1929,12 +1948,12 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     let rows: any[] | null = null
     for (const dv of dateVariants) {
       const { data, error } = await supabase.from(tableName).select("*")
-        .eq(dateCol, dv).order(strikeCol, { ascending: true }).limit(2000)
+        .eq(dateCol, dv).order(strikeCol, { ascending: true }).limit(5000)
       if (!error && data && data.length > 0) { rows = data; break }
     }
     if (!rows || rows.length === 0) {
       const { data } = await supabase.from(tableName).select("*")
-        .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(2000)
+        .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(5000)
       rows = data && data.length > 0 ? data : null
     }
     if (!rows || rows.length === 0) return []
@@ -1967,11 +1986,12 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
       setLoading(false); return
     }
 
-    const filteredDates = dates.filter(d => d >= fromDate)
+    // Filter by BOTH fromDate AND toDate (date range)
+    const filteredDates = dates.filter(d => d >= fromDate && d <= toDate)
     if (filteredDates.length === 0) {
       setLoadMsg(dates.length === 0
         ? `⚠ No dates found in table. Check RLS policy on "${tableName}".`
-        : `⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]} — change Start Date`)
+        : `⚠ No dates in range ${fromDate} to ${toDate}. Available: ${dates[0]} → ${dates[dates.length-1]}`)
       setLoading(false); return
     }
 
@@ -2101,12 +2121,12 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     ? Math.max(0, Math.round((new Date(selectedExpiry+"T00:00:00").getTime() - new Date(currentDate+"T00:00:00").getTime()) / (86400000)))
     : 0
 
-  // Filter rows by selected expiry and show ±10 strikes around ATM
+  // Filter rows by selected expiry and show ±25 strikes around ATM (50+ total)
   const displayRows = normRows.filter(r => !selectedExpiry || !r.expiry_date || r.expiry_date === selectedExpiry || normDateStr(r.expiry_date) === selectedExpiry)
   const nearATM = atm > 0
-    ? displayRows.filter(r => Math.abs(r.strike_price - atm) <= 10 * interval)
-    : displayRows.slice(0, 21)
-  const rowsToShow = nearATM.length > 0 ? nearATM : displayRows.slice(0, 21)
+    ? displayRows.filter(r => Math.abs(r.strike_price - atm) <= 25 * interval)
+    : displayRows.slice(0, 51)
+  const rowsToShow = nearATM.length > 0 ? nearATM : displayRows.slice(0, 51)
 
   // Open P&L
   const openPnl = positions.reduce((sum, pos) => {
@@ -2139,9 +2159,15 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
 
         <div className="flex flex-wrap gap-3 items-end">
           <div>
-            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Start Date</label>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">From Date</label>
             <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
               min={REPLAY_START_DATES[replaySym]} max="2026-05-30"
+              className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary" />
+          </div>
+          <div>
+            <label className="text-[11px] font-semibold text-muted-foreground block mb-1">To Date</label>
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+              min={fromDate} max="2026-05-31"
               className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary" />
           </div>
           <div>
@@ -2766,8 +2792,8 @@ function RightPanel({ legs, spot, vix, symbol, positions, livePrices, balance, r
         const maxPeOI = Math.max(...replayRows.map(r => r.pe_oi ?? 0), 1)
         const interval = getStrikeInterval(symbol)
         const atm = spot > 0 ? Math.round(spot / interval) * interval : 0
-        // Show ±6 strikes around ATM
-        const visible = replayRows.filter(r => Math.abs(r.strike_price - atm) <= 6 * interval)
+        // Show ±12 strikes around ATM for better visualization
+        const visible = replayRows.filter(r => Math.abs(r.strike_price - atm) <= 12 * interval)
         if (visible.length === 0) return null
         return (
           <div className="bg-card border border-border rounded-xl p-3 flex-shrink-0">
