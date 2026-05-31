@@ -1838,13 +1838,22 @@ function deriveSpotFromRows(rows: NormRow[], symbol: string): number {
   return Math.round((bestRow.strike_price + ce - pe) / interval) * interval
 }
 
+// Default start dates per symbol (earliest available bhav data)
+const REPLAY_START_DATES: Record<string, string> = {
+  NIFTY:     "2024-08-01",
+  BANKNIFTY: "2025-01-02",
+}
+
 function ReplayPanel({ symbol, vix, onReplayStep }: {
   symbol: string
   vix: number
   onReplayStep: (rows: NormRow[], date: string, spot: number) => void
 }) {
-  const [fromDate, setFromDate] = useState("2024-08-01")
-  const [currentDate, setCurrentDate] = useState("2024-08-01")
+  // Independent symbol switcher — NIFTY or BANKNIFTY regardless of chain selector
+  const initSym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
+  const [replaySym, setReplaySym] = useState<"NIFTY"|"BANKNIFTY">(initSym as "NIFTY"|"BANKNIFTY")
+  const [fromDate, setFromDate] = useState(REPLAY_START_DATES[initSym])
+  const [currentDate, setCurrentDate] = useState(REPLAY_START_DATES[initSym])
   const [isPlaying, setIsPlaying] = useState(false)
   const [speed, setSpeed] = useState(1000)
   const [allDates, setAllDates] = useState<string[]>([])
@@ -1855,8 +1864,23 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
   const [debugInfo, setDebugInfo] = useState<string | null>(null)
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
   const prefetchCache = useRef<Record<string, NormRow[]>>({})
-  const replaySym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
   const tableName = replaySym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
+
+  // When symbol switcher changes, reset state and update default start date
+  function switchReplaySym(sym: "NIFTY"|"BANKNIFTY") {
+    if (intervalRef.current) clearInterval(intervalRef.current)
+    setIsPlaying(false)
+    setReplaySym(sym)
+    setFromDate(REPLAY_START_DATES[sym])
+    setCurrentDate(REPLAY_START_DATES[sym])
+    setAllDates([])
+    setNormRows([])
+    setReplaySpot(0)
+    setLoadMsg("")
+    setDebugInfo(null)
+    prefetchCache.current = {}
+    delete _schemaCache[sym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"]
+  }
 
   async function fetchRowsForDate(date: string): Promise<NormRow[]> {
     // Return from prefetch cache if available
@@ -1906,7 +1930,13 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
     }
 
     if (fetchError && dates.length === 0) {
-      setLoadMsg(`⚠ ${fetchError}`)
+      // Give actionable RLS fix instructions
+      const isRLS = fetchError.toLowerCase().includes("rls") || fetchError.toLowerCase().includes("row") || fetchError.toLowerCase().includes("policy") || fetchError.includes("empty")
+      if (isRLS || fetchError.includes("empty")) {
+        setLoadMsg(`⚠ ${fetchError} → In Supabase: go to Table Editor → "${tableName}" → RLS → Add Policy → SELECT → USING (true)`)
+      } else {
+        setLoadMsg(`⚠ ${fetchError}`)
+      }
       setLoading(false); return
     }
 
@@ -1914,9 +1944,9 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
 
     if (filteredDates.length === 0) {
       if (dates.length === 0) {
-        setLoadMsg(fetchError ?? `Table "${tableName}" returned no dates. Check Supabase RLS / table name.`)
+        setLoadMsg(fetchError ?? `Table "${tableName}" returned no dates. Fix RLS: Supabase → Table Editor → "${tableName}" → RLS → Add SELECT policy → USING (true)`)
       } else {
-        setLoadMsg(`⚠ No dates from ${fromDate}. Earliest available in DB: ${dates[0]}`)
+        setLoadMsg(`⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]} — try changing Start Date`)
       }
       setLoading(false); return
     }
@@ -1988,12 +2018,28 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
         <div className="flex items-center gap-2 mb-3">
           <Clock className="w-4 h-4 text-primary" />
           <span className="text-sm font-bold text-foreground">Historical Replay</span>
-          <span className="text-[11px] bg-primary/10 text-primary px-2 py-0.5 rounded-full font-semibold">{replaySym}</span>
+          {/* Independent NIFTY / BANKNIFTY switcher */}
+          <div className="flex gap-1 ml-2">
+            {(["NIFTY","BANKNIFTY"] as const).map(sym => (
+              <button key={sym} onClick={() => switchReplaySym(sym)}
+                className={`text-[11px] px-2.5 py-0.5 rounded-full font-semibold transition-colors ${
+                  replaySym === sym
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:bg-muted/80"
+                }`}>
+                {sym}
+              </button>
+            ))}
+          </div>
+          <span className="text-[10px] text-muted-foreground ml-auto">
+            {replaySym === "NIFTY" ? "Aug 2024 – present" : "Jan 2025 – present"}
+          </span>
         </div>
         <div className="flex flex-wrap gap-3 items-end mb-4">
           <div>
             <label className="text-[11px] font-semibold text-muted-foreground block mb-1">Start Date</label>
-            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} min="2024-08-01" max="2026-05-29"
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+              min={REPLAY_START_DATES[replaySym]} max="2026-05-29"
               className="bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-primary" />
           </div>
           <div>
@@ -2016,6 +2062,19 @@ function ReplayPanel({ symbol, vix, onReplayStep }: {
         {debugInfo && !loading && (
           <div className="mb-2 px-3 py-1.5 bg-muted/50 border border-border/50 rounded-lg text-[10px] font-mono text-muted-foreground break-all">
             🔍 {debugInfo}
+          </div>
+        )}
+
+        {/* RLS helper — shown when error references empty/RLS */}
+        {loadMsg && loadMsg.includes("empty") && !loading && (
+          <div className="mb-3 p-3 bg-warning/5 border border-warning/30 rounded-xl text-xs space-y-1.5">
+            <p className="font-bold text-warning">📋 Fix Supabase RLS in 3 steps:</p>
+            <ol className="space-y-1 text-muted-foreground list-decimal list-inside">
+              <li>Open <strong>Supabase Dashboard</strong> → <strong>Table Editor</strong></li>
+              <li>Click <strong>{tableName}</strong> → <strong>RLS</strong> tab → <strong>Add Policy</strong></li>
+              <li>Choose <strong>SELECT</strong> → set <code className="bg-muted px-1 rounded">USING (true)</code> → Save</li>
+            </ol>
+            <p className="text-muted-foreground">Repeat for <code className="bg-muted px-1 rounded">banknifty_options</code> and <code className="bg-muted px-1 rounded">india_vix</code> tables.</p>
           </div>
         )}
 
@@ -2789,7 +2848,7 @@ function TradingDashboard({ userId }: { userId: string }) {
   function startAutoPlay() {
     if (isAutoPlay) return
     // Load all bhav dates for current symbol for the replay
-    fetchBhavDates(["NIFTY","BANKNIFTY"].includes(chainSymbol) ? chainSymbol : "NIFTY").then(dates => {
+    fetchBhavDates(["NIFTY","BANKNIFTY"].includes(chainSymbol) ? chainSymbol : "NIFTY").then(({ dates }) => {
       if (dates.length === 0) return
       autoPlayDatesRef.current = dates
       autoPlayIdxRef.current = 0
