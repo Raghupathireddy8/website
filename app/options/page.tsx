@@ -658,6 +658,14 @@ function normDateStr(v: string): string {
   return s.slice(0,10)
 }
 
+// Better date comparison that handles format differences
+function compareDates(dateStr: string, fromDate: string, toDate: string): boolean {
+  const d = normDateStr(dateStr)
+  const from = normDateStr(fromDate)
+  const to = normDateStr(toDate)
+  return d >= from && d <= to
+}
+
 // ─── Fetch all UNIQUE trading dates — fast path first, paged fallback ────────
 // Returns { dates, error } so callers can show the real Supabase error
 async function fetchBhavDates(symbol: string): Promise<{ dates: string[]; error: string | null }> {
@@ -1986,8 +1994,8 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
       setLoading(false); return
     }
 
-    // Filter by BOTH fromDate AND toDate (date range)
-    const filteredDates = dates.filter(d => d >= fromDate && d <= toDate)
+    // Filter by BOTH fromDate AND toDate (date range) using robust comparison
+    const filteredDates = dates.filter(d => compareDates(d, fromDate, toDate))
     if (filteredDates.length === 0) {
       setLoadMsg(dates.length === 0
         ? `⚠ No dates found in table. Check RLS policy on "${tableName}".`
@@ -2009,7 +2017,16 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     setExpiries(expirySet)
     if (expirySet.length > 0 && !selectedExpiry) setSelectedExpiry(expirySet[0])
 
-    setLoadMsg(`✅ Loaded ${filteredDates.length} trading days (${firstDate} → ${filteredDates[filteredDates.length-1]})`)
+    // Debug logging
+    const debugInfo = `
+✅ Loaded ${filteredDates.length} trading days
+📅 Range: ${firstDate} → ${filteredDates[filteredDates.length-1]}
+⚙️ Schema: dateCol="${schema.dateCol}", strikeCol="${schema.strikeCol}"
+🎯 First date rows: ${rows.length} strikes
+📊 Available expiries: ${expirySet.length} (${expirySet.slice(0,3).join(', ')}...)
+    `.trim()
+    
+    setLoadMsg(debugInfo)
     setLoading(false)
   }
 
