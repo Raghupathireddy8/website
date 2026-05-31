@@ -621,10 +621,27 @@ function normDateStr(v: string): string {
   return s.slice(0,10)
 }
 
-// ─── Fetch all UNIQUE trading dates (paged to avoid timeout) ─────────────────
+// ─── Fetch all UNIQUE trading dates — fast path first, paged fallback ────────
 async function fetchBhavDates(symbol: string): Promise<string[]> {
   const tableName = symbol === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
   const { dateCol } = await getBhavSchema(tableName)
+
+  // Fast path: try Postgres DISTINCT via RPC (requires a simple SQL function in Supabase)
+  // CREATE OR REPLACE FUNCTION distinct_dates(tbl text, col text)
+  // RETURNS TABLE(d text) LANGUAGE sql STABLE AS
+  // $$ SELECT DISTINCT col::text FROM nifty_options ORDER BY 1 $$;
+  // If that RPC doesn't exist yet we fall through to the paginated approach.
+  try {
+    const rpcName = tableName === "nifty_options" ? "nifty_distinct_dates" : "banknifty_distinct_dates"
+    const { data: rpcData, error: rpcErr } = await supabase.rpc(rpcName)
+    if (!rpcErr && rpcData && rpcData.length > 0) {
+      return [...new Set((rpcData as any[]).map((r: any) => normDateStr(String(r.d ?? r[dateCol] ?? r[Object.keys(r)[0]] ?? ""))))]
+        .filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+    }
+  } catch {}
+
+  // Medium path: select distinct using Supabase .select() with a small limit per page
+  // Works well when the table has an index on dateCol
   const allRaw: string[] = []
   let page = 0
   const PAGE = 5000
@@ -1734,42 +1751,47 @@ function StrategyBuilder({ userId, balance, spot, vix, symbol, onTrade, onLegsCh
 // REPLAY / AUTOPLAY
 // ═════════════════════════════════════════════════════════════════════════════
 
-function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
+// ─── Derive implied spot from ATM row in bhav data ───────────────────────────
+function deriveSpotFromRows(rows: NormRow[], symbol: string): number {
+  if (rows.length === 0) return 0
+  const interval = getStrikeInterval(symbol)
+  // Find the row where CE ≈ PE (that's ATM by put-call parity)
+  let bestRow = rows[0]
+  let bestDiff = Infinity
+  for (const r of rows) {
+    if (r.ce_ltp == null || r.pe_ltp == null) continue
+    const diff = Math.abs(r.ce_ltp - r.pe_ltp)
+    if (diff < bestDiff) { bestDiff = diff; bestRow = r }
+  }
+  // Spot ≈ strike + CE_LTP - PE_LTP  (put-call parity approximation)
+  const ce = bestRow.ce_ltp ?? 0
+  const pe = bestRow.pe_ltp ?? 0
+  return Math.round((bestRow.strike_price + ce - pe) / interval) * interval
+}
+
+function ReplayPanel({ symbol, vix, onReplayStep }: {
+  symbol: string
+  vix: number
+  onReplayStep: (rows: NormRow[], date: string, spot: number) => void
+}) {
   const [fromDate, setFromDate] = useState("2024-08-01")
   const [currentDate, setCurrentDate] = useState("2024-08-01")
   const [isPlaying, setIsPlaying] = useState(false)
-  const [speed, setSpeed] = useState(1000) // ms per day
+  const [speed, setSpeed] = useState(1000)
   const [allDates, setAllDates] = useState<string[]>([])
-  const [normRows, setNormRows] = useState<NormRow[]>([])  // normalised rows for current date
+  const [normRows, setNormRows] = useState<NormRow[]>([])
+  const [replaySpot, setReplaySpot] = useState(0)
   const [loading, setLoading] = useState(false)
   const [loadMsg, setLoadMsg] = useState("")
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
+  const prefetchCache = useRef<Record<string, NormRow[]>>({})
   const replaySym = ["NIFTY","BANKNIFTY"].includes(symbol) ? symbol : "NIFTY"
   const tableName = replaySym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
 
-  async function loadBhav() {
-    setLoading(true)
-    setLoadMsg("")
+  async function fetchRowsForDate(date: string): Promise<NormRow[]> {
+    // Return from prefetch cache if available
+    if (prefetchCache.current[date]) return prefetchCache.current[date]
 
-    // Step 1: get all available dates from the table (schema-aware)
-    const dates = await fetchBhavDates(replaySym)
-    const filteredDates = dates.filter(d => d >= fromDate)
-
-    if (filteredDates.length === 0) {
-      if (dates.length === 0) { setLoadMsg(`⚠ Table "${tableName}" empty or unreachable. Check Supabase RLS.`) }
-      else { setLoadMsg(`⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]}`) }
-      setLoading(false); return
-    }
-
-    setAllDates(filteredDates)
-    const firstDate = filteredDates[0]
-    setCurrentDate(firstDate)
-    await loadDateRows(firstDate)
-    setLoadMsg(`✅ Loaded ${filteredDates.length} trading days`)
-    setLoading(false)
-  }
-
-  async function loadDateRows(date: string) {
     const { dateCol, strikeCol } = await getBhavSchema(tableName)
     const d = new Date(date + "T00:00:00")
     const dd = String(d.getDate()).padStart(2,"0")
@@ -1790,11 +1812,52 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
         .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(1000)
       rows = data && data.length > 0 ? data : null
     }
-    if (!rows || rows.length === 0) { setNormRows([]); return }
-    if (isNarrowFormat(rows)) {
-      setNormRows(normaliseNarrowRows(rows))
-    } else {
-      setNormRows(rows.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price))
+    if (!rows || rows.length === 0) return []
+
+    const normalised = isNarrowFormat(rows)
+      ? normaliseNarrowRows(rows)
+      : rows.map(normaliseWideRow).sort((a, b) => a.strike_price - b.strike_price)
+
+    prefetchCache.current[date] = normalised
+    return normalised
+  }
+
+  async function loadBhav() {
+    setLoading(true)
+    setLoadMsg("")
+    prefetchCache.current = {}
+
+    const dates = await fetchBhavDates(replaySym)
+    const filteredDates = dates.filter(d => d >= fromDate)
+
+    if (filteredDates.length === 0) {
+      if (dates.length === 0) { setLoadMsg(`⚠ Table "${tableName}" empty or unreachable. Check Supabase RLS.`) }
+      else { setLoadMsg(`⚠ No dates from ${fromDate}. Earliest in DB: ${dates[0]}`) }
+      setLoading(false); return
+    }
+
+    setAllDates(filteredDates)
+    const firstDate = filteredDates[0]
+    setCurrentDate(firstDate)
+    await loadDateRows(firstDate)
+    setLoadMsg(`✅ Loaded ${filteredDates.length} trading days`)
+    setLoading(false)
+  }
+
+  async function loadDateRows(date: string) {
+    const rows = await fetchRowsForDate(date)
+    const spot = deriveSpotFromRows(rows, replaySym)
+    setNormRows(rows)
+    setReplaySpot(spot)
+    onReplayStep(rows, date, spot)
+
+    // Prefetch next 3 dates silently in background
+    const idx = allDates.indexOf(date)
+    for (let i = 1; i <= 3; i++) {
+      const nextDate = allDates[idx + i]
+      if (nextDate && !prefetchCache.current[nextDate]) {
+        fetchRowsForDate(nextDate).catch(() => {})
+      }
     }
   }
 
@@ -1812,7 +1875,6 @@ function ReplayPanel({ symbol, vix }: { symbol: string; vix: number }) {
       if (intervalRef.current) clearInterval(intervalRef.current)
       setIsPlaying(false)
     } else {
-      // Sync ref to current state before starting
       currentIdxRef.current = allDates.indexOf(currentDate)
       setIsPlaying(true)
       intervalRef.current = setInterval(() => {
@@ -2263,9 +2325,10 @@ function PayoffChart({ legs, spot, vix, lotSize }: {
 }
 
 // ─── Right-panel: Payoff + MTM + greeks summary ───────────────────────────────
-function RightPanel({ legs, spot, vix, symbol, positions, livePrices, balance }: {
+function RightPanel({ legs, spot, vix, symbol, positions, livePrices, balance, replayDate, replayRows }: {
   legs: StrategyLeg[]; spot: number; vix: number; symbol: string
   positions: any[]; livePrices: Record<string, number>; balance: number
+  replayDate?: string; replayRows?: NormRow[]
 }) {
   const lotSize   = LOT_SIZES[symbol] ?? 75
   const interval  = getStrikeInterval(symbol)
@@ -2309,6 +2372,67 @@ function RightPanel({ legs, spot, vix, symbol, positions, livePrices, balance }:
 
   return (
     <div className="flex flex-col gap-3 h-full">
+
+      {/* ── Replay mode banner ── */}
+      {replayDate && (
+        <div className="bg-primary/10 border border-primary/20 rounded-xl px-3 py-2 flex items-center gap-2 flex-shrink-0">
+          <Clock className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+          <span className="text-xs font-bold text-primary">Replay</span>
+          <span className="text-xs font-mono text-foreground ml-1">{replayDate}</span>
+          {spot > 0 && (
+            <span className="ml-auto text-xs font-mono font-bold text-foreground">
+              ≈ {fmtN(spot)}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* ── OI heatmap during replay ── */}
+      {replayDate && replayRows && replayRows.length > 0 && (() => {
+        const maxCeOI = Math.max(...replayRows.map(r => r.ce_oi ?? 0), 1)
+        const maxPeOI = Math.max(...replayRows.map(r => r.pe_oi ?? 0), 1)
+        const interval = getStrikeInterval(symbol)
+        const atm = spot > 0 ? Math.round(spot / interval) * interval : 0
+        // Show ±6 strikes around ATM
+        const visible = replayRows.filter(r => Math.abs(r.strike_price - atm) <= 6 * interval)
+        if (visible.length === 0) return null
+        return (
+          <div className="bg-card border border-border rounded-xl p-3 flex-shrink-0">
+            <div className="text-[10px] font-bold text-muted-foreground uppercase tracking-wide mb-2 flex items-center gap-1.5">
+              <BarChart2 className="w-3 h-3" /> OI heatmap — {replayDate}
+            </div>
+            <div className="space-y-0.5">
+              {visible.map((r, i) => {
+                const isAtm = r.strike_price === atm
+                const ceW = Math.round((r.ce_oi ?? 0) / maxCeOI * 100)
+                const peW = Math.round((r.pe_oi ?? 0) / maxPeOI * 100)
+                return (
+                  <div key={i} className={`flex items-center gap-1 ${isAtm ? "bg-primary/5 rounded" : ""}`}>
+                    {/* CE OI bar — right-aligned */}
+                    <div className="flex-1 flex justify-end items-center gap-1">
+                      {r.ce_ltp != null && <span className="text-[9px] font-mono text-success">{fmtN(r.ce_ltp)}</span>}
+                      <div className="h-3 bg-success/20 rounded-sm" style={{ width: `${ceW}%`, minWidth: ceW > 0 ? 2 : 0 }} />
+                    </div>
+                    {/* Strike label */}
+                    <div className={`text-[10px] font-mono font-bold w-14 text-center flex-shrink-0 ${isAtm ? "text-primary" : "text-foreground"}`}>
+                      {fmtN(r.strike_price)}{isAtm ? " ◀" : ""}
+                    </div>
+                    {/* PE OI bar — left-aligned */}
+                    <div className="flex-1 flex items-center gap-1">
+                      <div className="h-3 bg-destructive/20 rounded-sm" style={{ width: `${peW}%`, minWidth: peW > 0 ? 2 : 0 }} />
+                      {r.pe_ltp != null && <span className="text-[9px] font-mono text-destructive">{fmtN(r.pe_ltp)}</span>}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <div className="flex justify-between text-[9px] text-muted-foreground mt-1.5">
+              <span>CE OI ←</span><span>→ PE OI</span>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Payoff chart */}
       <div className="bg-card border border-border rounded-xl p-3 flex-shrink-0">
         <div className="flex items-center justify-between mb-2">
@@ -2412,6 +2536,9 @@ function TradingDashboard({ userId }: { userId: string }) {
   const [chainSymbol,  setChainSymbol]  = useState("NIFTY")
   const [chainExpiry,  setChainExpiry]  = useState(getThursdaysForNext3Months()[0] ?? "")
   const [strategyLegs,  setStrategyLegs]  = useState<StrategyLeg[]>([])
+  const [replayRows,    setReplayRows]    = useState<NormRow[]>([])
+  const [replayDate,    setReplayDate]    = useState<string>("")
+  const [replaySpot,    setReplaySpot]    = useState<number>(0)
   const [expiryPopup,          setExpiryPopup]          = useState<any[] | null>(null)
   const [autoPlayShowNewSession, setAutoPlayShowNewSession] = useState(false)
   const positionsRef    = useRef<any[]>([])
@@ -2940,15 +3067,26 @@ function TradingDashboard({ userId }: { userId: string }) {
                 symbol={chainSymbol} onTrade={load} onLegsChange={setStrategyLegs}
               />
             )}
-            {tab === "replay" && <ReplayPanel symbol={chainSymbol} vix={vix} />}
+            {tab === "replay" && <ReplayPanel symbol={chainSymbol} vix={vix} onReplayStep={(rows, date, rSpot) => {
+              setReplayRows(rows)
+              setReplayDate(date)
+              setReplaySpot(rSpot > 0 ? rSpot : spot)
+            }} />}
             {tab === "future" && <FuturePlays spot={spot} vix={vix} symbol={chainSymbol} />}
           </div>
 
-          {/* RIGHT: always-on payoff + MTM */}
+          {/* RIGHT: always-on payoff + MTM — uses replay spot when in replay mode */}
           <div className="xl:sticky xl:top-4">
             <RightPanel
-              legs={strategyLegs} spot={spot} vix={vix} symbol={chainSymbol}
-              positions={positions} livePrices={livePrices} balance={balance}
+              legs={strategyLegs}
+              spot={tab === "replay" && replaySpot > 0 ? replaySpot : spot}
+              vix={vix}
+              symbol={chainSymbol}
+              positions={positions}
+              livePrices={livePrices}
+              balance={balance}
+              replayDate={tab === "replay" ? replayDate : ""}
+              replayRows={tab === "replay" ? replayRows : []}
             />
           </div>
         </div>
