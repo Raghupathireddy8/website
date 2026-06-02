@@ -691,9 +691,11 @@ async function fetchBhavDates(symbol: string): Promise<{ dates: string[]; error:
   } catch {}
 
   // Medium path: paginated select
+  // NOTE: Supabase/PostgREST hard-caps rows at 1000 per request by default.
+  // PAGE must be 1000 (not 5000) so `data.length < PAGE` correctly detects the last page.
   const allRaw: string[] = []
   let page = 0
-  const PAGE = 5000
+  const PAGE = 1000
   let lastError: string | null = null
   while (true) {
     const { data, error } = await supabase
@@ -733,13 +735,14 @@ async function fetchBhavDates(symbol: string): Promise<{ dates: string[]; error:
       // Paginate to get ALL dates from the corrected column
       const allRaw2: string[] = []
       let page2 = 0
+      const PAGE2 = 1000  // Supabase hard cap is 1000 rows per request
       while (true) {
         const { data: d2, error: e2 } = await supabase.from(tableName).select(foundCol)
           .order(foundCol, { ascending: true })
-          .range(page2 * PAGE, (page2 + 1) * PAGE - 1)
+          .range(page2 * PAGE2, (page2 + 1) * PAGE2 - 1)
         if (e2 || !d2 || d2.length === 0) break
         for (const r of d2) allRaw2.push(String((r as any)[foundCol!] ?? ""))
-        if (d2.length < PAGE) break
+        if (d2.length < PAGE2) break
         page2++
       }
       const fallbackDates = [...new Set(allRaw2.map(normDateStr))].filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
@@ -1928,6 +1931,9 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
   const prefetchCache   = useRef<Record<string, NormRow[]>>({})
   const allDatesRef     = useRef<string[]>([])
   const currentIdxRef   = useRef(0)
+  const selectedExpiryRef = useRef(selectedExpiry)
+  // Keep ref in sync with state so interval callback always uses latest expiry
+  useEffect(() => { selectedExpiryRef.current = selectedExpiry }, [selectedExpiry])
   const tableName = replaySym === "BANKNIFTY" ? "banknifty_options" : "nifty_options"
   const lotSize   = LOT_SIZES[replaySym] ?? 75
   const interval  = getStrikeInterval(replaySym)
@@ -1950,43 +1956,91 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
   }
 
   // ── Data fetching ────────────────────────────────────────────────────────
-  async function fetchRowsForDate(date: string): Promise<NormRow[]> {
-    if (prefetchCache.current[date]) return prefetchCache.current[date]
+  // fetchRowsForDate: optionally filter by a specific expiry at DB level.
+  // This is critical: with ~148 strikes × 16 expiries ≈ 2368 rows/day, an
+  // unfiltered fetch would need 3 Supabase pages (Supabase caps at 1000 rows/req).
+  // Filtering by expiry upfront reduces to ~148 rows per request (1 page).
+  // cacheKey includes expiry so we don't serve the wrong cached slice.
+  async function fetchRowsForDate(date: string, expiryFilter?: string): Promise<NormRow[]> {
+    const cacheKey = expiryFilter ? `${date}__${expiryFilter}` : date
+    if (prefetchCache.current[cacheKey]) return prefetchCache.current[cacheKey]
     let schema: { dateCol: string; strikeCol: string; expiryCol: string }
     try { schema = await getBhavSchema(tableName) } catch { return [] }
-    const { dateCol, strikeCol } = schema
+    const { dateCol, strikeCol, expiryCol } = schema
 
     const d = new Date(date + "T00:00:00")
     const dd = String(d.getDate()).padStart(2,"0")
     const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
     const dateVariants = [date, date.replace(/-/g,""), `${dd}-${mon3}-${d.getFullYear()}`]
 
-    // Paginated fetch — get ALL rows for this date (multiple expiries × all strikes)
+    // Build expiry variants for DB filter (same logic as fetchBhavOptionChain)
+    let expiryVariants: string[] | null = null
+    if (expiryFilter) {
+      const ed = new Date(expiryFilter + "T00:00:00")
+      const edd  = String(ed.getDate()).padStart(2,"0")
+      const emon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][ed.getMonth()]
+      const eyyyy = ed.getFullYear()
+      const eyy   = String(eyyyy).slice(2)
+      expiryVariants = [
+        expiryFilter,
+        `${edd}-${emon3}-${eyyyy}`,
+        `${edd}-${emon3}-${eyy}`,
+      ]
+    }
+
+    // Paginated fetch — with expiry filter we expect ~148 rows (1 page); without filter
+    // we may need multiple pages for all expiries.
+    const PG = 1000  // Supabase PostgREST hard cap per request
     let rows: any[] | null = null
+
     for (const dv of dateVariants) {
       const allPages: any[] = []
       let pg = 0
-      const PG = 1000
-      while (true) {
-        const { data, error } = await supabase.from(tableName).select("*")
-          .eq(dateCol, dv).order(strikeCol, { ascending: true })
-          .range(pg * PG, (pg + 1) * PG - 1)
-        if (error || !data || data.length === 0) break
-        allPages.push(...data)
-        if (data.length < PG) break
-        pg++
+      let found = false
+
+      if (expiryVariants) {
+        // Try each expiry variant until we get rows
+        for (const ev of expiryVariants) {
+          allPages.length = 0; pg = 0
+          while (true) {
+            const { data, error } = await supabase.from(tableName).select("*")
+              .eq(dateCol, dv).eq(expiryCol, ev)
+              .order(strikeCol, { ascending: true })
+              .range(pg * PG, (pg + 1) * PG - 1)
+            if (error || !data || data.length === 0) break
+            allPages.push(...data)
+            if (data.length < PG) break
+            pg++
+          }
+          if (allPages.length > 0) { found = true; break }
+        }
+      } else {
+        // No expiry filter — fetch all expiries for the date (used on initial load)
+        while (true) {
+          const { data, error } = await supabase.from(tableName).select("*")
+            .eq(dateCol, dv).order(strikeCol, { ascending: true })
+            .range(pg * PG, (pg + 1) * PG - 1)
+          if (error || !data || data.length === 0) break
+          allPages.push(...data)
+          if (data.length < PG) break
+          pg++
+        }
+        if (allPages.length > 0) found = true
       }
-      if (allPages.length > 0) { rows = allPages; break }
+
+      if (found || allPages.length > 0) { rows = allPages; break }
     }
+
     if (!rows || rows.length === 0) {
-      // ilike fallback — also paginated
+      // ilike fallback — also paginated, with optional expiry filter
       const allPages: any[] = []
       let pg = 0
-      const PG = 1000
       while (true) {
-        const { data } = await supabase.from(tableName).select("*")
+        let q = supabase.from(tableName).select("*")
           .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true })
           .range(pg * PG, (pg + 1) * PG - 1)
+        if (expiryVariants) q = q.eq(expiryCol, expiryVariants[0])
+        const { data } = await q
         if (!data || data.length === 0) break
         allPages.push(...data)
         if (data.length < PG) break
@@ -1999,7 +2053,7 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     const normalised = isNarrowFormat(rows)
       ? normaliseNarrowRows(rows)
       : rows.map(normaliseWideRow).sort((a,b) => a.strike_price - b.strike_price)
-    prefetchCache.current[date] = normalised
+    prefetchCache.current[cacheKey] = normalised
     return normalised
   }
 
@@ -2054,7 +2108,15 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
       expirySet = bhavExpiries.filter(e => e >= firstDate)
     }
     setExpiries(expirySet)
-    if (expirySet.length > 0 && !selectedExpiry) setSelectedExpiry(expirySet[0])
+    const firstExpiry = expirySet.length > 0 ? expirySet[0] : ""
+    if (expirySet.length > 0 && !selectedExpiry) setSelectedExpiry(firstExpiry)
+
+    // Re-fetch first date filtered by the first expiry so we get all ~148 strikes
+    // (the initial unfiltered fetch may have been cut at 1000 rows for just a partial expiry)
+    if (firstExpiry) {
+      const filteredRows = await fetchRowsForDate(firstDate, firstExpiry)
+      if (filteredRows.length > 0) applyDateRows(filteredRows, firstDate)
+    }
 
     // Debug logging
     const debugInfo = `
@@ -2089,12 +2151,14 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     const idx = allDatesRef.current.indexOf(date)
     if (idx >= 0) currentIdxRef.current = idx
     setCurrentDate(date)
-    const rows = await fetchRowsForDate(date)
+    const expiry = selectedExpiryRef.current
+    const rows = await fetchRowsForDate(date, expiry || undefined)
     applyDateRows(rows, date)
-    // Prefetch next 3
+    // Prefetch next 3 dates with same expiry
     for (let i = 1; i <= 3; i++) {
       const nd = allDatesRef.current[idx + i]
-      if (nd && !prefetchCache.current[nd]) fetchRowsForDate(nd).catch(() => {})
+      const cacheKey = expiry ? `${nd}__${expiry}` : nd
+      if (nd && !prefetchCache.current[cacheKey]) fetchRowsForDate(nd, expiry || undefined).catch(() => {})
     }
   }
 
@@ -2113,19 +2177,29 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
         clearInterval(intervalRef.current!); setIsPlaying(false); return
       }
       // Auto-stop at expiry
-      if (selectedExpiry && dates[currentIdxRef.current] > selectedExpiry) {
+      const curExpiry = selectedExpiryRef.current
+      if (curExpiry && dates[currentIdxRef.current] > curExpiry) {
         clearInterval(intervalRef.current!); setIsPlaying(false)
         setTradeMsg("⏹ Reached expiry date — auto-play stopped")
         return
       }
       const nd = dates[currentIdxRef.current]
       setCurrentDate(nd)
-      const rows = await fetchRowsForDate(nd)
+      const rows = await fetchRowsForDate(nd, curExpiry || undefined)
       applyDateRows(rows, nd)
     }, speed)
   }
 
   useEffect(() => () => { if (intervalRef.current) clearInterval(intervalRef.current) }, [])
+
+  // When user picks a different expiry, re-fetch current date filtered by that expiry
+  useEffect(() => {
+    if (!selectedExpiry || !currentDate || allDates.length === 0) return
+    fetchRowsForDate(currentDate, selectedExpiry).then(rows => {
+      if (rows.length > 0) applyDateRows(rows, currentDate)
+    }).catch(() => {})
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedExpiry])
 
   // ── Greeks helper (BS) ───────────────────────────────────────────────────
   function getGreeks(strike: number, optType: "CE"|"PE", expiry: string) {
