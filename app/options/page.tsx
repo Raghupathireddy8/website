@@ -730,11 +730,19 @@ async function fetchBhavDates(symbol: string): Promise<{ dates: string[]; error:
       // Re-cache with corrected column
       _schemaCache[tableName] = { ...schema, dateCol: foundCol }
 
-      const { data: d2, error: e2 } = await supabase.from(tableName).select(foundCol)
-        .order(foundCol, { ascending: true }).limit(PAGE)
-      if (e2 || !d2) return { dates: [], error: `Failed to read "${foundCol}": ${e2?.message}` }
-      const fallbackDates = [...new Set(d2.map((r: any) => normDateStr(String(r[foundCol!] ?? ""))))]
-        .filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
+      // Paginate to get ALL dates from the corrected column
+      const allRaw2: string[] = []
+      let page2 = 0
+      while (true) {
+        const { data: d2, error: e2 } = await supabase.from(tableName).select(foundCol)
+          .order(foundCol, { ascending: true })
+          .range(page2 * PAGE, (page2 + 1) * PAGE - 1)
+        if (e2 || !d2 || d2.length === 0) break
+        for (const r of d2) allRaw2.push(String((r as any)[foundCol!] ?? ""))
+        if (d2.length < PAGE) break
+        page2++
+      }
+      const fallbackDates = [...new Set(allRaw2.map(normDateStr))].filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)).sort()
       return { dates: fallbackDates, error: fallbackDates.length === 0 ? `Column "${foundCol}" found but no valid dates parsed.` : null }
     } catch (e2: any) {
       return { dates: [], error: e2.message ?? String(e2) }
@@ -1953,16 +1961,38 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     const mon3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][d.getMonth()]
     const dateVariants = [date, date.replace(/-/g,""), `${dd}-${mon3}-${d.getFullYear()}`]
 
+    // Paginated fetch — get ALL rows for this date (multiple expiries × all strikes)
     let rows: any[] | null = null
     for (const dv of dateVariants) {
-      const { data, error } = await supabase.from(tableName).select("*")
-        .eq(dateCol, dv).order(strikeCol, { ascending: true }).limit(5000)
-      if (!error && data && data.length > 0) { rows = data; break }
+      const allPages: any[] = []
+      let pg = 0
+      const PG = 1000
+      while (true) {
+        const { data, error } = await supabase.from(tableName).select("*")
+          .eq(dateCol, dv).order(strikeCol, { ascending: true })
+          .range(pg * PG, (pg + 1) * PG - 1)
+        if (error || !data || data.length === 0) break
+        allPages.push(...data)
+        if (data.length < PG) break
+        pg++
+      }
+      if (allPages.length > 0) { rows = allPages; break }
     }
     if (!rows || rows.length === 0) {
-      const { data } = await supabase.from(tableName).select("*")
-        .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true }).limit(5000)
-      rows = data && data.length > 0 ? data : null
+      // ilike fallback — also paginated
+      const allPages: any[] = []
+      let pg = 0
+      const PG = 1000
+      while (true) {
+        const { data } = await supabase.from(tableName).select("*")
+          .ilike(dateCol, `${date}%`).order(strikeCol, { ascending: true })
+          .range(pg * PG, (pg + 1) * PG - 1)
+        if (!data || data.length === 0) break
+        allPages.push(...data)
+        if (data.length < PG) break
+        pg++
+      }
+      rows = allPages.length > 0 ? allPages : null
     }
     if (!rows || rows.length === 0) return []
 
@@ -2012,8 +2042,17 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     const rows = await fetchRowsForDate(firstDate)
     applyDateRows(rows, firstDate)
 
-    // derive available expiries from data
-    const expirySet = [...new Set(rows.map(r => r.expiry_date).filter(Boolean))].sort()
+    // derive available expiries — from current date rows first, fallback to full bhav expiries
+    let expirySet = [...new Set(rows.map(r => normDateStr(r.expiry_date)).filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v)))].sort()
+    if (expirySet.length === 0) {
+      // rows may have non-normalised expiry dates — try raw values
+      expirySet = [...new Set(rows.map(r => r.expiry_date).filter(Boolean))].sort()
+    }
+    if (expirySet.length === 0) {
+      // last resort: query all distinct expiry values from table
+      const bhavExpiries = await fetchBhavExpiries(replaySym)
+      expirySet = bhavExpiries.filter(e => e >= firstDate)
+    }
     setExpiries(expirySet)
     if (expirySet.length > 0 && !selectedExpiry) setSelectedExpiry(expirySet[0])
 
@@ -2139,7 +2178,13 @@ function ReplayPanel({ symbol, vix: liveVix, onReplayStep, userId }: {
     : 0
 
   // Filter rows by selected expiry and show ±25 strikes around ATM (50+ total)
-  const displayRows = normRows.filter(r => !selectedExpiry || !r.expiry_date || r.expiry_date === selectedExpiry || normDateStr(r.expiry_date) === selectedExpiry)
+  // Always normalise expiry_date from rows (may be "01-AUG-2024") to compare with selectedExpiry ("2024-08-01")
+  const displayRows = normRows.filter(r => {
+    if (!selectedExpiry) return true
+    if (!r.expiry_date) return true
+    const rowExpNorm = normDateStr(r.expiry_date)
+    return rowExpNorm === selectedExpiry || r.expiry_date === selectedExpiry
+  })
   const nearATM = atm > 0
     ? displayRows.filter(r => Math.abs(r.strike_price - atm) <= 25 * interval)
     : displayRows.slice(0, 51)
